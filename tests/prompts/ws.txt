@@ -1,0 +1,13 @@
+   leading spaces here
+trailing spaces here   
+  both  sides  
+single space runs: a b  c   d    e     f      g
+tabs:	a	b		c			d
+mixed	 	 space and tab	 
+     
+			
+ 
+. , ; : ! ?   
+word     word
+         
+end   
