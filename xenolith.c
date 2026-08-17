@@ -195,6 +195,7 @@ typedef struct {
     ze_kernel_handle_t prefill_route_scatter;
     ze_kernel_handle_t prefill_route_pack;
     ze_kernel_handle_t prefill_q4q8_grouped_n64;
+    ze_kernel_handle_t prefill_q4q8_grouped_m16_n64;
     ze_kernel_handle_t prefill_expert_geglu_q8;
     ze_kernel_handle_t prefill_route_reduce;
     ze_kernel_handle_t prefill_ffn_finish;
@@ -428,7 +429,7 @@ static void xe_gpu_init(xe_engine *e) {
     }
     if (log) xe_ze_check("zeModuleBuildLogDestroy", zeModuleBuildLogDestroy(log));
 
-    const char *prefill_names[23] = {
+    const char *prefill_names[24] = {
         "xe_prefill_rms_scale",
         "xe_prefill_norm_q8",
         "xe_prefill_q4q8_n32",
@@ -449,11 +450,12 @@ static void xe_gpu_init(xe_engine *e) {
         "xe_prefill_route_scatter",
         "xe_prefill_route_pack",
         "xe_prefill_q4q8_grouped_n64",
+        "xe_prefill_q4q8_grouped_m16_n64",
         "xe_prefill_expert_geglu_q8",
         "xe_prefill_route_reduce",
         "xe_prefill_ffn_finish"
     };
-    ze_kernel_handle_t *prefill_handles[23] = {
+    ze_kernel_handle_t *prefill_handles[24] = {
         &e->gpu.prefill_rms_scale,
         &e->gpu.prefill_norm_q8,
         &e->gpu.prefill_q4q8_n32,
@@ -474,15 +476,16 @@ static void xe_gpu_init(xe_engine *e) {
         &e->gpu.prefill_route_scatter,
         &e->gpu.prefill_route_pack,
         &e->gpu.prefill_q4q8_grouped_n64,
+        &e->gpu.prefill_q4q8_grouped_m16_n64,
         &e->gpu.prefill_expert_geglu_q8,
         &e->gpu.prefill_route_reduce,
         &e->gpu.prefill_ffn_finish
     };
-    uint32_t prefill_group_sizes[23] = {
+    uint32_t prefill_group_sizes[24] = {
         128, 128, 128, 128, 128, 128, 128, 128, 256, 256, 128, 128,
-        128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128
+        128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128
     };
-    for (int i = 0; i < 23; i++) {
+    for (int i = 0; i < 24; i++) {
         ze_kernel_desc_t desc = {
             .stype = ZE_STRUCTURE_TYPE_KERNEL_DESC,
             .pKernelName = prefill_names[i]
@@ -534,6 +537,9 @@ static void xe_gpu_destroy(xe_engine *e) {
     if (e->gpu.prefill_q4q8_grouped_n64)
         xe_ze_check("zeKernelDestroy prefill grouped q4q8 n64",
                     zeKernelDestroy(e->gpu.prefill_q4q8_grouped_n64));
+    if (e->gpu.prefill_q4q8_grouped_m16_n64)
+        xe_ze_check("zeKernelDestroy prefill grouped q4q8 m16 n64",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_grouped_m16_n64));
     if (e->gpu.prefill_route_pack)
         xe_ze_check("zeKernelDestroy prefill route pack",
                     zeKernelDestroy(e->gpu.prefill_route_pack));
@@ -906,6 +912,14 @@ static void __attribute__((unused)) xe_prefill_route_append(
         xe_engine *e, const xe_q8 *source, xe_q8 *packed,
         const int *route_expert, xe_prefill_routes *route, int rows) {
     int routes = rows * XE_EXPERTS_USED;
+#ifdef XE_TEST_PREFILL_TILE
+    int tile_rows = xe_test_prefill_tile_rows
+                    ? xe_test_prefill_tile_rows : rows <= 96 ? 16 : 32;
+#elif defined(XE_PREFILL_FORCE_M32)
+    int tile_rows = 32;
+#else
+    int tile_rows = rows <= 96 ? 16 : 32;
+#endif
     ze_kernel_handle_t reset = e->gpu.prefill_route_reset;
     xe_gpu_pointer_arg(reset, 0, route->expert_count);
     xe_gpu_pointer_arg(reset, 1, route->cursor);
@@ -929,6 +943,7 @@ static void __attribute__((unused)) xe_prefill_route_append(
     xe_gpu_pointer_arg(prefix, 2, route->cursor);
     xe_gpu_pointer_arg(prefix, 3, route->tile_expert);
     xe_gpu_pointer_arg(prefix, 4, route->tile_m0);
+    xe_gpu_int_arg(prefix, 5, tile_rows);
     ze_group_count_t one_group = { 1, 1, 1 };
     xe_ze_check("zeCommandListAppendLaunchKernel prefill route prefix",
                 zeCommandListAppendLaunchKernel(e->gpu.commands, prefix,
@@ -960,8 +975,21 @@ static void __attribute__((unused)) xe_prefill_route_append(
 
 static void __attribute__((unused)) xe_prefill_grouped_projection_append(
         xe_engine *e, const xe_q4 *weight, const xe_q8 *input,
-        float *output, const xe_prefill_routes *route, int columns) {
+        float *output, const xe_prefill_routes *route, int columns,
+        int rows) {
+#ifdef XE_TEST_PREFILL_TILE
+    int tile_rows = xe_test_prefill_tile_rows
+                    ? xe_test_prefill_tile_rows : rows <= 96 ? 16 : 32;
+    ze_kernel_handle_t kernel = tile_rows == 16
+        ? e->gpu.prefill_q4q8_grouped_m16_n64
+        : e->gpu.prefill_q4q8_grouped_n64;
+#elif defined(XE_PREFILL_FORCE_M32)
     ze_kernel_handle_t kernel = e->gpu.prefill_q4q8_grouped_n64;
+#else
+    ze_kernel_handle_t kernel = rows <= 96
+        ? e->gpu.prefill_q4q8_grouped_m16_n64
+        : e->gpu.prefill_q4q8_grouped_n64;
+#endif
     xe_gpu_pointer_arg(kernel, 0, weight->qs);
     xe_gpu_pointer_arg(kernel, 1, weight->d);
     xe_gpu_pointer_arg(kernel, 2, input->qs);
@@ -1437,8 +1465,8 @@ static void __attribute__((unused)) xe_prefill_rope_prepare_batch(
 
 static void xe_prefill_attention_qkv_append(
         xe_engine *e, int layer_index, xe_prefill_workspace *w, int rows) {
-    if (rows != 32 && rows != 512)
-        xe_fatal("prefill layer initial supports M32 or M512");
+    if (rows < 1 || rows > 512)
+        xe_fatal("prefill layer initial supports M1 through M512");
     const xe_layer *layer = &e->layers[layer_index];
     int global = XE_IS_GLOBAL(layer_index);
     int dimension = global ? XE_GLOBAL_HEAD_DIM : XE_SWA_HEAD_DIM;
@@ -1547,8 +1575,8 @@ static void __attribute__((unused)) xe_prefill_attention_initial_append(
 
 static void __attribute__((unused)) xe_prefill_ffn_append(
         xe_engine *e, int layer_index, xe_prefill_workspace *w, int rows) {
-    if (rows != 32 && rows != 512)
-        xe_fatal("prefill FFN supports M32 or M512");
+    if (rows < 1 || rows > 512)
+        xe_fatal("prefill FFN supports M1 through M512");
     const xe_layer *layer = &e->layers[layer_index];
     int wide = rows == 512;
     xe_prefill_rms_append(e, w->attention_output, w->row_scale,
@@ -1570,14 +1598,15 @@ static void __attribute__((unused)) xe_prefill_ffn_append(
                             w->route_expert, &w->routes, rows);
     xe_prefill_grouped_projection_append(e, &layer->gate_up_exps,
                                           &w->packed_moe, w->expert_gate_up,
-                                          &w->routes, 2 * XE_EXPERT_FFN);
+                                          &w->routes, 2 * XE_EXPERT_FFN,
+                                          rows);
     xe_prefill_expert_geglu_append(e, w->expert_gate_up,
                                     &w->expert_activation,
                                     rows * XE_EXPERTS_USED);
     xe_prefill_grouped_projection_append(e, &layer->down_exps,
                                           &w->expert_activation,
                                           w->expert_down, &w->routes,
-                                          XE_EMBD);
+                                          XE_EMBD, rows);
     xe_prefill_route_reduce_append(e, layer, w->expert_down, w->route_weight,
                                     w->route_expert, &w->routes,
                                     w->moe_output, rows);
@@ -4363,8 +4392,8 @@ static void xe_output_decode(xe_session *s, int softcap_mode) {
 static void xe_prefill_batch_run(xe_session *s, const int32_t *tokens,
                                  int rows, int batch_start,
                                  int output_logits) {
-    if (rows != 32 && rows != 512)
-        xe_fatal("prefill batch supports M32 or M512");
+    if (rows < 1 || rows > 512)
+        xe_fatal("prefill batch supports M1 through M512");
     if (batch_start != s->n_tokens)
         xe_fatal("prefill batch expected position %d, received %d",
                  s->n_tokens, batch_start);
@@ -4441,7 +4470,8 @@ static void xe_decode_token_mode(xe_session *s, int32_t token, int pos,
     s->n_tokens = pos + 1;
 }
 
-static void xe_decode_token(xe_session *s, int32_t token, int pos) {
+static void __attribute__((unused)) xe_decode_token(
+        xe_session *s, int32_t token, int pos) {
     xe_decode_token_mode(s, token, pos, XE_MOE_GENERIC_BATCHED, 1,
                          XE_SOFTCAP_SECOND_LOOP, 1);
 }
@@ -4627,18 +4657,12 @@ static int xe_session_swa_can_resume(int current, int resume) {
 }
 
 static void xe_session_extend(xe_session *s, const int32_t *tokens, int end) {
-    while (end - s->n_tokens >= 512) {
+    while (s->n_tokens < end) {
         int start = s->n_tokens;
-        xe_prefill_batch_run(s, tokens + start, 512, start,
-                             start + 512 == end);
-    }
-    for (int pos = s->n_tokens; pos < end; pos++) {
-        if (pos == end - 1)
-            xe_decode_token(s, tokens[pos], pos);
-        else
-            xe_decode_token_mode(s, tokens[pos], pos, XE_MOE_GENERIC_BATCHED,
-                                 1, XE_SOFTCAP_SECOND_LOOP, 0);
-        s->tokens[pos] = tokens[pos];
+        int rows = end - start;
+        if (rows > 512) rows = 512;
+        xe_prefill_batch_run(s, tokens + start, rows, start,
+                             start + rows == end);
     }
 }
 

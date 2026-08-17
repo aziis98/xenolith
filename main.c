@@ -694,10 +694,8 @@ static int cmd_bench(const char *model, int argc, char **argv) {
     }
 
     if (params.n_prompt) {
-        const char *backend = params.n_prompt >= 512
-                              ? "Level Zero+CPU" : "CPU serial";
         bench_result result = bench_run(e, &params, params.n_prompt, 0,
-                                        backend);
+                                        "Level Zero+CPU");
         if (params.jsonl)
             bench_print_jsonl(model, e, &result);
         else

@@ -150,8 +150,12 @@ enum {
 #define BENCH_TM64_TN64 BENCH_VARIANTS
 
 #define BENCH_MOE_EXPERTS 128
-#define BENCH_MOE_ROWS 4096
+#ifndef BENCH_MOE_TOKENS
 #define BENCH_MOE_TOKENS 512
+#endif
+#ifndef BENCH_MOE_ROWS
+#define BENCH_MOE_ROWS (BENCH_MOE_TOKENS * 8)
+#endif
 #ifndef BENCH_MOE_N
 #define BENCH_MOE_N 1408
 #endif
@@ -1886,6 +1890,8 @@ static void bench_moe_verify(bench_gpu *gpu, int variant, const char *name,
     double max_abs = 0.0;
     for (int probe = 0; probe < 256; probe++) {
         int expert = (probe * 37 + 11) % BENCH_MOE_EXPERTS;
+        while (data->expert_count[expert] == 0)
+            expert = (expert + 1) % BENCH_MOE_EXPERTS;
         int local_row = (probe * 17 + 5) % data->expert_count[expert];
         int packed_row = data->token_offset[expert] + local_row;
         int column = (probe * 101 + 17) % BENCH_MOE_N;
@@ -2430,6 +2436,8 @@ static void bench_route_verify(bench_gpu *gpu, bench_moe_data *data,
     double max_abs = 0.0;
     for (int probe = 0; probe < 256; probe++) {
         int expert = (probe * 37 + 11) % BENCH_MOE_EXPERTS;
+        while (data->expert_count[expert] == 0)
+            expert = (expert + 1) % BENCH_MOE_EXPERTS;
         int local_row = (probe * 17 + 5) % data->expert_count[expert];
         int packed = data->token_offset[expert] + local_row;
         int column = (probe * 101 + 17) % BENCH_MOE_N;
@@ -5372,6 +5380,7 @@ int main(int argc, char **argv) {
     int run_router = 0;
     int run_input = 0;
     int run_moe_tile = 0;
+    int run_moe_tm16 = 0;
     int run_tile_only = 0;
     int run_fusion = 0;
     int run_qkv_post = 0;
@@ -5398,6 +5407,8 @@ int main(int argc, char **argv) {
             run_b5 = 1;
         else if (!strcmp(argv[i], "--moe-tile"))
             run_moe_tile = 1;
+        else if (!strcmp(argv[i], "--moe-tm16"))
+            run_moe_tm16 = 1;
         else if (!strcmp(argv[i], "--tile-only"))
             run_tile_only = 1;
         else if (!strcmp(argv[i], "--fusion"))
@@ -5452,10 +5463,12 @@ int main(int argc, char **argv) {
     if (rounds < 3 || rounds > BENCH_ROUNDS_MAX || !(rounds & 1))
         bench_fatal("rounds must be odd and between 3 and %d", BENCH_ROUNDS_MAX);
     if (run_moe + run_moe_signed + run_moe_kb128 + run_moe_slmacc + run_moe_direct + run_moe_coalesced + run_b5 + run_attention + run_attention_long + run_routing + run_reduce + run_activate
-        + run_router + run_input + run_moe_tile + run_tile_only + run_fusion
+        + run_router + run_input + run_moe_tile + run_moe_tm16
+        + run_tile_only + run_fusion
         + run_qkv_post + run_glue + run_layer > 1
         || ((run_moe || run_attention || run_routing || run_reduce
-             || run_activate || run_router || run_input || run_moe_tile)
+             || run_activate || run_router || run_input || run_moe_tile
+             || run_moe_tm16)
             && selected_shape))
         bench_fatal("benchmark modes are mutually exclusive");
     if (!run_moe && !run_moe_tile && !run_routing && !run_reduce && !run_activate
@@ -5492,6 +5505,9 @@ int main(int argc, char **argv) {
         bench_b5_run(&gpu, rounds, seconds);
     } else if (run_moe_tile) {
         bench_moe_tile_run(&gpu, selected_distribution, rounds, seconds);
+    } else if (run_moe_tm16) {
+        bench_moe_pair_run(&gpu, BENCH_MOE_TM16_TN64, "tm16", rounds,
+                           seconds);
     } else if (run_routing) {
         bench_route_run(&gpu, selected_distribution, rounds, seconds);
     } else if (run_reduce) {

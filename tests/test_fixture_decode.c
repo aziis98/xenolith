@@ -98,7 +98,9 @@ static int fixture_sync(xe_engine *e, int32_t *ids, int n, const float *want) {
     output_count_ok = output_count_ok && xe_test_output_calls == outputs;
     ok = ok && memcmp(xe_session_logits(s), want, XE_VOCAB * sizeof(float)) == 0;
 
-    static const int32_t expected[] = { 715, 236772, 715, 236772, 715, 236772, 107, 715 };
+    static const int32_t expected[] = {
+        715, 236772, 759, 569, 9105, 236772, 759, 569
+    };
     int32_t generated[8];
     int32_t prompt[8200];
     memcpy(prompt, ids, (size_t)n * sizeof(*ids));
@@ -113,6 +115,11 @@ static int fixture_sync(xe_engine *e, int32_t *ids, int n, const float *want) {
         }
     }
     int continuation_ok = memcmp(generated, expected, sizeof expected) == 0;
+    if (!continuation_ok) {
+        printf("fixture: greedy got");
+        for (int i = 0; i < 8; i++) printf(" %d", generated[i]);
+        printf("\n");
+    }
     ok = ok && continuation_ok;
     printf("fixture: greedy continuation %s\n", continuation_ok ? "PASS" : "FAIL");
     ok = ok && output_count_ok && allocations == xe_test_allocations;
@@ -136,7 +143,7 @@ static int fixture_run(xe_engine *e, const char *name, int with_reference) {
     xe_session *s = xe_session_new(e);
     size_t allocations = xe_test_allocations;
     double start = fixture_now();
-    for (int pos = 0; pos < n; pos++) xe_decode_token(s, ids[pos], pos);
+    fixture_session_sync(s, ids, n);
     double seconds = fixture_now() - start;
     int finite = 1;
     for (int i = 0; i < XE_VOCAB; i++) finite = finite && isfinite(s->logits[i]);

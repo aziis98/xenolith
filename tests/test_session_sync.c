@@ -47,11 +47,11 @@ int main(int argc, char **argv) {
     xe_tokens prefix = { original, 64, 1568 };
     sync_counts_reset();
     xe_session_sync(s, &prefix);
-    int initial = sync_counts(0, 64, 1)
+    int initial = sync_counts(1, 0, 1)
                   && sync_tokens_equal(s, original, 64)
                   && sync_logits_finite(s);
     ok &= initial;
-    printf("session-sync: initial CPU tail %s\n", initial ? "PASS" : "FAIL");
+    printf("session-sync: initial GPU batch %s\n", initial ? "PASS" : "FAIL");
 
     sync_counts_reset();
     xe_session_sync(s, &prefix);
@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
 
     sync_counts_reset();
     xe_session_rewind(s, 32);
-    int rewind = sync_counts(0, 1, 1)
+    int rewind = sync_counts(1, 0, 1)
                  && xe_session_position(s) == 32
                  && sync_tokens_equal(s, original, 32)
                  && sync_logits_finite(s);
@@ -71,21 +71,21 @@ int main(int argc, char **argv) {
 
     sync_counts_reset();
     xe_session_sync(s, &prefix);
-    int extend = sync_counts(0, 32, 1)
+    int extend = sync_counts(1, 0, 1)
                  && sync_tokens_equal(s, original, 64)
                  && sync_logits_finite(s);
     ok &= extend;
-    printf("session-sync: CPU extension %s\n", extend ? "PASS" : "FAIL");
+    printf("session-sync: GPU extension %s\n", extend ? "PASS" : "FAIL");
 
     xe_session_reset(s);
     prefix.len = 1056;
     sync_counts_reset();
     xe_session_sync(s, &prefix);
-    int long_initial = sync_counts(2, 32, 1)
+    int long_initial = sync_counts(3, 0, 1)
                        && sync_tokens_equal(s, original, 1056)
                        && sync_logits_finite(s);
     ok &= long_initial;
-    printf("session-sync: long M512x2+CPU32 %s\n",
+    printf("session-sync: long M512x2+M32 %s\n",
            long_initial ? "PASS" : "FAIL");
 
     memcpy(branch, original, sizeof branch);
@@ -93,7 +93,7 @@ int main(int argc, char **argv) {
     prefix.v = branch;
     sync_counts_reset();
     xe_session_sync(s, &prefix);
-    int safe_branch = sync_counts(0, 1, 1)
+    int safe_branch = sync_counts(1, 0, 1)
                       && sync_tokens_equal(s, branch, 1056)
                       && sync_logits_finite(s);
     ok &= safe_branch;
@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
     prefix.v = original;
     sync_counts_reset();
     xe_session_sync(s, &prefix);
-    int rebuild = sync_counts(2, 32, 1)
+    int rebuild = sync_counts(3, 0, 1)
                   && sync_tokens_equal(s, original, 1056)
                   && sync_logits_finite(s);
     ok &= rebuild;

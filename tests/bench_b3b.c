@@ -1,6 +1,9 @@
 #include "../xenolith.c"
 
 #include <level_zero/ze_api.h>
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
 
 #define B3B_ROWS 4096
 #define B3B_BLOCKS 88
@@ -9,6 +12,25 @@
 #define B3B_REPLICAS 160
 #endif
 #define B3B_TAIL_SECONDS 35.0
+#define B3B_PMU_COUNT 5
+
+enum {
+    B3B_IMC0_READ,
+    B3B_IMC0_WRITE,
+    B3B_IMC1_READ,
+    B3B_IMC1_WRITE,
+    B3B_ENERGY_PKG
+};
+
+typedef struct {
+    int fd[B3B_PMU_COUNT];
+    double energy_scale;
+    char error[128];
+} b3b_pmu;
+
+typedef struct {
+    double count[B3B_PMU_COUNT];
+} b3b_pmu_result;
 
 typedef struct {
     uint8_t *weights;
@@ -188,6 +210,90 @@ static long b3b_read_long(const char *path) {
     return value;
 }
 
+static double b3b_read_double(const char *path) {
+    FILE *file = fopen(path, "r");
+    if (!file) return -1.0;
+    double value = -1.0;
+    if (fscanf(file, "%lf", &value) != 1) value = -1.0;
+    fclose(file);
+    return value;
+}
+
+static int b3b_perf_open(uint32_t type, uint64_t config) {
+    struct perf_event_attr attr = {0};
+    attr.type = type;
+    attr.size = sizeof attr;
+    attr.config = config;
+    attr.disabled = 1;
+    attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+    return (int)syscall(SYS_perf_event_open, &attr, -1, 0, -1, 0);
+}
+
+static b3b_pmu b3b_pmu_open(void) {
+    b3b_pmu pmu = {0};
+    for (int i = 0; i < B3B_PMU_COUNT; i++) pmu.fd[i] = -1;
+    long imc0 = b3b_read_long("/sys/bus/event_source/devices/uncore_imc_free_running_0/type");
+    long imc1 = b3b_read_long("/sys/bus/event_source/devices/uncore_imc_free_running_1/type");
+    long power = b3b_read_long("/sys/bus/event_source/devices/power/type");
+    pmu.energy_scale = b3b_read_double("/sys/bus/event_source/devices/power/events/energy-pkg.scale");
+    if (imc0 < 0 || imc1 < 0 || power < 0 || pmu.energy_scale <= 0.0) {
+        snprintf(pmu.error, sizeof pmu.error, "PMU metadata unavailable");
+        return pmu;
+    }
+    uint32_t types[B3B_PMU_COUNT] = {
+        (uint32_t)imc0, (uint32_t)imc0, (uint32_t)imc1, (uint32_t)imc1,
+        (uint32_t)power
+    };
+    uint64_t configs[B3B_PMU_COUNT] = { 0x20ff, 0x30ff, 0x20ff, 0x30ff, 0x02 };
+    for (int i = 0; i < B3B_PMU_COUNT; i++) {
+        pmu.fd[i] = b3b_perf_open(types[i], configs[i]);
+        if (pmu.fd[i] >= 0) continue;
+        snprintf(pmu.error, sizeof pmu.error, "perf_event_open: %s", strerror(errno));
+        for (int j = 0; j < i; j++) {
+            close(pmu.fd[j]);
+            pmu.fd[j] = -1;
+        }
+        return pmu;
+    }
+    return pmu;
+}
+
+static int b3b_pmu_available(const b3b_pmu *pmu) {
+    return pmu->fd[0] >= 0;
+}
+
+static void b3b_pmu_start(b3b_pmu *pmu) {
+    if (!b3b_pmu_available(pmu)) return;
+    for (int i = 0; i < B3B_PMU_COUNT; i++) {
+        ioctl(pmu->fd[i], PERF_EVENT_IOC_RESET, 0);
+        ioctl(pmu->fd[i], PERF_EVENT_IOC_ENABLE, 0);
+    }
+}
+
+static b3b_pmu_result b3b_pmu_stop(b3b_pmu *pmu) {
+    b3b_pmu_result result = {0};
+    if (!b3b_pmu_available(pmu)) return result;
+    for (int i = 0; i < B3B_PMU_COUNT; i++) {
+        uint64_t values[3] = {0};
+        ioctl(pmu->fd[i], PERF_EVENT_IOC_DISABLE, 0);
+        if (read(pmu->fd[i], values, sizeof values) != sizeof values || !values[2]) {
+            snprintf(pmu->error, sizeof pmu->error, "PMU counter read failed: %s", strerror(errno));
+            for (int j = 0; j < B3B_PMU_COUNT; j++) {
+                close(pmu->fd[j]);
+                pmu->fd[j] = -1;
+            }
+            return result;
+        }
+        result.count[i] = (double)values[0] * (double)values[1] / (double)values[2];
+    }
+    return result;
+}
+
+static void b3b_pmu_close(b3b_pmu *pmu) {
+    for (int i = 0; i < B3B_PMU_COUNT; i++)
+        if (pmu->fd[i] >= 0) close(pmu->fd[i]);
+}
+
 static long b3b_read_fd(int fd) {
     char buffer[64];
     ssize_t count = pread(fd, buffer, sizeof buffer - 1, 0);
@@ -319,6 +425,11 @@ static void b3b_run(const char *mode, double seconds, b3b_pass_fn pass, void *st
     double tail_end = 0.0;
     int passes = 0;
     int window = 0;
+    b3b_pmu pmu = b3b_pmu_open();
+    if (b3b_pmu_available(&pmu))
+        printf("b3b: PMU IMC read/write and package energy available\n");
+    else
+        printf("b3b: PMU unavailable: %s\n", pmu.error);
 
     while (b3b_now() - start < seconds) {
         double before = b3b_now();
@@ -329,7 +440,10 @@ static void b3b_run(const char *mode, double seconds, b3b_pass_fn pass, void *st
             printf("b3b: %s cold pass %.6f s %.6f GB/s\n",
                    mode, elapsed, useful_bytes / elapsed / 1e9);
         if (before - start >= B3B_TAIL_SECONDS) {
-            if (tail_start == 0.0) tail_start = before;
+            if (tail_start == 0.0) {
+                tail_start = before;
+                b3b_pmu_start(&pmu);
+            }
             tail_bytes += useful_bytes;
             tail_end = after;
         }
@@ -348,6 +462,7 @@ static void b3b_run(const char *mode, double seconds, b3b_pass_fn pass, void *st
     }
 
     double total_time = b3b_now() - start;
+    b3b_pmu_result pmu_result = b3b_pmu_stop(&pmu);
     printf("b3b: %s total passes %d time %.6f s %.6f GB/s\n",
            mode, passes, total_time, total_bytes / total_time / 1e9);
     if (tail_start > 0.0)
@@ -356,6 +471,18 @@ static void b3b_run(const char *mode, double seconds, b3b_pass_fn pass, void *st
                tail_bytes / (tail_end - tail_start) / 1e9);
     else
         printf("b3b: %s tail unavailable\n", mode);
+    if (tail_start > 0.0 && b3b_pmu_available(&pmu)) {
+        double read_gb = (pmu_result.count[B3B_IMC0_READ] +
+                          pmu_result.count[B3B_IMC1_READ]) * 64.0 / 1e9;
+        double write_gb = (pmu_result.count[B3B_IMC0_WRITE] +
+                           pmu_result.count[B3B_IMC1_WRITE]) * 64.0 / 1e9;
+        double joules = pmu_result.count[B3B_ENERGY_PKG] * pmu.energy_scale;
+        printf("b3b: %s tail PMU DRAM read %.6f write %.6f GB/s package %.3f W %.6f J/GB\n",
+               mode, read_gb / (tail_end - tail_start),
+               write_gb / (tail_end - tail_start), joules / (tail_end - tail_start),
+               joules / (tail_bytes / 1e9));
+    }
+    b3b_pmu_close(&pmu);
 }
 
 typedef struct {

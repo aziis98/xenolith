@@ -3,7 +3,30 @@
 
 #include <dirent.h>
 #include <limits.h>
+#include <linux/perf_event.h>
 #include <sys/resource.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+
+#define TG_PMU_COUNT 5
+
+enum {
+    TG_IMC0_READ,
+    TG_IMC0_WRITE,
+    TG_IMC1_READ,
+    TG_IMC1_WRITE,
+    TG_ENERGY_PKG
+};
+
+typedef struct {
+    int fd[TG_PMU_COUNT];
+    double energy_scale;
+    char error[128];
+} tg_pmu;
+
+typedef struct {
+    double count[TG_PMU_COUNT];
+} tg_pmu_result;
 
 typedef struct {
     struct rusage usage;
@@ -54,6 +77,90 @@ static long tg_read_long(const char *path) {
     char *end;
     long value = strtol(buf, &end, 10);
     return end == buf ? -1 : value;
+}
+
+static double tg_read_double(const char *path) {
+    FILE *file = fopen(path, "r");
+    if (!file) return -1.0;
+    double value = -1.0;
+    if (fscanf(file, "%lf", &value) != 1) value = -1.0;
+    fclose(file);
+    return value;
+}
+
+static int tg_perf_open(uint32_t type, uint64_t config) {
+    struct perf_event_attr attr = {0};
+    attr.type = type;
+    attr.size = sizeof attr;
+    attr.config = config;
+    attr.disabled = 1;
+    attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+    return (int)syscall(SYS_perf_event_open, &attr, -1, 0, -1, 0);
+}
+
+static tg_pmu tg_pmu_open(void) {
+    tg_pmu pmu = {0};
+    for (int i = 0; i < TG_PMU_COUNT; i++) pmu.fd[i] = -1;
+    long imc0 = tg_read_long("/sys/bus/event_source/devices/uncore_imc_free_running_0/type");
+    long imc1 = tg_read_long("/sys/bus/event_source/devices/uncore_imc_free_running_1/type");
+    long power = tg_read_long("/sys/bus/event_source/devices/power/type");
+    pmu.energy_scale = tg_read_double("/sys/bus/event_source/devices/power/events/energy-pkg.scale");
+    if (imc0 < 0 || imc1 < 0 || power < 0 || pmu.energy_scale <= 0.0) {
+        snprintf(pmu.error, sizeof pmu.error, "PMU metadata unavailable");
+        return pmu;
+    }
+    uint32_t types[TG_PMU_COUNT] = {
+        (uint32_t)imc0, (uint32_t)imc0, (uint32_t)imc1, (uint32_t)imc1,
+        (uint32_t)power
+    };
+    uint64_t configs[TG_PMU_COUNT] = { 0x20ff, 0x30ff, 0x20ff, 0x30ff, 0x02 };
+    for (int i = 0; i < TG_PMU_COUNT; i++) {
+        pmu.fd[i] = tg_perf_open(types[i], configs[i]);
+        if (pmu.fd[i] >= 0) continue;
+        snprintf(pmu.error, sizeof pmu.error, "perf_event_open: %s", strerror(errno));
+        for (int j = 0; j < i; j++) {
+            close(pmu.fd[j]);
+            pmu.fd[j] = -1;
+        }
+        return pmu;
+    }
+    return pmu;
+}
+
+static int tg_pmu_available(const tg_pmu *pmu) {
+    return pmu->fd[0] >= 0;
+}
+
+static void tg_pmu_start(tg_pmu *pmu) {
+    if (!tg_pmu_available(pmu)) return;
+    for (int i = 0; i < TG_PMU_COUNT; i++) {
+        ioctl(pmu->fd[i], PERF_EVENT_IOC_RESET, 0);
+        ioctl(pmu->fd[i], PERF_EVENT_IOC_ENABLE, 0);
+    }
+}
+
+static tg_pmu_result tg_pmu_stop(tg_pmu *pmu) {
+    tg_pmu_result result = {0};
+    if (!tg_pmu_available(pmu)) return result;
+    for (int i = 0; i < TG_PMU_COUNT; i++) {
+        uint64_t values[3] = {0};
+        ioctl(pmu->fd[i], PERF_EVENT_IOC_DISABLE, 0);
+        if (read(pmu->fd[i], values, sizeof values) != sizeof values || !values[2]) {
+            snprintf(pmu->error, sizeof pmu->error, "PMU counter read failed: %s", strerror(errno));
+            for (int j = 0; j < TG_PMU_COUNT; j++) {
+                close(pmu->fd[j]);
+                pmu->fd[j] = -1;
+            }
+            return result;
+        }
+        result.count[i] = (double)values[0] * (double)values[1] / (double)values[2];
+    }
+    return result;
+}
+
+static void tg_pmu_close(tg_pmu *pmu) {
+    for (int i = 0; i < TG_PMU_COUNT; i++)
+        if (pmu->fd[i] >= 0) close(pmu->fd[i]);
 }
 
 static int tg_read_text(const char *path, char *out, size_t size) {
@@ -308,7 +415,9 @@ int main(int argc, char **argv) {
     const char *model = argv[1];
     int reps = argc > 2 ? (int)strtol(argv[2], NULL, 10) : 5;
     int cooldown = argc > 3 ? (int)strtol(argv[3], NULL, 10) : 0;
-    if (reps < 1 || reps > 20 || cooldown < 0 || cooldown > 600) return 2;
+    int warmup = argc > 4 ? (int)strtol(argv[4], NULL, 10) : 35;
+    if (reps < 1 || reps > 20 || cooldown < 0 || cooldown > 600 ||
+        warmup < 0 || warmup > 600) return 2;
 
     long ac = tg_read_long("/sys/class/power_supply/ACAD/online");
     if (ac != 1 && !getenv("XE_BENCH_ALLOW_BATTERY")) {
@@ -318,9 +427,33 @@ int main(int argc, char **argv) {
 
     xe_engine *e = xe_engine_open(model);
     xe_session *s = xe_session_new(e);
-    xe_decode_token(s, 2, 0);
     tg_print_environment(e, cooldown);
     if (cooldown) sleep((unsigned)cooldown);
+
+    double warm_start = tg_now();
+    int warm_sequences = 0;
+    do {
+        s->n_tokens = 0;
+        uint32_t state = UINT32_C(0x9e3779b9) + (uint32_t)warm_sequences;
+        for (int pos = 0; pos < 128; pos++) {
+            int32_t token = 2;
+            if (pos) {
+                state = state * UINT32_C(1664525) + UINT32_C(1013904223);
+                token = (int32_t)(state % XE_VOCAB);
+            }
+            xe_decode_token(s, token, pos);
+        }
+        warm_sequences++;
+    } while (tg_now() - warm_start < warmup);
+    double warm_seconds = tg_now() - warm_start;
+    printf("tg128: active warmup %.3f s sequences %d %.3f tok/s\n",
+           warm_seconds, warm_sequences, warm_sequences * 128.0 / warm_seconds);
+
+    tg_pmu pmu = tg_pmu_open();
+    if (tg_pmu_available(&pmu))
+        printf("tg128: PMU IMC read/write and package energy available\n");
+    else
+        printf("tg128: PMU unavailable: %s\n", pmu.error);
 
     tg_sampler sampler = {0};
     for (int rep = 0; rep < 20; rep++) sampler.freq_min[rep] = LONG_MAX;
@@ -335,12 +468,16 @@ int main(int argc, char **argv) {
     tg_snapshot before[20];
     tg_snapshot after[20];
     xe_tg_profile profiles[20];
+    tg_pmu_result pmu_results[20];
+    double model_bytes = (double)e->dense_bytes + (double)e->experts_bytes *
+                         XE_EXPERTS_USED / XE_EXPERTS + (double)e->tok_embd_bytes;
     for (int rep = 0; rep < reps; rep++) {
         s->n_tokens = 0;
         uint32_t state = UINT32_C(0x12345678) + (uint32_t)rep;
         memset(&xe_tg_profile_data, 0, sizeof xe_tg_profile_data);
         before[rep] = tg_take_snapshot();
         atomic_store_explicit(&sampler.rep, rep, memory_order_release);
+        tg_pmu_start(&pmu);
         double start = tg_now();
         for (int pos = 0; pos < 128; pos++) {
             int32_t token;
@@ -355,6 +492,7 @@ int main(int argc, char **argv) {
             all_tokens[rep * 128 + pos] = tg_now() - t0;
         }
         rep_seconds[rep] = tg_now() - start;
+        pmu_results[rep] = tg_pmu_stop(&pmu);
         atomic_store_explicit(&sampler.rep, -1, memory_order_release);
         after[rep] = tg_take_snapshot();
         profiles[rep] = xe_tg_profile_data;
@@ -362,9 +500,24 @@ int main(int argc, char **argv) {
         double last = 0.0;
         for (int i = 0; i < 16; i++) first += all_tokens[rep * 128 + i];
         for (int i = 112; i < 128; i++) last += all_tokens[rep * 128 + i];
-        printf("tg128: rep %d %.3f tok/s first16 %.3f last16 %.3f ms\n",
+        double sorted_tokens[128];
+        memcpy(sorted_tokens, all_tokens + rep * 128, sizeof sorted_tokens);
+        qsort(sorted_tokens, 128, sizeof sorted_tokens[0], tg_compare);
+        printf("tg128: rep %d %.3f tok/s p50 %.3f p90 %.3f first16 %.3f last16 %.3f ms model %.2f GB/s\n",
                rep + 1, 128.0 / rep_seconds[rep],
-               first * 1000.0 / 16.0, last * 1000.0 / 16.0);
+               sorted_tokens[64] * 1000.0, sorted_tokens[115] * 1000.0,
+               first * 1000.0 / 16.0, last * 1000.0 / 16.0,
+               model_bytes * 128.0 / rep_seconds[rep] / 1e9);
+        if (tg_pmu_available(&pmu)) {
+            double read_gb = (pmu_results[rep].count[TG_IMC0_READ] +
+                              pmu_results[rep].count[TG_IMC1_READ]) * 64.0 / 1e9;
+            double write_gb = (pmu_results[rep].count[TG_IMC0_WRITE] +
+                               pmu_results[rep].count[TG_IMC1_WRITE]) * 64.0 / 1e9;
+            double joules = pmu_results[rep].count[TG_ENERGY_PKG] * pmu.energy_scale;
+            printf("tg128: PMU rep %d DRAM read %.2f write %.2f GB/s package %.2f W %.3f J/token\n",
+                   rep + 1, read_gb / rep_seconds[rep], write_gb / rep_seconds[rep],
+                   joules / rep_seconds[rep], joules / 128.0);
+        }
         fflush(stdout);
     }
 
@@ -408,11 +561,12 @@ int main(int argc, char **argv) {
     for (int i = 0; i < reps; i++) total += rep_seconds[i];
     double mean = total / reps;
     printf("tg128: workers %d reps %d mean %.3f tok/s median-rep %.3f tok/s "
-           "token-p50 %.3f ms token-p90 %.3f ms effective %.2f GB/s\n",
+           "token-p50 %.3f ms token-p90 %.3f ms model %.2f GB/s bytes/token %.6f GB\n",
            XE_WORKERS, reps, 128.0 / mean, 128.0 / sorted_reps[reps / 2],
            all_tokens[reps * 64] * 1000.0, all_tokens[reps * 115] * 1000.0,
-           2.19 * 128.0 / mean);
+           model_bytes * 128.0 / mean / 1e9, model_bytes / 1e9);
 
+    tg_pmu_close(&pmu);
     xe_session_free(s);
     xe_engine_close(e);
     return 0;
