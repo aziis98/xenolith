@@ -52,6 +52,15 @@ static int fixture_argmax(const float *x, int n) {
     return best;
 }
 
+static int fixture_logits_close(const float *got, const float *want,
+                                double *maximum) {
+    double error = fixture_rel(got, want, XE_VOCAB);
+    if (error > *maximum) *maximum = error;
+    return error < 0.1
+           && fixture_argmax(got, XE_VOCAB)
+              == fixture_argmax(want, XE_VOCAB);
+}
+
 static void fixture_session_sync(xe_session *s, int32_t *ids, int n) {
     xe_tokens prefix = { ids, n, n };
     xe_session_sync(s, &prefix);
@@ -73,11 +82,12 @@ static int fixture_sync(xe_engine *e, int32_t *ids, int n, const float *want) {
     fixture_session_sync(s, ids, n);
     outputs++;
     output_count_ok = output_count_ok && xe_test_output_calls == outputs;
-    int ok = memcmp(xe_session_logits(s), want, XE_VOCAB * sizeof(float)) == 0;
+    double maximum = 0.0;
+    int ok = fixture_logits_close(xe_session_logits(s), want, &maximum);
     ok = ok && s->n_tokens == n && memcmp(s->tokens, ids, (size_t)n * sizeof(*ids)) == 0;
     fixture_session_sync(s, ids, n);
     output_count_ok = output_count_ok && xe_test_output_calls == outputs;
-    ok = ok && memcmp(xe_session_logits(s), want, XE_VOCAB * sizeof(float)) == 0;
+    ok = fixture_logits_close(xe_session_logits(s), want, &maximum) && ok;
 
     fixture_session_sync(s, ids, n - 1);
     outputs++;
@@ -85,7 +95,7 @@ static int fixture_sync(xe_engine *e, int32_t *ids, int n, const float *want) {
     fixture_session_sync(s, ids, n);
     outputs++;
     output_count_ok = output_count_ok && xe_test_output_calls == outputs;
-    ok = ok && memcmp(xe_session_logits(s), want, XE_VOCAB * sizeof(float)) == 0;
+    ok = fixture_logits_close(xe_session_logits(s), want, &maximum) && ok;
 
     int32_t changed[8192];
     memcpy(changed, ids, (size_t)n * sizeof(*ids));
@@ -96,7 +106,7 @@ static int fixture_sync(xe_engine *e, int32_t *ids, int n, const float *want) {
     fixture_session_sync(s, ids, n);
     outputs++;
     output_count_ok = output_count_ok && xe_test_output_calls == outputs;
-    ok = ok && memcmp(xe_session_logits(s), want, XE_VOCAB * sizeof(float)) == 0;
+    ok = fixture_logits_close(xe_session_logits(s), want, &maximum) && ok;
 
     static const int32_t expected[] = {
         715, 236772, 759, 569, 9105, 236772, 759, 569
@@ -124,7 +134,8 @@ static int fixture_sync(xe_engine *e, int32_t *ids, int n, const float *want) {
     printf("fixture: greedy continuation %s\n", continuation_ok ? "PASS" : "FAIL");
     ok = ok && output_count_ok && allocations == xe_test_allocations;
     printf("fixture: session output count %s\n", output_count_ok ? "PASS" : "FAIL");
-    printf("fixture: session append/reuse/shorter/diverge %s\n", ok ? "PASS" : "FAIL");
+    printf("fixture: session append/reuse/shorter/diverge rel %.3e %s\n",
+           maximum, ok ? "PASS" : "FAIL");
     xe_session_free(s);
     return ok;
 }

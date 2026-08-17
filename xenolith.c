@@ -4656,11 +4656,20 @@ static int xe_session_swa_can_resume(int current, int resume) {
     return needed >= oldest;
 }
 
-static void xe_session_extend(xe_session *s, const int32_t *tokens, int end) {
+static void xe_session_extend(xe_session *s, const int32_t *tokens, int end,
+                              int cpu_single) {
     while (s->n_tokens < end) {
         int start = s->n_tokens;
         int rows = end - start;
         if (rows > 512) rows = 512;
+        if (rows == 1 && cpu_single) {
+            int pos = s->n_tokens;
+            xe_decode_token_mode(s, tokens[pos], pos,
+                                 XE_MOE_GENERIC_BATCHED, 1,
+                                 XE_SOFTCAP_SECOND_LOOP, 1);
+            s->tokens[pos] = tokens[pos];
+            continue;
+        }
         xe_prefill_batch_run(s, tokens + start, rows, start,
                              start + rows == end);
     }
@@ -4706,7 +4715,8 @@ void xe_session_sync(xe_session *s, const xe_tokens *prefix) {
         else
             s->n_tokens = 0;
     }
-    xe_session_extend(s, prefix->v, n);
+    xe_session_extend(s, prefix->v, n,
+                      common == current && n == current + 1);
 }
 
 const float *xe_session_logits(xe_session *s) {

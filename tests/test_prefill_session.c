@@ -169,7 +169,7 @@ static void session_kv_copy(xe_session *s, int rows, _Float16 *k,
 }
 
 static int session_gpu_split(xe_engine *e, int32_t *tokens, int rows,
-                             int split) {
+                             int split, int cpu_tail) {
     if (split < 1 || split >= rows)
         xe_fatal("GPU split must be inside the batch");
     size_t kv_elements = session_kv_elements(rows);
@@ -185,6 +185,8 @@ static int session_gpu_split(xe_engine *e, int32_t *tokens, int rows,
         NULL, XE_EMBD * sizeof(*direct_hidden), XE_MEM_HOST);
     float *direct_logits = xe_alloc(
         NULL, XE_VOCAB * sizeof(*direct_logits), XE_MEM_HOST);
+    float *direct_next = xe_alloc(
+        NULL, XE_VOCAB * sizeof(*direct_next), XE_MEM_HOST);
     xe_test_prefill_tile_rows = 0;
     xe_session *direct = xe_session_new(e);
     double direct_start = session_now();
@@ -193,10 +195,27 @@ static int session_gpu_split(xe_engine *e, int32_t *tokens, int rows,
     memcpy(direct_hidden, direct->hidden, XE_EMBD * sizeof(*direct_hidden));
     memcpy(direct_logits, direct->logits, XE_VOCAB * sizeof(*direct_logits));
     session_kv_copy(direct, rows, direct_k, direct_v);
-    xe_session *partitioned = xe_session_new(e);
+    int32_t continuation[8];
+    for (int step = 0; step < 8; step++) {
+        continuation[step] = session_argmax(direct->logits, XE_VOCAB);
+        xe_decode_token(direct, continuation[step], rows + step);
+        if (step == 0)
+            memcpy(direct_next, direct->logits,
+                   XE_VOCAB * sizeof(*direct_next));
+    }
+    xe_session_reset(direct);
+    xe_session *partitioned = direct;
     double split_start = session_now();
     xe_prefill_batch_run(partitioned, tokens, split, 0, 0);
-    xe_prefill_batch_run(partitioned, tokens + split, rows - split, split, 1);
+    if (cpu_tail) {
+        for (int pos = split; pos < rows; pos++)
+            xe_decode_token_mode(partitioned, tokens[pos], pos,
+                                 XE_MOE_GENERIC_BATCHED, 1,
+                                 XE_SOFTCAP_SECOND_LOOP, pos == rows - 1);
+    } else {
+        xe_prefill_batch_run(partitioned, tokens + split, rows - split,
+                             split, 1);
+    }
     double split_seconds = session_now() - split_start;
     session_kv_copy(partitioned, rows, split_k, split_v);
     double hidden_error = session_rel(
@@ -205,35 +224,50 @@ static int session_gpu_split(xe_engine *e, int32_t *tokens, int rows,
         partitioned->logits, direct_logits, XE_VOCAB);
     double k_error = session_half_rel(split_k, direct_k, kv_elements);
     double v_error = session_half_rel(split_v, direct_v, kv_elements);
+    int top_ok = session_argmax(partitioned->logits, XE_VOCAB)
+                 == session_argmax(direct_logits, XE_VOCAB);
     size_t kv_mismatches = 0;
     for (size_t i = 0; i < kv_elements; i++)
         kv_mismatches += split_k[i] != direct_k[i]
                          || split_v[i] != direct_v[i];
     int greedy_mismatches = 0;
     int first_greedy_mismatch = -1;
+    double next_error = 0.0;
+    int next_top_ok = 0;
     for (int step = 0; step < 8; step++) {
-        int direct_token = session_argmax(direct->logits, XE_VOCAB);
         int split_token = session_argmax(partitioned->logits, XE_VOCAB);
-        if (direct_token != split_token) {
+        if (continuation[step] != split_token) {
             greedy_mismatches++;
             if (first_greedy_mismatch < 0) first_greedy_mismatch = step;
         }
-        xe_decode_token(direct, direct_token, rows + step);
-        xe_decode_token(partitioned, direct_token, rows + step);
+        xe_decode_token(partitioned, continuation[step], rows + step);
+        if (step == 0) {
+            next_error = session_rel(partitioned->logits, direct_next,
+                                     XE_VOCAB);
+            next_top_ok = session_argmax(partitioned->logits, XE_VOCAB)
+                          == session_argmax(direct_next, XE_VOCAB);
+        }
     }
-    printf("prefill-gpu-split: M%d %d+%d direct %.6f s split %.6f s hidden %.3e logits %.3e KV %.3e/%.3e mismatches %zu/%zu greedy %d/8 first %d\n",
-           rows, split, rows - split, direct_seconds, split_seconds,
-           hidden_error, logits_error, k_error, v_error, kv_mismatches,
-           2 * kv_elements, greedy_mismatches, first_greedy_mismatch);
+    int ok = hidden_error < 0.1 && logits_error < 0.1 && top_ok
+             && k_error < 0.15 && v_error < 0.15
+             && next_error < 0.1 && next_top_ok
+             && greedy_mismatches == 0;
+    printf("prefill-%s-split: M%d %d+%d direct %.6f s split %.6f s hidden %.3e logits %.3e top %s KV %.3e/%.3e mismatches %zu/%zu handoff %.3e top %s greedy %d/8 first %d %s\n",
+           cpu_tail ? "hybrid" : "gpu", rows, split, rows - split,
+           direct_seconds, split_seconds,
+           hidden_error, logits_error, top_ok ? "same" : "different",
+           k_error, v_error, kv_mismatches, 2 * kv_elements, next_error,
+           next_top_ok ? "same" : "different", greedy_mismatches,
+           first_greedy_mismatch, ok ? "PASS" : "FAIL");
     xe_session_free(partitioned);
-    xe_session_free(direct);
+    xe_free(NULL, direct_next, XE_MEM_HOST);
     xe_free(NULL, direct_logits, XE_MEM_HOST);
     xe_free(NULL, direct_hidden, XE_MEM_HOST);
     xe_free(NULL, split_v, XE_MEM_HOST);
     xe_free(NULL, split_k, XE_MEM_HOST);
     xe_free(NULL, direct_v, XE_MEM_HOST);
     xe_free(NULL, direct_k, XE_MEM_HOST);
-    return greedy_mismatches != 0;
+    return ok ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -244,7 +278,10 @@ int main(int argc, char **argv) {
     const char *model = argv[1];
     int rows = argc > 2 ? (int)strtol(argv[2], NULL, 10) : 32;
     int batch_start = argc > 3 ? (int)strtol(argv[3], NULL, 10) : 0;
-    int split_mode = argc > 4 && !strcmp(argv[4], "split");
+    int split_mode = argc > 4
+                     && (!strcmp(argv[4], "split")
+                         || !strcmp(argv[4], "hybrid"));
+    int hybrid_mode = argc > 4 && !strcmp(argv[4], "hybrid");
     int cpu_tail = argc > 5 && !split_mode
                    ? (int)strtol(argv[5], NULL, 10) : 0;
     if (rows < 1 || rows > 512)
@@ -275,7 +312,7 @@ int main(int argc, char **argv) {
     }
     if (split_mode) {
         int split = argc > 5 ? (int)strtol(argv[5], NULL, 10) : rows - 1;
-        int result = session_gpu_split(e, tokens, rows, split);
+        int result = session_gpu_split(e, tokens, rows, split, hybrid_mode);
         xe_engine_close(e);
         return result;
     }
@@ -309,9 +346,8 @@ int main(int argc, char **argv) {
             memcpy(reference_next, cpu->logits,
                    XE_VOCAB * sizeof(*reference_next));
     }
-    xe_session_free(cpu);
-
-    xe_session *gpu = xe_session_new(e);
+    xe_session_reset(cpu);
+    xe_session *gpu = cpu;
     size_t allocations = xe_test_allocations;
     size_t outputs = xe_test_output_calls;
     double gpu_start = session_now();
