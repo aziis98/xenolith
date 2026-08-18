@@ -65,8 +65,8 @@ int main(int argc, char **argv) {
         xe_alloc(e, XE_EXPERTS * sizeof(int), XE_MEM_SHARED),
         xe_alloc(e, (XE_EXPERTS + 1) * sizeof(int), XE_MEM_SHARED),
         xe_alloc(e, XE_EXPERTS * sizeof(int), XE_MEM_SHARED),
-        xe_alloc(e, 256 * sizeof(int), XE_MEM_SHARED),
-        xe_alloc(e, 256 * sizeof(int), XE_MEM_SHARED),
+        xe_alloc(e, 512 * sizeof(int), XE_MEM_SHARED),
+        xe_alloc(e, 512 * sizeof(int), XE_MEM_SHARED),
         xe_alloc(e, routes_count * sizeof(int), XE_MEM_SHARED),
         xe_alloc(e, routes_count * sizeof(int), XE_MEM_SHARED)
     };
@@ -91,18 +91,18 @@ int main(int argc, char **argv) {
     xe_prefill_rms_append(e, input, row_scale, rows, XE_EMBD);
     xe_prefill_ffn_input_append(e, layer, input, row_scale, &dense_input,
                                 &moe_input, router_input, rows);
-    xe_prefill_router_append(e, layer, router_input, router_logits,
+    xe_prefill_router_append(e, layer, input, row_scale, router_logits,
                              route_expert, route_weight, rows);
     xe_prefill_route_append(e, &moe_input, &packed_moe, route_expert,
                             &routes, rows);
     xe_prefill_grouped_projection_append(e, &layer->gate_up_exps,
                                           &packed_moe, expert_gate_up,
-                                          &routes, 2 * XE_EXPERT_FFN);
+                                          &routes, 2 * XE_EXPERT_FFN, rows);
     xe_prefill_expert_geglu_append(e, expert_gate_up, &expert_activation,
                                     routes_count);
     xe_prefill_grouped_projection_append(e, &layer->down_exps,
                                           &expert_activation, expert_down,
-                                          &routes, XE_EMBD);
+                                          &routes, XE_EMBD, rows);
     xe_prefill_route_reduce_append(e, layer, expert_down, route_weight,
                                     route_expert, &routes, moe_output, rows);
     xe_prefill_ffn_finish_append(e, layer, down, moe_output, input,
@@ -122,18 +122,19 @@ int main(int argc, char **argv) {
         xe_prefill_rms_append(e, input, row_scale, rows, XE_EMBD);
         xe_prefill_ffn_input_append(e, layer, input, row_scale, &dense_input,
                                     &moe_input, router_input, rows);
-        xe_prefill_router_append(e, layer, router_input, router_logits,
+        xe_prefill_router_append(e, layer, input, row_scale, router_logits,
                                  route_expert, route_weight, rows);
         xe_prefill_route_append(e, &moe_input, &packed_moe, route_expert,
                                 &routes, rows);
         xe_prefill_grouped_projection_append(e, &layer->gate_up_exps,
                                               &packed_moe, expert_gate_up,
-                                              &routes, 2 * XE_EXPERT_FFN);
+                                              &routes, 2 * XE_EXPERT_FFN,
+                                              rows);
         xe_prefill_expert_geglu_append(e, expert_gate_up,
                                         &expert_activation, routes_count);
         xe_prefill_grouped_projection_append(e, &layer->down_exps,
                                               &expert_activation, expert_down,
-                                              &routes, XE_EMBD);
+                                              &routes, XE_EMBD, rows);
         xe_prefill_route_reduce_append(e, layer, expert_down, route_weight,
                                         route_expert, &routes, moe_output,
                                         rows);
@@ -154,7 +155,7 @@ int main(int argc, char **argv) {
     const int router_repetitions = 30;
     start = dense_now();
     for (int repetition = 0; repetition < router_repetitions; repetition++)
-        xe_prefill_router_append(e, layer, router_input, router_logits,
+        xe_prefill_router_append(e, layer, input, row_scale, router_logits,
                                  route_expert, route_weight, rows);
     xe_ze_check("zeCommandListHostSynchronize prefill router timing",
                 zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
@@ -172,12 +173,13 @@ int main(int argc, char **argv) {
     for (int repetition = 0; repetition < moe_repetitions; repetition++) {
         xe_prefill_grouped_projection_append(e, &layer->gate_up_exps,
                                               &packed_moe, expert_gate_up,
-                                              &routes, 2 * XE_EXPERT_FFN);
+                                              &routes, 2 * XE_EXPERT_FFN,
+                                              rows);
         xe_prefill_expert_geglu_append(e, expert_gate_up,
                                         &expert_activation, routes_count);
         xe_prefill_grouped_projection_append(e, &layer->down_exps,
                                               &expert_activation, expert_down,
-                                              &routes, XE_EMBD);
+                                              &routes, XE_EMBD, rows);
         xe_prefill_route_reduce_append(e, layer, expert_down, route_weight,
                                         route_expert, &routes, moe_output,
                                         rows);
@@ -185,6 +187,26 @@ int main(int argc, char **argv) {
     xe_ze_check("zeCommandListHostSynchronize prefill moe timing",
                 zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
     double moe_ms = (dense_now() - start) * 1000.0 / moe_repetitions;
+    const int projection_repetitions = 5;
+    start = dense_now();
+    for (int repetition = 0; repetition < projection_repetitions; repetition++)
+        xe_prefill_grouped_projection_append(e, &layer->gate_up_exps,
+                                              &packed_moe, expert_gate_up,
+                                              &routes, 2 * XE_EXPERT_FFN,
+                                              rows);
+    xe_ze_check("zeCommandListHostSynchronize prefill expert gate timing",
+                zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
+    double expert_gate_ms = (dense_now() - start) * 1000.0
+                            / projection_repetitions;
+    start = dense_now();
+    for (int repetition = 0; repetition < projection_repetitions; repetition++)
+        xe_prefill_grouped_projection_append(e, &layer->down_exps,
+                                              &expert_activation, expert_down,
+                                              &routes, XE_EMBD, rows);
+    xe_ze_check("zeCommandListHostSynchronize prefill expert down timing",
+                zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
+    double expert_down_ms = (dense_now() - start) * 1000.0
+                            / projection_repetitions;
     const int finish_repetitions = 30;
     start = dense_now();
     for (int repetition = 0; repetition < finish_repetitions; repetition++)
@@ -237,7 +259,6 @@ int main(int argc, char **argv) {
                 * (1.0f / sqrtf((float)XE_EMBD)) * layer->router_scale[column];
         }
     }
-    double router_error = dense_rel(router_input, router_reference, input_n);
     float *router_logits_reference = xe_alloc(
         NULL, (size_t)rows * XE_EXPERTS * sizeof(*router_logits_reference),
         XE_MEM_HOST);
@@ -255,7 +276,7 @@ int main(int argc, char **argv) {
         for (int expert = 0; expert < XE_EXPERTS; expert++) {
             float value = xe_dot_f32_avx(
                 layer->router_w + (size_t)expert * XE_EMBD,
-                router_input + (size_t)row * XE_EMBD, XE_EMBD);
+                router_reference + (size_t)row * XE_EMBD, XE_EMBD);
             router_logits_reference[(size_t)row * XE_EXPERTS + expert] = value;
             if (value <= best_value[8]) continue;
             int slot = 8;
@@ -290,21 +311,60 @@ int main(int argc, char **argv) {
                                     / (route_weight_reference + 1e-30));
     int routing_errors = routes.token_offset[0] != 0
                          || routes.token_offset[XE_EXPERTS] != routes_count;
-    int tiles = 0;
+    int full_tiles = 0;
+    int tail_tiles = 0;
+    int tail16_tiles = 0;
+    int tail8_tiles = 0;
     for (int expert = 0; expert < XE_EXPERTS; expert++) {
         routing_errors += routes.token_offset[expert + 1]
                           - routes.token_offset[expert]
                           != routes.expert_count[expert];
-        tiles += (routes.expert_count[expert] + 31) / 32;
+        int count = routes.expert_count[expert];
+        if (rows <= 96) {
+            tail_tiles += (count + 15) / 16;
+        } else {
+            int remainder = count & 31;
+            full_tiles += count / 32 + (remainder > 16);
+            tail_tiles += remainder > 16 ? 0 : (remainder + 15) / 16;
+            tail16_tiles += remainder >= 9 && remainder <= 16;
+            tail8_tiles += remainder >= 1 && remainder <= 8;
+        }
     }
+    int tiles = full_tiles + tail_tiles;
     for (int tile = 0; tile < 256; tile++) {
-        if (tile < tiles) {
+        int valid = rows <= 96 ? tile < tail_tiles : tile < full_tiles;
+        if (valid) {
             int expert = routes.tile_expert[tile];
             routing_errors += expert < 0 || expert >= XE_EXPERTS;
             routing_errors += routes.tile_m0[tile] < 0
-                              || (routes.tile_m0[tile] & 31) != 0;
+                              || (routes.tile_m0[tile]
+                                  & (rows <= 96 ? 15 : 31)) != 0;
         } else {
             routing_errors += routes.tile_expert[tile] != -1;
+        }
+    }
+    if (rows > 96) {
+        for (int tile = 0; tile < 128; tile++) {
+            int index = 256 + tile;
+            if (tile < tail16_tiles) {
+                int expert = routes.tile_expert[index];
+                routing_errors += expert < 0 || expert >= XE_EXPERTS;
+                routing_errors += routes.tile_m0[index] < 0
+                                  || (routes.tile_m0[index] & 15) != 0;
+            } else {
+                routing_errors += routes.tile_expert[index] != -1;
+            }
+        }
+        for (int tile = 0; tile < 128; tile++) {
+            int index = 384 + tile;
+            if (tile < tail8_tiles) {
+                int expert = routes.tile_expert[index];
+                routing_errors += expert < 0 || expert >= XE_EXPERTS;
+                routing_errors += routes.tile_m0[index] < 0
+                                  || (routes.tile_m0[index] & 7) != 0;
+            } else {
+                routing_errors += routes.tile_expert[index] != -1;
+            }
         }
     }
     int blocks = XE_EMBD / 32;
@@ -494,18 +554,20 @@ int main(int argc, char **argv) {
     }
     double finish_error = dense_rel(layer_output, layer_reference, input_n);
     int ok = dense_max_delta <= 1 && moe_max_delta <= 1
-             && activation_max_delta <= 1 && router_error < 3e-6
+             && activation_max_delta <= 1
              && router_logits_error < 2e-5 && route_mismatch == 0
              && route_weights_rel < 2e-5
-             && routing_errors == 0 && tiles <= 256
+             && routing_errors == 0 && tiles <= 384
              && expert_gate_error < 2e-5 && expert_activation_delta <= 1
              && expert_down_error < 2e-5 && moe_reduce_error < 2e-5
              && finish_error < 3e-6
              && gate_up_error < 2e-5 && down_error < 2e-5;
-    printf("prefill-dense: M%d chain %.6f ms router %.6f ms routing %.6f ms/%d tiles moe %.6f ms finish %.6f ms dense-q8 %d delta %d moe-q8 %d delta %d router-input %.3e logits %.3e routes %d weights %.3e min-margin %.3e activation-q8 %d delta %d gate-up %.3e down %.3e expert-gate %.3e expert-act %d delta %d expert-down %.3e reduce %.3e finish-error %.3e %s\n",
-           rows, elapsed_ms, router_ms, routing_ms, tiles, moe_ms, finish_ms,
+    printf("prefill-dense: M%d chain %.6f ms router %.6f ms routing %.6f ms/%d tiles %d/%d/%d moe %.6f ms expert-gate %.6f ms expert-down %.6f ms finish %.6f ms dense-q8 %d delta %d moe-q8 %d delta %d logits %.3e routes %d weights %.3e min-margin %.3e activation-q8 %d delta %d gate-up %.3e down %.3e expert-gate-error %.3e expert-act %d delta %d expert-down-error %.3e reduce %.3e finish-error %.3e %s\n",
+           rows, elapsed_ms, router_ms, routing_ms, tiles, full_tiles,
+           tail16_tiles, tail8_tiles, moe_ms,
+           expert_gate_ms, expert_down_ms, finish_ms,
            dense_mismatch, dense_max_delta, moe_mismatch,
-           moe_max_delta, router_error, router_logits_error, route_mismatch,
+           moe_max_delta, router_logits_error, route_mismatch,
            route_weights_rel, (double)minimum_margin, activation_mismatch,
            activation_max_delta, gate_up_error, down_error,
            expert_gate_error, expert_activation_mismatch,

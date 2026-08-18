@@ -179,8 +179,19 @@ typedef struct {
     ze_kernel_handle_t prefill_norm_q8;
     ze_kernel_handle_t prefill_q4q8_n32;
     ze_kernel_handle_t prefill_q4q8_n64;
+    ze_kernel_handle_t prefill_q4q8_n128;
+    ze_kernel_handle_t prefill_q4q8_kv_n128;
+    ze_kernel_handle_t prefill_q4q8_swa_q_n128;
+    ze_kernel_handle_t prefill_q4q8_swa_o_n128;
+    ze_kernel_handle_t prefill_q4q8_global_q_n128;
+    ze_kernel_handle_t prefill_q4q8_global_k_n128;
+    ze_kernel_handle_t prefill_q4q8_global_o_n128;
+    ze_kernel_handle_t prefill_q4q8_dense_down_n128;
+    ze_kernel_handle_t prefill_q4q8_n128_tail;
     ze_kernel_handle_t prefill_qkv_post;
     ze_kernel_handle_t prefill_attn_online_b8;
+    ze_kernel_handle_t prefill_attn_online_b8_global_shared;
+    ze_kernel_handle_t prefill_attn_online_b8_swa;
     ze_kernel_handle_t prefill_heads_q8;
     ze_kernel_handle_t prefill_rms_residual;
     ze_kernel_handle_t prefill_swa_stage;
@@ -194,8 +205,12 @@ typedef struct {
     ze_kernel_handle_t prefill_route_prefix;
     ze_kernel_handle_t prefill_route_scatter;
     ze_kernel_handle_t prefill_route_pack;
-    ze_kernel_handle_t prefill_q4q8_grouped_n64;
+    ze_kernel_handle_t prefill_q4q8_grouped_n128;
+    ze_kernel_handle_t prefill_q4q8_grouped_gate_n128;
+    ze_kernel_handle_t prefill_q4q8_grouped_down_n128;
     ze_kernel_handle_t prefill_q4q8_grouped_m16_n64;
+    ze_kernel_handle_t prefill_q4q8_grouped_m16_n128;
+    ze_kernel_handle_t prefill_q4q8_grouped_m8_n128;
     ze_kernel_handle_t prefill_expert_geglu_q8;
     ze_kernel_handle_t prefill_route_reduce;
     ze_kernel_handle_t prefill_ffn_finish;
@@ -429,13 +444,24 @@ static void xe_gpu_init(xe_engine *e) {
     }
     if (log) xe_ze_check("zeModuleBuildLogDestroy", zeModuleBuildLogDestroy(log));
 
-    const char *prefill_names[24] = {
+    const char *prefill_names[39] = {
         "xe_prefill_rms_scale",
         "xe_prefill_norm_q8",
         "xe_prefill_q4q8_n32",
         "xe_prefill_q4q8_n64",
+        "xe_prefill_q4q8_n128",
+        "xe_prefill_q4q8_kv_n128",
+        "xe_prefill_q4q8_swa_q_n128",
+        "xe_prefill_q4q8_swa_o_n128",
+        "xe_prefill_q4q8_global_q_n128",
+        "xe_prefill_q4q8_global_k_n128",
+        "xe_prefill_q4q8_global_o_n128",
+        "xe_prefill_q4q8_dense_down_n128",
+        "xe_prefill_q4q8_n128_tail",
         "xe_prefill_qkv_post",
         "xe_prefill_attn_online_b8",
+        "xe_prefill_attn_online_b8_global_shared",
+        "xe_prefill_attn_online_b8_swa",
         "xe_prefill_heads_q8",
         "xe_prefill_rms_residual",
         "xe_prefill_swa_stage",
@@ -449,19 +475,34 @@ static void xe_gpu_init(xe_engine *e) {
         "xe_prefill_route_prefix",
         "xe_prefill_route_scatter",
         "xe_prefill_route_pack",
-        "xe_prefill_q4q8_grouped_n64",
+        "xe_prefill_q4q8_grouped_n128",
+        "xe_prefill_q4q8_grouped_gate_n128",
+        "xe_prefill_q4q8_grouped_down_n128",
         "xe_prefill_q4q8_grouped_m16_n64",
+        "xe_prefill_q4q8_grouped_m16_n128",
+        "xe_prefill_q4q8_grouped_m8_n128",
         "xe_prefill_expert_geglu_q8",
         "xe_prefill_route_reduce",
         "xe_prefill_ffn_finish"
     };
-    ze_kernel_handle_t *prefill_handles[24] = {
+    ze_kernel_handle_t *prefill_handles[39] = {
         &e->gpu.prefill_rms_scale,
         &e->gpu.prefill_norm_q8,
         &e->gpu.prefill_q4q8_n32,
         &e->gpu.prefill_q4q8_n64,
+        &e->gpu.prefill_q4q8_n128,
+        &e->gpu.prefill_q4q8_kv_n128,
+        &e->gpu.prefill_q4q8_swa_q_n128,
+        &e->gpu.prefill_q4q8_swa_o_n128,
+        &e->gpu.prefill_q4q8_global_q_n128,
+        &e->gpu.prefill_q4q8_global_k_n128,
+        &e->gpu.prefill_q4q8_global_o_n128,
+        &e->gpu.prefill_q4q8_dense_down_n128,
+        &e->gpu.prefill_q4q8_n128_tail,
         &e->gpu.prefill_qkv_post,
         &e->gpu.prefill_attn_online_b8,
+        &e->gpu.prefill_attn_online_b8_global_shared,
+        &e->gpu.prefill_attn_online_b8_swa,
         &e->gpu.prefill_heads_q8,
         &e->gpu.prefill_rms_residual,
         &e->gpu.prefill_swa_stage,
@@ -475,17 +516,22 @@ static void xe_gpu_init(xe_engine *e) {
         &e->gpu.prefill_route_prefix,
         &e->gpu.prefill_route_scatter,
         &e->gpu.prefill_route_pack,
-        &e->gpu.prefill_q4q8_grouped_n64,
+        &e->gpu.prefill_q4q8_grouped_n128,
+        &e->gpu.prefill_q4q8_grouped_gate_n128,
+        &e->gpu.prefill_q4q8_grouped_down_n128,
         &e->gpu.prefill_q4q8_grouped_m16_n64,
+        &e->gpu.prefill_q4q8_grouped_m16_n128,
+        &e->gpu.prefill_q4q8_grouped_m8_n128,
         &e->gpu.prefill_expert_geglu_q8,
         &e->gpu.prefill_route_reduce,
         &e->gpu.prefill_ffn_finish
     };
-    uint32_t prefill_group_sizes[24] = {
-        128, 128, 128, 128, 128, 128, 128, 128, 256, 256, 128, 128,
-        128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128
+    uint32_t prefill_group_sizes[39] = {
+        128, 128, 128, 128, 256, 256, 256, 256, 256, 256, 256, 256, 256, 128, 128, 128, 128, 128, 128, 128, 256, 256, 128,
+        128, 128, 128, 128, 128, 128, 128, 256, 256, 256, 128, 128, 128, 128, 128,
+        128
     };
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < 39; i++) {
         ze_kernel_desc_t desc = {
             .stype = ZE_STRUCTURE_TYPE_KERNEL_DESC,
             .pKernelName = prefill_names[i]
@@ -496,7 +542,6 @@ static void xe_gpu_init(xe_engine *e) {
                     zeKernelSetGroupSize(*prefill_handles[i],
                                          prefill_group_sizes[i], 1, 1));
     }
-
     ze_kernel_desc_t kernel_desc = {
         .stype = ZE_STRUCTURE_TYPE_KERNEL_DESC,
         .pKernelName = "xe_probe"
@@ -534,12 +579,24 @@ static void xe_gpu_destroy(xe_engine *e) {
     if (e->gpu.prefill_expert_geglu_q8)
         xe_ze_check("zeKernelDestroy prefill expert geglu q8",
                     zeKernelDestroy(e->gpu.prefill_expert_geglu_q8));
-    if (e->gpu.prefill_q4q8_grouped_n64)
+    if (e->gpu.prefill_q4q8_grouped_n128)
         xe_ze_check("zeKernelDestroy prefill grouped q4q8 n64",
-                    zeKernelDestroy(e->gpu.prefill_q4q8_grouped_n64));
+                    zeKernelDestroy(e->gpu.prefill_q4q8_grouped_n128));
+    if (e->gpu.prefill_q4q8_grouped_gate_n128)
+        xe_ze_check("zeKernelDestroy prefill grouped gate q4q8 n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_grouped_gate_n128));
+    if (e->gpu.prefill_q4q8_grouped_down_n128)
+        xe_ze_check("zeKernelDestroy prefill grouped down q4q8 n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_grouped_down_n128));
     if (e->gpu.prefill_q4q8_grouped_m16_n64)
         xe_ze_check("zeKernelDestroy prefill grouped q4q8 m16 n64",
                     zeKernelDestroy(e->gpu.prefill_q4q8_grouped_m16_n64));
+    if (e->gpu.prefill_q4q8_grouped_m16_n128)
+        xe_ze_check("zeKernelDestroy prefill grouped q4q8 m16 n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_grouped_m16_n128));
+    if (e->gpu.prefill_q4q8_grouped_m8_n128)
+        xe_ze_check("zeKernelDestroy prefill grouped q4q8 m8 n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_grouped_m8_n128));
     if (e->gpu.prefill_route_pack)
         xe_ze_check("zeKernelDestroy prefill route pack",
                     zeKernelDestroy(e->gpu.prefill_route_pack));
@@ -582,12 +639,45 @@ static void xe_gpu_destroy(xe_engine *e) {
     if (e->gpu.prefill_attn_online_b8)
         xe_ze_check("zeKernelDestroy prefill attention online b8",
                     zeKernelDestroy(e->gpu.prefill_attn_online_b8));
+    if (e->gpu.prefill_attn_online_b8_global_shared)
+        xe_ze_check("zeKernelDestroy prefill attention online b8 global shared",
+                    zeKernelDestroy(e->gpu.prefill_attn_online_b8_global_shared));
+    if (e->gpu.prefill_attn_online_b8_swa)
+        xe_ze_check("zeKernelDestroy prefill attention online b8 swa",
+                    zeKernelDestroy(e->gpu.prefill_attn_online_b8_swa));
     if (e->gpu.prefill_qkv_post)
         xe_ze_check("zeKernelDestroy prefill qkv post",
                     zeKernelDestroy(e->gpu.prefill_qkv_post));
     if (e->gpu.prefill_q4q8_n64)
         xe_ze_check("zeKernelDestroy prefill q4q8 n64",
                     zeKernelDestroy(e->gpu.prefill_q4q8_n64));
+    if (e->gpu.prefill_q4q8_n128)
+        xe_ze_check("zeKernelDestroy prefill q4q8 n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_n128));
+    if (e->gpu.prefill_q4q8_kv_n128)
+        xe_ze_check("zeKernelDestroy prefill q4q8 kv n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_kv_n128));
+    if (e->gpu.prefill_q4q8_swa_q_n128)
+        xe_ze_check("zeKernelDestroy prefill q4q8 swa q n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_swa_q_n128));
+    if (e->gpu.prefill_q4q8_swa_o_n128)
+        xe_ze_check("zeKernelDestroy prefill q4q8 swa o n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_swa_o_n128));
+    if (e->gpu.prefill_q4q8_global_q_n128)
+        xe_ze_check("zeKernelDestroy prefill q4q8 global q n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_global_q_n128));
+    if (e->gpu.prefill_q4q8_global_k_n128)
+        xe_ze_check("zeKernelDestroy prefill q4q8 global k n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_global_k_n128));
+    if (e->gpu.prefill_q4q8_global_o_n128)
+        xe_ze_check("zeKernelDestroy prefill q4q8 global o n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_global_o_n128));
+    if (e->gpu.prefill_q4q8_dense_down_n128)
+        xe_ze_check("zeKernelDestroy prefill q4q8 dense down n128",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_dense_down_n128));
+    if (e->gpu.prefill_q4q8_n128_tail)
+        xe_ze_check("zeKernelDestroy prefill q4q8 n128 tail",
+                    zeKernelDestroy(e->gpu.prefill_q4q8_n128_tail));
     if (e->gpu.prefill_q4q8_n32)
         xe_ze_check("zeKernelDestroy prefill q4q8 n32",
                     zeKernelDestroy(e->gpu.prefill_q4q8_n32));
@@ -663,7 +753,32 @@ static void __attribute__((unused)) xe_prefill_input_append(xe_engine *e, const 
 static void __attribute__((unused)) xe_prefill_projection_append(xe_engine *e, const xe_q4 *weight,
                                          const xe_q8 *input, float *output,
                                          int rows, int columns, int n64) {
-    ze_kernel_handle_t kernel = n64 ? e->gpu.prefill_q4q8_n64
+    int n128_tail = n64 && columns == XE_DENSE_FFN;
+    int n128 = n64 && !(columns & 127);
+    ze_kernel_handle_t kernel = n128 && rows == 512 && columns == 2048
+                                         && weight->blocks == 88
+                              ? e->gpu.prefill_q4q8_kv_n128
+                              : n128 && rows == 512 && columns == 4096
+                                         && weight->blocks == 88
+                              ? e->gpu.prefill_q4q8_swa_q_n128
+                              : n128 && rows == 512 && columns == 2816
+                                         && weight->blocks == 128
+                              ? e->gpu.prefill_q4q8_swa_o_n128
+                              : n128 && rows == 512 && columns == 8192
+                                         && weight->blocks == 88
+                              ? e->gpu.prefill_q4q8_global_q_n128
+                              : n128 && rows == 512 && columns == 1024
+                                         && weight->blocks == 88
+                              ? e->gpu.prefill_q4q8_global_k_n128
+                              : n128 && rows == 512 && columns == 2816
+                                         && weight->blocks == 256
+                              ? e->gpu.prefill_q4q8_global_o_n128
+                              : n128 && rows == 512 && columns == 2816
+                                         && weight->blocks == 66
+                              ? e->gpu.prefill_q4q8_dense_down_n128
+                              : n128_tail ? e->gpu.prefill_q4q8_n128_tail
+                              : n128 ? e->gpu.prefill_q4q8_n128
+                              : n64 ? e->gpu.prefill_q4q8_n64
                                     : e->gpu.prefill_q4q8_n32;
     xe_gpu_pointer_arg(kernel, 0, weight->qs);
     xe_gpu_pointer_arg(kernel, 1, weight->d);
@@ -676,7 +791,8 @@ static void __attribute__((unused)) xe_prefill_projection_append(xe_engine *e, c
     xe_gpu_int_arg(kernel, 8, weight->blocks);
     ze_group_count_t groups = {
         (uint32_t)((rows + 31) / 32),
-        (uint32_t)(columns / (n64 ? 64 : 32)), 1
+        (uint32_t)(n128_tail ? (columns + 127) / 128
+                             : columns / (n128 ? 128 : n64 ? 64 : 32)), 1
     };
     xe_ze_check("zeCommandListAppendLaunchKernel prefill projection",
                 zeCommandListAppendLaunchKernel(e->gpu.commands, kernel,
@@ -717,7 +833,11 @@ static void __attribute__((unused)) xe_prefill_attention_online_append(
         xe_engine *e, const float *q, const _Float16 *k, const _Float16 *v,
         float *output, int rows, int keys, int dimension, int kv_heads,
         int query_offset, int window) {
-    ze_kernel_handle_t kernel = e->gpu.prefill_attn_online_b8;
+    ze_kernel_handle_t kernel = dimension == 256
+                                ? e->gpu.prefill_attn_online_b8_swa
+                                : (rows & 7) == 0
+                                  ? e->gpu.prefill_attn_online_b8_global_shared
+                                  : e->gpu.prefill_attn_online_b8;
     xe_gpu_pointer_arg(kernel, 0, q);
     xe_gpu_pointer_arg(kernel, 1, k);
     xe_gpu_pointer_arg(kernel, 2, v);
@@ -872,14 +992,18 @@ static void __attribute__((unused)) xe_prefill_geglu_q8_append(
 
 static void __attribute__((unused)) xe_prefill_router_append(
         xe_engine *e, const xe_layer *layer, const float *input,
+        const float *row_scale,
         float *logits, int *route_expert, float *route_weight, int rows) {
     ze_kernel_handle_t gemm = e->gpu.prefill_router_gemm;
     xe_gpu_pointer_arg(gemm, 0, input);
-    xe_gpu_pointer_arg(gemm, 1, layer->router_w);
-    xe_gpu_pointer_arg(gemm, 2, logits);
-    xe_gpu_int_arg(gemm, 3, rows);
-    xe_gpu_int_arg(gemm, 4, XE_EMBD);
-    xe_gpu_int_arg(gemm, 5, XE_EXPERTS);
+    xe_gpu_pointer_arg(gemm, 1, layer->router_scale);
+    xe_gpu_pointer_arg(gemm, 2, row_scale);
+    xe_gpu_pointer_arg(gemm, 3, layer->router_w);
+    xe_gpu_pointer_arg(gemm, 4, logits);
+    xe_gpu_float_arg(gemm, 5, 1.0f / sqrtf((float)XE_EMBD));
+    xe_gpu_int_arg(gemm, 6, rows);
+    xe_gpu_int_arg(gemm, 7, XE_EMBD);
+    xe_gpu_int_arg(gemm, 8, XE_EXPERTS);
     ze_group_count_t gemm_groups = {
         (uint32_t)((rows + 15) / 16), XE_EXPERTS / 16, 1
     };
@@ -914,18 +1038,21 @@ static void __attribute__((unused)) xe_prefill_route_append(
     int routes = rows * XE_EXPERTS_USED;
 #ifdef XE_TEST_PREFILL_TILE
     int tile_rows = xe_test_prefill_tile_rows
-                    ? xe_test_prefill_tile_rows : rows <= 96 ? 16 : 32;
+                    ? xe_test_prefill_tile_rows
+                    : rows >= 32 && rows <= 96 ? 16 : 0;
 #elif defined(XE_PREFILL_FORCE_M32)
     int tile_rows = 32;
 #else
-    int tile_rows = rows <= 96 ? 16 : 32;
+    int tile_rows = rows >= 32 && rows <= 96 ? 16 : 0;
 #endif
     ze_kernel_handle_t reset = e->gpu.prefill_route_reset;
     xe_gpu_pointer_arg(reset, 0, route->expert_count);
     xe_gpu_pointer_arg(reset, 1, route->cursor);
     xe_gpu_pointer_arg(reset, 2, route->tile_expert);
     xe_gpu_pointer_arg(reset, 3, route->tile_m0);
-    ze_group_count_t reset_groups = { 2, 1, 1 };
+    ze_group_count_t reset_groups = {
+        (uint32_t)(rows > 96 && tile_rows != 32 ? 4 : 2), 1, 1
+    };
     xe_ze_check("zeCommandListAppendLaunchKernel prefill route reset",
                 zeCommandListAppendLaunchKernel(e->gpu.commands, reset,
                                                 &reset_groups, NULL, 0, NULL));
@@ -979,33 +1106,63 @@ static void __attribute__((unused)) xe_prefill_grouped_projection_append(
         int rows) {
 #ifdef XE_TEST_PREFILL_TILE
     int tile_rows = xe_test_prefill_tile_rows
-                    ? xe_test_prefill_tile_rows : rows <= 96 ? 16 : 32;
-    ze_kernel_handle_t kernel = tile_rows == 16
-        ? e->gpu.prefill_q4q8_grouped_m16_n64
-        : e->gpu.prefill_q4q8_grouped_n64;
+                    ? xe_test_prefill_tile_rows
+                    : rows >= 32 && rows <= 96 ? 16 : 0;
 #elif defined(XE_PREFILL_FORCE_M32)
-    ze_kernel_handle_t kernel = e->gpu.prefill_q4q8_grouped_n64;
+    int tile_rows = 32;
 #else
-    ze_kernel_handle_t kernel = rows <= 96
-        ? e->gpu.prefill_q4q8_grouped_m16_n64
-        : e->gpu.prefill_q4q8_grouped_n64;
+    int tile_rows = rows >= 32 && rows <= 96 ? 16 : 0;
 #endif
-    xe_gpu_pointer_arg(kernel, 0, weight->qs);
-    xe_gpu_pointer_arg(kernel, 1, weight->d);
-    xe_gpu_pointer_arg(kernel, 2, input->qs);
-    xe_gpu_pointer_arg(kernel, 3, input->d);
-    xe_gpu_pointer_arg(kernel, 4, input->sigma);
-    xe_gpu_pointer_arg(kernel, 5, output);
-    xe_gpu_pointer_arg(kernel, 6, route->expert_count);
-    xe_gpu_pointer_arg(kernel, 7, route->token_offset);
-    xe_gpu_pointer_arg(kernel, 8, route->tile_expert);
-    xe_gpu_pointer_arg(kernel, 9, route->tile_m0);
-    xe_gpu_int_arg(kernel, 10, columns);
-    xe_gpu_int_arg(kernel, 11, weight->blocks);
-    ze_group_count_t groups = { 256, (uint32_t)(columns / 64), 1 };
-    xe_ze_check("zeCommandListAppendLaunchKernel prefill grouped projection",
-                zeCommandListAppendLaunchKernel(e->gpu.commands, kernel,
-                                                &groups, NULL, 0, NULL));
+    ze_kernel_handle_t kernels[3] = {
+        tile_rows == 16
+        ? rows <= 96 ? e->gpu.prefill_q4q8_grouped_m16_n64
+                     : e->gpu.prefill_q4q8_grouped_m16_n128
+        : columns == 2 * XE_EXPERT_FFN
+          ? e->gpu.prefill_q4q8_grouped_gate_n128
+          : columns == XE_EMBD
+            ? e->gpu.prefill_q4q8_grouped_down_n128
+            : e->gpu.prefill_q4q8_grouped_n128,
+        e->gpu.prefill_q4q8_grouped_m16_n128,
+        e->gpu.prefill_q4q8_grouped_m8_n128
+    };
+    const int *tile_expert[3] = {
+        route->tile_expert, route->tile_expert + 256,
+        route->tile_expert + 384
+    };
+    const int *tile_m0[3] = {
+        route->tile_m0, route->tile_m0 + 256, route->tile_m0 + 384
+    };
+    int group_x[3] = {
+        tile_rows == 16 && rows > 96 ? 384 : 256, 256, 128
+    };
+    int passes = tile_rows ? 1 : 3;
+    if (!tile_rows) {
+        group_x[0] = 256;
+        group_x[1] = 128;
+    }
+    int tile_columns = tile_rows == 16 && rows <= 96 ? 32 : 128;
+    for (int pass = 0; pass < passes; pass++) {
+        ze_kernel_handle_t kernel = kernels[pass];
+        xe_gpu_pointer_arg(kernel, 0, weight->qs);
+        xe_gpu_pointer_arg(kernel, 1, weight->d);
+        xe_gpu_pointer_arg(kernel, 2, input->qs);
+        xe_gpu_pointer_arg(kernel, 3, input->d);
+        xe_gpu_pointer_arg(kernel, 4, input->sigma);
+        xe_gpu_pointer_arg(kernel, 5, output);
+        xe_gpu_pointer_arg(kernel, 6, route->expert_count);
+        xe_gpu_pointer_arg(kernel, 7, route->token_offset);
+        xe_gpu_pointer_arg(kernel, 8, tile_expert[pass]);
+        xe_gpu_pointer_arg(kernel, 9, tile_m0[pass]);
+        xe_gpu_int_arg(kernel, 10, columns);
+        xe_gpu_int_arg(kernel, 11, weight->blocks);
+        ze_group_count_t groups = {
+            (uint32_t)group_x[pass],
+            (uint32_t)(columns / tile_columns), 1
+        };
+        xe_ze_check("zeCommandListAppendLaunchKernel prefill grouped projection",
+                    zeCommandListAppendLaunchKernel(e->gpu.commands, kernel,
+                                                    &groups, NULL, 0, NULL));
+    }
 }
 
 static void __attribute__((unused)) xe_prefill_expert_geglu_append(
@@ -1423,8 +1580,8 @@ static size_t __attribute__((unused)) xe_prefill_workspace_layout(
     w->routes.token_offset = xe_workspace_take(
         &a, (XE_EXPERTS + 1) * sizeof(int));
     w->routes.cursor = xe_workspace_take(&a, XE_EXPERTS * sizeof(int));
-    w->routes.tile_expert = xe_workspace_take(&a, 256 * sizeof(int));
-    w->routes.tile_m0 = xe_workspace_take(&a, 256 * sizeof(int));
+    w->routes.tile_expert = xe_workspace_take(&a, 512 * sizeof(int));
+    w->routes.tile_m0 = xe_workspace_take(&a, 512 * sizeof(int));
     w->routes.packed_route = xe_workspace_take(
         &a, (size_t)routes * sizeof(int));
     w->routes.route_packed = xe_workspace_take(
@@ -1480,10 +1637,10 @@ static void xe_prefill_attention_qkv_append(
                                  w->q_projection, rows, q_width, wide);
     xe_prefill_projection_append(e, &layer->attn_k, &w->attention_input,
                                  w->k_projection, rows, kv_width,
-                                 global && wide);
+                                 wide);
     if (!global)
         xe_prefill_projection_append(e, &layer->attn_v, &w->attention_input,
-                                     w->v_projection, rows, kv_width, 0);
+                                     w->v_projection, rows, kv_width, wide);
     xe_prefill_qkv_append(e, w->q_projection, w->k_projection,
                           global ? w->k_projection : w->v_projection,
                           layer->q_norm, layer->k_norm,
@@ -1592,7 +1749,8 @@ static void __attribute__((unused)) xe_prefill_ffn_append(
                                &w->dense_activation, rows, XE_DENSE_FFN);
     xe_prefill_projection_append(e, &layer->ffn_down, &w->dense_activation,
                                  w->dense_down, rows, XE_EMBD, wide);
-    xe_prefill_router_append(e, layer, w->router_input, w->router_logits,
+    xe_prefill_router_append(e, layer, w->attention_output, w->row_scale,
+                             w->router_logits,
                              w->route_expert, w->route_weight, rows);
     xe_prefill_route_append(e, &w->moe_input, &w->packed_moe,
                             w->route_expert, &w->routes, rows);
@@ -4668,6 +4826,7 @@ static void xe_session_extend(xe_session *s, const int32_t *tokens, int end,
                                  XE_MOE_GENERIC_BATCHED, 1,
                                  XE_SOFTCAP_SECOND_LOOP, 1);
             s->tokens[pos] = tokens[pos];
+            s->n_tokens++;
             continue;
         }
         xe_prefill_batch_run(s, tokens + start, rows, start,

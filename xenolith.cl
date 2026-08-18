@@ -3,9 +3,11 @@ __kernel void xe_probe(__global uint *value) {
 }
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
 
 #define XE_PREFILL_TM 32
 #define XE_PREFILL_KB 64
+#define XE_PREFILL_N128_KB 32
 
 #define XE_PREFILL_GEMM_ARGS __global const uchar *wq, \
                              __global const half *wd, \
@@ -110,16 +112,18 @@ __kernel void xe_prefill_q4q8_n32(XE_PREFILL_GEMM_ARGS) {
 __attribute__((intel_reqd_sub_group_size(16)))
 __kernel void xe_prefill_q4q8_n64(XE_PREFILL_GEMM_ARGS) {
     __local char la[XE_PREFILL_TM * XE_PREFILL_KB];
-    __local uchar lw[64 * (XE_PREFILL_KB / 2)];
+    __local uint lw[64 * 8];
     __local half lad[XE_PREFILL_TM * 2];
     __local short las[XE_PREFILL_TM * 2];
     __local half lwd[64 * 2];
     int lid = get_local_id(0);
-    int wm = lid >> 4;
-    int wn = lid & 15;
+    int subgroup = lid >> 4;
+    int lane = lid & 15;
+    int wm = (subgroup & 3) * 8;
+    int wn = (subgroup >> 2) * 32 + lane;
     int m0 = get_group_id(0) * XE_PREFILL_TM;
     int n0 = get_group_id(1) * 64;
-    float acc[4][4] = {{0.0f}};
+    float acc[8][2] = {{0.0f}};
     for (int kb = 0; kb < blocks * 32; kb += XE_PREFILL_KB) {
         for (int x = lid; x < XE_PREFILL_TM * XE_PREFILL_KB; x += 128) {
             int lm = x / XE_PREFILL_KB;
@@ -128,18 +132,16 @@ __kernel void xe_prefill_q4q8_n64(XE_PREFILL_GEMM_ARGS) {
             la[x] = gm < m_count
                     ? aq[(size_t)gm * blocks * 32 + kb + lk] : 0;
         }
-        #pragma unroll
-        for (int seg = 0; seg < 16; seg++) {
-            int lng = seg >> 1;
-            int lb = seg & 1;
-            int chunk = lid >> 5;
-            int rem = lid & 31;
-            int row8 = rem >> 2;
-            int j = rem & 3;
-            int ln = lng * 8 + row8;
-            lw[ln * 32 + lb * 16 + chunk * 4 + j] =
-                wq[((size_t)((n0 >> 3) + lng) * blocks
-                    + kb / 32 + lb) * 128 + lid];
+        for (int x = lid; x < 64 * 8; x += 128) {
+            int ln = x >> 3;
+            int q = x & 7;
+            int lb = q >> 2;
+            int c = q & 3;
+            int gn = n0 + ln;
+            __global const uint *source = (__global const uint *)(
+                wq + ((size_t)(gn >> 3) * blocks + kb / 32 + lb) * 128
+                + c * 32 + (gn & 7) * 4);
+            lw[(lb * 4 + c) * 64 + ln] = *source;
         }
         if (lid < XE_PREFILL_TM * 2) {
             int lm = lid >> 1;
@@ -151,51 +153,334 @@ __kernel void xe_prefill_q4q8_n64(XE_PREFILL_GEMM_ARGS) {
                        ? as[(size_t)gm * blocks + kb / 32 + lb] : (short)0;
         }
         {
-            int seg = lid >> 3;
-            int row8 = lid & 7;
-            int lng = seg >> 1;
-            int lb = seg & 1;
-            lwd[(lng * 8 + row8) * 2 + lb] =
-                wd[((size_t)((n0 >> 3) + lng) * blocks
-                    + kb / 32 + lb) * 8 + row8];
+            int ln = lid >> 1;
+            int lb = lid & 1;
+            int gn = n0 + ln;
+            lwd[lb * 64 + ln] =
+                wd[((size_t)(gn >> 3) * blocks + kb / 32 + lb) * 8
+                   + (gn & 7)];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         #pragma unroll
         for (int lb = 0; lb < 2; lb++) {
+            uchar4 packed00 = as_uchar4(lw[(lb * 4) * 64 + wn]);
+            uchar4 packed01 = as_uchar4(lw[(lb * 4 + 1) * 64 + wn]);
+            uchar4 packed02 = as_uchar4(lw[(lb * 4 + 2) * 64 + wn]);
+            uchar4 packed03 = as_uchar4(lw[(lb * 4 + 3) * 64 + wn]);
+            uchar4 packed10 = as_uchar4(lw[(lb * 4) * 64 + wn + 16]);
+            uchar4 packed11 = as_uchar4(lw[(lb * 4 + 1) * 64 + wn + 16]);
+            uchar4 packed12 = as_uchar4(lw[(lb * 4 + 2) * 64 + wn + 16]);
+            uchar4 packed13 = as_uchar4(lw[(lb * 4 + 3) * 64 + wn + 16]);
             #pragma unroll
-            for (int im = 0; im < 4; im++) {
-                int lm = wm + im * 8;
+            for (int im = 0; im < 8; im++) {
+                int lm = wm + im;
                 int correction = 8 * (int)las[lm * 2 + lb];
                 float da = (float)lad[lm * 2 + lb];
-                #pragma unroll
-                for (int in = 0; in < 4; in++) {
-                    int ln = wn + in * 16;
-                    int integer = 0;
-                    #pragma unroll
-                    for (int c = 0; c < 4; c++) {
-                        uchar4 packed = vload4(
-                            0, lw + ln * 32 + lb * 16 + c * 4);
-                        char4 lo = vload4(
-                            0, la + lm * XE_PREFILL_KB + lb * 32 + c * 4);
-                        char4 hi = vload4(
-                            0, la + lm * XE_PREFILL_KB + lb * 32 + 16 + c * 4);
-                        integer += dot(packed & (uchar4)(15), lo)
-                                   + dot(packed >> (uchar4)(4), hi);
-                    }
-                    acc[im][in] += (float)(integer - correction) * da
-                                   * (float)lwd[ln * 2 + lb];
-                }
+                char4 lo0 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32);
+                char4 lo1 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 4);
+                char4 lo2 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 8);
+                char4 lo3 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 12);
+                char4 hi0 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 16);
+                char4 hi1 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 20);
+                char4 hi2 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 24);
+                char4 hi3 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 28);
+                int integer0 = dot(packed00 & (uchar4)(15), lo0)
+                               + dot(packed00 >> (uchar4)(4), hi0)
+                               + dot(packed01 & (uchar4)(15), lo1)
+                               + dot(packed01 >> (uchar4)(4), hi1)
+                               + dot(packed02 & (uchar4)(15), lo2)
+                               + dot(packed02 >> (uchar4)(4), hi2)
+                               + dot(packed03 & (uchar4)(15), lo3)
+                               + dot(packed03 >> (uchar4)(4), hi3);
+                int integer1 = dot(packed10 & (uchar4)(15), lo0)
+                               + dot(packed10 >> (uchar4)(4), hi0)
+                               + dot(packed11 & (uchar4)(15), lo1)
+                               + dot(packed11 >> (uchar4)(4), hi1)
+                               + dot(packed12 & (uchar4)(15), lo2)
+                               + dot(packed12 >> (uchar4)(4), hi2)
+                               + dot(packed13 & (uchar4)(15), lo3)
+                               + dot(packed13 >> (uchar4)(4), hi3);
+                acc[im][0] += (float)(integer0 - correction) * da
+                              * (float)lwd[lb * 64 + wn];
+                acc[im][1] += (float)(integer1 - correction) * da
+                              * (float)lwd[lb * 64 + wn + 16];
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     #pragma unroll
-    for (int im = 0; im < 4; im++) {
-        int gm = m0 + wm + im * 8;
+    for (int im = 0; im < 8; im++) {
+        int gm = m0 + wm + im;
         if (gm >= m_count) continue;
+        out[(size_t)gm * n_count + n0 + wn] = acc[im][0];
+        out[(size_t)gm * n_count + n0 + wn + 16] = acc[im][1];
+    }
+}
+
+static inline void xe_prefill_q4q8_n128_body(
+                             __global const uchar *wq,
+                             __global const half *wd,
+                             __global const char *aq,
+                             __global const half *ad,
+                             __global float *out, int m_count,
+                             int n_count, int blocks,
+                             __local char *la,
+                             __local char *lw,
+                             __local half *lad,
+                             __local half *lwd) {
+    int lid = get_local_id(0);
+    int subgroup = lid >> 4;
+    int lane = lid & 15;
+    int wm = (subgroup & 3) * 8;
+    int wn = (subgroup >> 2) * 32 + lane;
+    int m0 = get_group_id(0) * XE_PREFILL_TM;
+    int n0 = get_group_id(1) * 128;
+    float acc[8][2] = {{0.0f}};
+    for (int kb = 0; kb < blocks * 32; kb += XE_PREFILL_N128_KB) {
+        for (int x = lid; x < XE_PREFILL_TM * XE_PREFILL_N128_KB; x += 256) {
+            int lm = x / XE_PREFILL_N128_KB;
+            int lk = x - lm * XE_PREFILL_N128_KB;
+            int gm = m0 + lm;
+            la[x] = gm < m_count
+                    ? aq[(size_t)gm * blocks * 32 + kb + lk] : 0;
+        }
+        for (int x = lid; x < 128 * 4; x += 256) {
+            int ln = x >> 2;
+            int c = x & 3;
+            int gn = n0 + ln;
+            __global const uint *source = (__global const uint *)(
+                wq + ((size_t)(gn >> 3) * blocks + kb / 32) * 128
+                + c * 32 + (gn & 7) * 4);
+            uchar4 packed = as_uchar4(*source);
+            int base = ln * XE_PREFILL_N128_KB + c * 4;
+            vstore4(convert_char4(packed & (uchar4)(15)) - (char4)(8),
+                    0, lw + base);
+            vstore4(convert_char4(packed >> (uchar4)(4)) - (char4)(8),
+                    0, lw + base + 16);
+        }
+        if (lid < XE_PREFILL_TM) {
+            int lm = lid;
+            int gm = m0 + lm;
+            lad[lm] = gm < m_count
+                      ? ad[(size_t)gm * blocks + kb / 32] : (half)0;
+        }
+        if (lid < 128) {
+            int ln = lid;
+            int gn = n0 + ln;
+            lwd[ln] =
+                wd[((size_t)(gn >> 3) * blocks + kb / 32) * 8
+                   + (gn & 7)];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
         #pragma unroll
-        for (int in = 0; in < 4; in++)
-            out[(size_t)gm * n_count + n0 + wn + in * 16] = acc[im][in];
+        for (int im = 0; im < 8; im++) {
+            int lm = wm + im;
+            float da = (float)lad[lm];
+            int integer0 = 0;
+            int integer1 = 0;
+            #pragma unroll
+            for (int c = 0; c < 8; c++) {
+                char4 activation = vload4(
+                    0, la + lm * XE_PREFILL_N128_KB + c * 4);
+                integer0 += dot(vload4(
+                    0, lw + wn * XE_PREFILL_N128_KB + c * 4),
+                    activation);
+                integer1 += dot(vload4(
+                    0, lw + (wn + 16) * XE_PREFILL_N128_KB + c * 4),
+                    activation);
+            }
+            acc[im][0] += (float)integer0 * da * (float)lwd[wn];
+            acc[im][1] += (float)integer1 * da * (float)lwd[wn + 16];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    #pragma unroll
+    for (int im = 0; im < 8; im++) {
+        int gm = m0 + wm + im;
+        if (gm >= m_count) continue;
+        out[(size_t)gm * n_count + n0 + wn] = acc[im][0];
+        out[(size_t)gm * n_count + n0 + wn + 16] = acc[im][1];
+    }
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_n128(XE_PREFILL_GEMM_ARGS) {
+    __local char la[XE_PREFILL_TM * XE_PREFILL_N128_KB];
+    __local char lw[128 * XE_PREFILL_N128_KB];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_n128_body(
+        wq, wd, aq, ad, out, m_count, n_count, blocks, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_kv_n128(XE_PREFILL_GEMM_ARGS) {
+    __local char la[XE_PREFILL_TM * XE_PREFILL_N128_KB];
+    __local char lw[128 * XE_PREFILL_N128_KB];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_n128_body(
+        wq, wd, aq, ad, out, m_count, 2048, 88, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_swa_q_n128(XE_PREFILL_GEMM_ARGS) {
+    __local char la[XE_PREFILL_TM * XE_PREFILL_N128_KB];
+    __local char lw[128 * XE_PREFILL_N128_KB];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_n128_body(
+        wq, wd, aq, ad, out, m_count, 4096, 88, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_swa_o_n128(XE_PREFILL_GEMM_ARGS) {
+    __local char la[XE_PREFILL_TM * XE_PREFILL_N128_KB];
+    __local char lw[128 * XE_PREFILL_N128_KB];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_n128_body(
+        wq, wd, aq, ad, out, m_count, 2816, 128, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_global_q_n128(XE_PREFILL_GEMM_ARGS) {
+    __local char la[XE_PREFILL_TM * XE_PREFILL_N128_KB];
+    __local char lw[128 * XE_PREFILL_N128_KB];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_n128_body(
+        wq, wd, aq, ad, out, m_count, 8192, 88, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_global_k_n128(XE_PREFILL_GEMM_ARGS) {
+    __local char la[XE_PREFILL_TM * XE_PREFILL_N128_KB];
+    __local char lw[128 * XE_PREFILL_N128_KB];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_n128_body(
+        wq, wd, aq, ad, out, m_count, 1024, 88, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_global_o_n128(XE_PREFILL_GEMM_ARGS) {
+    __local char la[XE_PREFILL_TM * XE_PREFILL_N128_KB];
+    __local char lw[128 * XE_PREFILL_N128_KB];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_n128_body(
+        wq, wd, aq, ad, out, m_count, 2816, 256, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_dense_down_n128(XE_PREFILL_GEMM_ARGS) {
+    __local char la[XE_PREFILL_TM * XE_PREFILL_N128_KB];
+    __local char lw[128 * XE_PREFILL_N128_KB];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_n128_body(
+        wq, wd, aq, ad, out, m_count, 2816, 66, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_n128_tail(XE_PREFILL_GEMM_ARGS) {
+    __local char la[XE_PREFILL_TM * XE_PREFILL_KB];
+    __local char lw[128 * XE_PREFILL_KB];
+    __local half lad[XE_PREFILL_TM * 2];
+    __local half lwd[128 * 2];
+    int lid = get_local_id(0);
+    int subgroup = lid >> 4;
+    int lane = lid & 15;
+    int wm = (subgroup & 3) * 8;
+    int wn = (subgroup >> 2) * 32 + lane;
+    int m0 = get_group_id(0) * XE_PREFILL_TM;
+    int n0 = get_group_id(1) * 128;
+    float acc[8][2] = {{0.0f}};
+    for (int kb = 0; kb < blocks * 32; kb += XE_PREFILL_KB) {
+        for (int x = lid; x < XE_PREFILL_TM * XE_PREFILL_KB; x += 256) {
+            int lm = x / XE_PREFILL_KB;
+            int lk = x - lm * XE_PREFILL_KB;
+            int gm = m0 + lm;
+            la[x] = gm < m_count
+                    ? aq[(size_t)gm * blocks * 32 + kb + lk] : 0;
+        }
+        for (int x = lid; x < 128 * 8; x += 256) {
+            int ln = x >> 3;
+            int q = x & 7;
+            int lb = q >> 2;
+            int c = q & 3;
+            int gn = n0 + ln;
+            __global const uint *source = (__global const uint *)(
+                wq + ((size_t)(gn >> 3) * blocks + kb / 32 + lb) * 128
+                + c * 32 + (gn & 7) * 4);
+            uchar4 packed = as_uchar4(gn < n_count ? *source : 0);
+            int base = ln * XE_PREFILL_KB + lb * 32 + c * 4;
+            vstore4(convert_char4(packed & (uchar4)(15)) - (char4)(8),
+                    0, lw + base);
+            vstore4(convert_char4(packed >> (uchar4)(4)) - (char4)(8),
+                    0, lw + base + 16);
+        }
+        if (lid < XE_PREFILL_TM * 2) {
+            int lm = lid >> 1;
+            int lb = lid & 1;
+            int gm = m0 + lm;
+            lad[lid] = gm < m_count
+                       ? ad[(size_t)gm * blocks + kb / 32 + lb] : (half)0;
+        }
+        {
+            int ln = lid >> 1;
+            int lb = lid & 1;
+            int gn = n0 + ln;
+            lwd[lb * 128 + ln] = gn < n_count ?
+                wd[((size_t)(gn >> 3) * blocks + kb / 32 + lb) * 8
+                   + (gn & 7)] : (half)0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (int lb = 0; lb < 2; lb++) {
+            #pragma unroll
+            for (int im = 0; im < 8; im++) {
+                int lm = wm + im;
+                float da = (float)lad[lm * 2 + lb];
+                int integer0 = 0;
+                int integer1 = 0;
+                #pragma unroll
+                for (int c = 0; c < 8; c++) {
+                    char4 activation = vload4(
+                        0, la + lm * XE_PREFILL_KB + lb * 32 + c * 4);
+                    integer0 += dot(vload4(
+                        0, lw + wn * XE_PREFILL_KB + lb * 32 + c * 4),
+                        activation);
+                    integer1 += dot(vload4(
+                        0, lw + (wn + 16) * XE_PREFILL_KB
+                           + lb * 32 + c * 4), activation);
+                }
+                acc[im][0] += (float)integer0 * da
+                              * (float)lwd[lb * 128 + wn];
+                acc[im][1] += (float)integer1 * da
+                              * (float)lwd[lb * 128 + wn + 16];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    #pragma unroll
+    for (int im = 0; im < 8; im++) {
+        int gm = m0 + wm + im;
+        if (gm >= m_count) continue;
+        int gn = n0 + wn;
+        if (gn < n_count)
+            out[(size_t)gm * n_count + gn] = acc[im][0];
+        if (gn + 16 < n_count)
+            out[(size_t)gm * n_count + gn + 16] = acc[im][1];
     }
 }
 
@@ -396,6 +681,193 @@ __kernel void xe_prefill_attn_online_b8(__global const float *q,
 }
 
 __attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_attn_online_b8_global_shared(
+                                        __global const float *q,
+                                        __global const half *k,
+                                        __global const half *v,
+                                        __global float *out,
+                                        int m_count,
+                                        int n_count,
+                                        int dimension,
+                                        int heads,
+                                        int kv_heads,
+                                        int query_offset,
+                                        int window) {
+    __local half lk[8 * 512];
+    int lid = get_local_id(0);
+    int subgroup = get_sub_group_id();
+    int lane = get_sub_group_local_id();
+    int query_head0 = get_group_id(0) * 8;
+    int head = query_head0 / m_count;
+    if (head >= heads) return;
+    int query0 = query_head0 - head * m_count;
+    int query = query0 + subgroup;
+    int kv_head = head * kv_heads / heads;
+    int position = query_offset + query;
+    int maximum_position = min(n_count - 1, query_offset + query0 + 7);
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    float8 acc0 = (float8)(0.0f);
+    float8 acc1 = (float8)(0.0f);
+    float8 acc2 = (float8)(0.0f);
+    float8 acc3 = (float8)(0.0f);
+    for (int key0 = 0; key0 <= maximum_position; key0 += 8) {
+        __global const uint4 *source = (__global const uint4 *)(
+            k + ((size_t)kv_head * n_count + key0) * 512);
+        __local uint4 *target = (__local uint4 *)lk;
+        for (int x = lid; x < 512; x += 128) target[x] = source[x];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        int keys = clamp(position - key0 + 1, 0, 8);
+        float score[8];
+        float block_maximum = -INFINITY;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            float value = 0.0f;
+            for (int d = lane; d < 512; d += 16)
+                value += q[((size_t)head * m_count + query) * 512 + d]
+                         * (float)lk[local_key * 512 + d];
+            score[local_key] = sub_group_reduce_add(value);
+            block_maximum = fmax(block_maximum, score[local_key]);
+        }
+        float next_maximum = fmax(maximum, block_maximum);
+        float alpha = maximum == -INFINITY ? 0.0f
+                      : exp(maximum - next_maximum);
+        float beta[8];
+        float block_denominator = 0.0f;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            beta[local_key] = exp(score[local_key] - next_maximum);
+            block_denominator += beta[local_key];
+        }
+        denominator = denominator * alpha + block_denominator;
+        acc0 *= alpha;
+        acc1 *= alpha;
+        acc2 *= alpha;
+        acc3 *= alpha;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            __global const ushort *source = (__global const ushort *)(
+                v + ((size_t)kv_head * n_count + key0 + local_key) * 512);
+            float weight = beta[local_key];
+            acc0 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source)));
+            acc1 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source + 128)));
+            acc2 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source + 256)));
+            acc3 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source + 384)));
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        maximum = next_maximum;
+    }
+    __global uint *target = (__global uint *)(
+        out + ((size_t)head * m_count + query) * 512);
+    intel_sub_group_block_write8(target,
+                                 as_uint8(acc0 / denominator));
+    intel_sub_group_block_write8(target + 128,
+                                 as_uint8(acc1 / denominator));
+    intel_sub_group_block_write8(target + 256,
+                                 as_uint8(acc2 / denominator));
+    intel_sub_group_block_write8(target + 384,
+                                 as_uint8(acc3 / denominator));
+}
+
+static inline float xe_prefill_attn_swa_block_score(
+        float8 q0, float8 q1, __global const half *k) {
+    __global const ushort *k_source = (__global const ushort *)k;
+    float value = 0.0f;
+    float8 k0 = convert_float8(as_half8(
+        intel_sub_group_block_read_us8(k_source)));
+    value += q0.s0 * k0.s0;
+    value += q0.s1 * k0.s1;
+    value += q0.s2 * k0.s2;
+    value += q0.s3 * k0.s3;
+    value += q0.s4 * k0.s4;
+    value += q0.s5 * k0.s5;
+    value += q0.s6 * k0.s6;
+    value += q0.s7 * k0.s7;
+    float8 k1 = convert_float8(as_half8(
+        intel_sub_group_block_read_us8(k_source + 128)));
+    value += q1.s0 * k1.s0;
+    value += q1.s1 * k1.s1;
+    value += q1.s2 * k1.s2;
+    value += q1.s3 * k1.s3;
+    value += q1.s4 * k1.s4;
+    value += q1.s5 * k1.s5;
+    value += q1.s6 * k1.s6;
+    value += q1.s7 * k1.s7;
+    return sub_group_reduce_add(value);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_attn_online_b8_swa(__global const float *q,
+                                            __global const half *k,
+                                            __global const half *v,
+                                            __global float *out,
+                                            int m_count,
+                                            int n_count,
+                                            int dimension,
+                                            int heads,
+                                            int kv_heads,
+                                            int query_offset,
+                                            int window) {
+    int query_head = get_group_id(0) * 8 + get_sub_group_id();
+    int lane = get_sub_group_local_id();
+    int query = query_head % m_count;
+    int head = query_head / m_count;
+    if (head >= heads) return;
+    int kv_head = head * kv_heads / heads;
+    int position = query_offset + query;
+    int first = window > 0 ? max(0, position - window + 1) : 0;
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    float8 acc0 = (float8)(0.0f);
+    float8 acc1 = (float8)(0.0f);
+    __global const uint *q_source = (__global const uint *)(
+        q + ((size_t)head * m_count + query) * 256);
+    float8 q0 = as_float8(intel_sub_group_block_read8(q_source));
+    float8 q1 = as_float8(intel_sub_group_block_read8(q_source + 128));
+    for (int key0 = first; key0 <= position; key0 += 8) {
+        int keys = min(8, position - key0 + 1);
+        float score[8];
+        float block_maximum = -INFINITY;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            int key = key0 + local_key;
+            score[local_key] = xe_prefill_attn_swa_block_score(
+                q0, q1,
+                k + ((size_t)kv_head * n_count + key) * 256);
+            block_maximum = fmax(block_maximum, score[local_key]);
+        }
+        float next_maximum = fmax(maximum, block_maximum);
+        float alpha = maximum == -INFINITY ? 0.0f
+                      : exp(maximum - next_maximum);
+        float beta[8];
+        float block_denominator = 0.0f;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            beta[local_key] = exp(score[local_key] - next_maximum);
+            block_denominator += beta[local_key];
+        }
+        denominator = denominator * alpha + block_denominator;
+        acc0 *= alpha;
+        acc1 *= alpha;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            __global const ushort *source = (__global const ushort *)(
+                v + ((size_t)kv_head * n_count + key0 + local_key) * 256);
+            float weight = beta[local_key];
+            acc0 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source)));
+            acc1 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source + 128)));
+        }
+        maximum = next_maximum;
+    }
+    __global uint *target = (__global uint *)(
+        out + ((size_t)head * m_count + query) * 256);
+    intel_sub_group_block_write8(target,
+                                 as_uint8(acc0 / denominator));
+    intel_sub_group_block_write8(target + 128,
+                                 as_uint8(acc1 / denominator));
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
 __kernel void xe_prefill_heads_q8(__global const float *heads,
                                   __global char *quantized,
                                   __global half *scale,
@@ -547,8 +1019,6 @@ __kernel void xe_prefill_ffn_input_q8(
         float x = input[(size_t)row * width + column];
         dense[half_index] = x * rms * dense_weight[column];
         moe[half_index] = x * rms * moe_weight[column];
-        router_input[(size_t)row * width + column] =
-            x * rms * router_scale * router_weight[column];
     }
     float dense_max = sub_group_reduce_max(
         fmax(fabs(dense[0]), fabs(dense[1])));
@@ -627,8 +1097,11 @@ __kernel void xe_prefill_geglu_q8(__global const float *gate,
 }
 
 __kernel void xe_prefill_router_gemm(__global const float *input,
+                                     __global const float *input_weight,
+                                     __global const float *row_scale,
                                      __global const float *weight,
                                      __global float *logits,
+                                     float input_scale,
                                      int rows,
                                      int width,
                                      int experts) {
@@ -647,8 +1120,9 @@ __kernel void xe_prefill_router_gemm(__global const float *input,
             int k = x & 31;
             int input_row = get_group_id(0) * 16 + tile_row;
             local_input[x] = input_row < rows
-                             ? input[(size_t)input_row * width + k0 + k]
-                             : 0.0f;
+                ? input[(size_t)input_row * width + k0 + k]
+                  * row_scale[input_row] * input_scale
+                  * input_weight[k0 + k] : 0.0f;
             local_weight[x] = weight[(size_t)(get_group_id(1) * 16 + tile_row)
                                      * width + k0 + k];
         }
@@ -728,7 +1202,7 @@ __kernel void xe_prefill_route_reset(__global int *expert_count,
         expert_count[index] = 0;
         cursor[index] = 0;
     }
-    if (index < 256) {
+    if (index < 512) {
         tile_expert[index] = -1;
         tile_m0[index] = 0;
     }
@@ -758,10 +1232,34 @@ __kernel void xe_prefill_route_prefix(__global const int *expert_count,
         cursor[expert] = offset;
         offset += count;
         token_offset[expert + 1] = offset;
-        for (int m0 = 0; m0 < count; m0 += tile_rows) {
-            tile_expert[tile] = expert;
-            tile_m0[tile] = m0;
-            tile++;
+        if (tile_rows) {
+            for (int m0 = 0; m0 < count; m0 += tile_rows) {
+                tile_expert[tile] = expert;
+                tile_m0[tile] = m0;
+                tile++;
+            }
+        } else {
+            int full_rows = count / 32 * 32;
+            if (count - full_rows > 16) full_rows += 32;
+            for (int m0 = 0; m0 < full_rows; m0 += 32) {
+                tile_expert[tile] = expert;
+                tile_m0[tile] = m0;
+                tile++;
+            }
+        }
+    }
+    if (!tile_rows) {
+        int tile16 = 256;
+        int tile8 = 384;
+        for (int expert = 0; expert < 128; expert++) {
+            int count = expert_count[expert];
+            int full_rows = count / 32 * 32;
+            if (count - full_rows > 16) full_rows += 32;
+            if (full_rows < count) {
+                int tile = count - full_rows <= 8 ? tile8++ : tile16++;
+                tile_expert[tile] = expert;
+                tile_m0[tile] = full_rows;
+            }
         }
     }
 }
@@ -804,8 +1302,105 @@ __kernel void xe_prefill_route_pack(__global const char *source_q,
     }
 }
 
+static inline void xe_prefill_q4q8_grouped_n128_body(
+                                        __global const uchar *wq,
+                                        __global const half *wd,
+                                        __global const char *aq,
+                                        __global const half *ad,
+                                        __global const short *as,
+                                        __global float *out,
+                                        __global const int *expert_count,
+                                        __global const int *token_offset,
+                                        __global const int *tile_expert,
+                                        __global const int *tile_m0,
+    int n_count,
+    int blocks,
+    __local char *la,
+    __local char *lw,
+    __local half *lad,
+    __local half *lwd) {
+    int lid = get_local_id(0);
+    int tile = get_group_id(0);
+    int expert = tile_expert[tile];
+    if (expert < 0) return;
+    int local_m0 = tile_m0[tile];
+    int packed_m0 = token_offset[expert] + local_m0;
+    int count = expert_count[expert];
+    int subgroup = lid >> 4;
+    int lane = lid & 15;
+    int wm = (subgroup & 3) * 8;
+    int wn = (subgroup >> 2) * 32 + lane;
+    int n0 = get_group_id(1) * 128;
+    float acc[8][2] = {{0.0f}};
+    for (int kb = 0; kb < blocks * 32; kb += 32) {
+        for (int x = lid; x < XE_PREFILL_TM * 32; x += 256) {
+            int lm = x >> 5;
+            int lk = x & 31;
+            int gm = packed_m0 + lm;
+            la[x] = local_m0 + lm < count
+                    ? aq[(size_t)gm * blocks * 32 + kb + lk] : 0;
+        }
+        for (int x = lid; x < 128 * 4; x += 256) {
+            int ln = x >> 2;
+            int c = x & 3;
+            int gn = n0 + ln;
+            __global const uint *source = (__global const uint *)(
+                wq + (((size_t)expert * (n_count >> 3) + (gn >> 3))
+                      * blocks + kb / 32) * 128
+                + c * 32 + (gn & 7) * 4);
+            uchar4 packed = as_uchar4(*source);
+            int base = ln * 32 + c * 4;
+            vstore4(convert_char4(packed & (uchar4)(15)) - (char4)(8),
+                    0, lw + base);
+            vstore4(convert_char4(packed >> (uchar4)(4)) - (char4)(8),
+                    0, lw + base + 16);
+        }
+        if (lid < XE_PREFILL_TM) {
+            int lm = lid;
+            int gm = packed_m0 + lm;
+            int valid = local_m0 + lm < count;
+            lad[lid] = valid
+                       ? ad[(size_t)gm * blocks + kb / 32] : (half)0;
+        }
+        if (lid < 128) {
+            int ln = lid;
+            int gn = n0 + ln;
+            lwd[ln] =
+                wd[(((size_t)expert * (n_count >> 3) + (gn >> 3))
+                    * blocks + kb / 32) * 8 + (gn & 7)];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (int im = 0; im < 8; im++) {
+            int lm = wm + im;
+            float da = (float)lad[lm];
+            int integer0 = 0;
+            int integer1 = 0;
+            #pragma unroll
+            for (int c = 0; c < 8; c++) {
+                char4 activation = vload4(0, la + lm * 32 + c * 4);
+                integer0 += dot(vload4(
+                    0, lw + wn * 32 + c * 4), activation);
+                integer1 += dot(vload4(
+                    0, lw + (wn + 16) * 32 + c * 4), activation);
+            }
+            acc[im][0] += (float)integer0 * da * (float)lwd[wn];
+            acc[im][1] += (float)integer1 * da * (float)lwd[wn + 16];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    #pragma unroll
+    for (int im = 0; im < 8; im++) {
+        int lm = wm + im;
+        if (local_m0 + lm >= count) continue;
+        int gm = packed_m0 + lm;
+        out[(size_t)gm * n_count + n0 + wn] = acc[im][0];
+        out[(size_t)gm * n_count + n0 + wn + 16] = acc[im][1];
+    }
+}
+
 __attribute__((intel_reqd_sub_group_size(16)))
-__kernel void xe_prefill_q4q8_grouped_n64(
+__kernel void xe_prefill_q4q8_grouped_n128(
                                         __global const uchar *wq,
                                         __global const half *wd,
                                         __global const char *aq,
@@ -818,101 +1413,59 @@ __kernel void xe_prefill_q4q8_grouped_n64(
                                         __global const int *tile_m0,
                                         int n_count,
                                         int blocks) {
-    __local char la[XE_PREFILL_TM * XE_PREFILL_KB];
-    __local uchar lw[64 * (XE_PREFILL_KB / 2)];
-    __local half lad[XE_PREFILL_TM * 2];
-    __local short las[XE_PREFILL_TM * 2];
-    __local half lwd[64 * 2];
-    int lid = get_local_id(0);
-    int tile = get_group_id(0);
-    int expert = tile_expert[tile];
-    if (expert < 0) return;
-    int local_m0 = tile_m0[tile];
-    int packed_m0 = token_offset[expert] + local_m0;
-    int count = expert_count[expert];
-    int wm = lid >> 4;
-    int wn = lid & 15;
-    int n0 = get_group_id(1) * 64;
-    float acc[4][4] = {{0.0f}};
-    for (int kb = 0; kb < blocks * 32; kb += XE_PREFILL_KB) {
-        for (int x = lid; x < XE_PREFILL_TM * XE_PREFILL_KB; x += 128) {
-            int lm = x / XE_PREFILL_KB;
-            int lk = x - lm * XE_PREFILL_KB;
-            int gm = packed_m0 + lm;
-            la[x] = local_m0 + lm < count
-                    ? aq[(size_t)gm * blocks * 32 + kb + lk] : 0;
-        }
-        #pragma unroll
-        for (int seg = 0; seg < 16; seg++) {
-            int lng = seg >> 1;
-            int lb = seg & 1;
-            int chunk = lid >> 5;
-            int rem = lid & 31;
-            int row8 = rem >> 2;
-            int j = rem & 3;
-            int ln = lng * 8 + row8;
-            lw[ln * 32 + lb * 16 + chunk * 4 + j] =
-                wq[(((size_t)expert * (n_count >> 3) + (n0 >> 3) + lng)
-                     * blocks + kb / 32 + lb) * 128 + lid];
-        }
-        if (lid < XE_PREFILL_TM * 2) {
-            int lm = lid >> 1;
-            int lb = lid & 1;
-            int gm = packed_m0 + lm;
-            int valid = local_m0 + lm < count;
-            lad[lid] = valid
-                       ? ad[(size_t)gm * blocks + kb / 32 + lb] : (half)0;
-            las[lid] = valid
-                       ? as[(size_t)gm * blocks + kb / 32 + lb] : (short)0;
-        }
-        {
-            int seg = lid >> 3;
-            int row8 = lid & 7;
-            int lng = seg >> 1;
-            int lb = seg & 1;
-            lwd[(lng * 8 + row8) * 2 + lb] =
-                wd[(((size_t)expert * (n_count >> 3) + (n0 >> 3) + lng)
-                    * blocks + kb / 32 + lb) * 8 + row8];
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        #pragma unroll
-        for (int lb = 0; lb < 2; lb++) {
-            #pragma unroll
-            for (int im = 0; im < 4; im++) {
-                int lm = wm + im * 8;
-                int correction = 8 * (int)las[lm * 2 + lb];
-                float da = (float)lad[lm * 2 + lb];
-                #pragma unroll
-                for (int in = 0; in < 4; in++) {
-                    int ln = wn + in * 16;
-                    int integer = 0;
-                    #pragma unroll
-                    for (int c = 0; c < 4; c++) {
-                        uchar4 packed = vload4(
-                            0, lw + ln * 32 + lb * 16 + c * 4);
-                        char4 lo = vload4(
-                            0, la + lm * XE_PREFILL_KB + lb * 32 + c * 4);
-                        char4 hi = vload4(
-                            0, la + lm * XE_PREFILL_KB + lb * 32 + 16 + c * 4);
-                        integer += dot(packed & (uchar4)(15), lo)
-                                   + dot(packed >> (uchar4)(4), hi);
-                    }
-                    acc[im][in] += (float)(integer - correction) * da
-                                   * (float)lwd[ln * 2 + lb];
-                }
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    #pragma unroll
-    for (int im = 0; im < 4; im++) {
-        int lm = wm + im * 8;
-        if (local_m0 + lm >= count) continue;
-        int gm = packed_m0 + lm;
-        #pragma unroll
-        for (int in = 0; in < 4; in++)
-            out[(size_t)gm * n_count + n0 + wn + in * 16] = acc[im][in];
-    }
+    __local char la[XE_PREFILL_TM * 32];
+    __local char lw[128 * 32];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_grouped_n128_body(
+        wq, wd, aq, ad, as, out, expert_count, token_offset,
+        tile_expert, tile_m0, n_count, blocks, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_grouped_gate_n128(
+                                        __global const uchar *wq,
+                                        __global const half *wd,
+                                        __global const char *aq,
+                                        __global const half *ad,
+                                        __global const short *as,
+                                        __global float *out,
+                                        __global const int *expert_count,
+                                        __global const int *token_offset,
+                                        __global const int *tile_expert,
+                                        __global const int *tile_m0,
+                                        int n_count,
+                                        int blocks) {
+    __local char la[XE_PREFILL_TM * 32];
+    __local char lw[128 * 32];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_grouped_n128_body(
+        wq, wd, aq, ad, as, out, expert_count, token_offset,
+        tile_expert, tile_m0, 1408, 88, la, lw, lad, lwd);
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_grouped_down_n128(
+                                        __global const uchar *wq,
+                                        __global const half *wd,
+                                        __global const char *aq,
+                                        __global const half *ad,
+                                        __global const short *as,
+                                        __global float *out,
+                                        __global const int *expert_count,
+                                        __global const int *token_offset,
+                                        __global const int *tile_expert,
+                                        __global const int *tile_m0,
+                                        int n_count,
+                                        int blocks) {
+    __local char la[XE_PREFILL_TM * 32];
+    __local char lw[128 * 32];
+    __local half lad[XE_PREFILL_TM];
+    __local half lwd[128];
+    xe_prefill_q4q8_grouped_n128_body(
+        wq, wd, aq, ad, as, out, expert_count, token_offset,
+        tile_expert, tile_m0, 2816, 22, la, lw, lad, lwd);
 }
 
 __attribute__((intel_reqd_sub_group_size(16)))
@@ -930,10 +1483,10 @@ __kernel void xe_prefill_q4q8_grouped_m16_n64(
                                         int n_count,
                                         int blocks) {
     __local char la[16 * XE_PREFILL_KB];
-    __local uchar lw[64 * (XE_PREFILL_KB / 2)];
+    __local uchar lw[32 * (XE_PREFILL_KB / 2)];
     __local half lad[16 * 2];
     __local short las[16 * 2];
-    __local half lwd[64 * 2];
+    __local half lwd[32 * 2];
     int lid = get_local_id(0);
     int tile = get_group_id(0);
     int expert = tile_expert[tile];
@@ -943,8 +1496,9 @@ __kernel void xe_prefill_q4q8_grouped_m16_n64(
     int count = expert_count[expert];
     int wm = lid >> 4;
     int wn = lid & 15;
-    int n0 = get_group_id(1) * 64;
-    float acc[2][4] = {{0.0f}};
+    int n0 = get_group_id(1) * 32;
+    float acc[2][2] = {{0.0f}};
+
     for (int kb = 0; kb < blocks * 32; kb += XE_PREFILL_KB) {
         for (int x = lid; x < 16 * XE_PREFILL_KB; x += 128) {
             int lm = x / XE_PREFILL_KB;
@@ -954,7 +1508,7 @@ __kernel void xe_prefill_q4q8_grouped_m16_n64(
                     ? aq[(size_t)gm * blocks * 32 + kb + lk] : 0;
         }
         #pragma unroll
-        for (int seg = 0; seg < 16; seg++) {
+        for (int seg = 0; seg < 8; seg++) {
             int lng = seg >> 1;
             int lb = seg & 1;
             int chunk = lid >> 5;
@@ -976,7 +1530,7 @@ __kernel void xe_prefill_q4q8_grouped_m16_n64(
             las[lid] = valid
                        ? as[(size_t)gm * blocks + kb / 32 + lb] : (short)0;
         }
-        {
+        if (lid < 64) {
             int seg = lid >> 3;
             int row8 = lid & 7;
             int lng = seg >> 1;
@@ -994,7 +1548,7 @@ __kernel void xe_prefill_q4q8_grouped_m16_n64(
                 int correction = 8 * (int)las[lm * 2 + lb];
                 float da = (float)lad[lm * 2 + lb];
                 #pragma unroll
-                for (int in = 0; in < 4; in++) {
+                for (int in = 0; in < 2; in++) {
                     int ln = wn + in * 16;
                     int integer = 0;
                     #pragma unroll
@@ -1021,8 +1575,285 @@ __kernel void xe_prefill_q4q8_grouped_m16_n64(
         if (local_m0 + lm >= count) continue;
         int gm = packed_m0 + lm;
         #pragma unroll
-        for (int in = 0; in < 4; in++)
+        for (int in = 0; in < 2; in++)
             out[(size_t)gm * n_count + n0 + wn + in * 16] = acc[im][in];
+    }
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_grouped_m16_n128(
+                                        __global const uchar *wq,
+                                        __global const half *wd,
+                                        __global const char *aq,
+                                        __global const half *ad,
+                                        __global const short *as,
+                                        __global float *out,
+                                        __global const int *expert_count,
+                                        __global const int *token_offset,
+                                        __global const int *tile_expert,
+                                        __global const int *tile_m0,
+    int n_count,
+    int blocks) {
+    __local char la[16 * XE_PREFILL_KB];
+    __local uint lw[128 * 8];
+    __local half lad[16 * 2];
+    __local short las[16 * 2];
+    __local half lwd[128 * 2];
+    int lid = get_local_id(0);
+    int tile = get_group_id(0);
+    int expert = tile_expert[tile];
+    if (expert < 0) return;
+    int local_m0 = tile_m0[tile];
+    int packed_m0 = token_offset[expert] + local_m0;
+    int count = expert_count[expert];
+    int subgroup = lid >> 4;
+    int lane = lid & 15;
+    int wm = (subgroup & 1) * 8;
+    int wn = (subgroup >> 1) * 32 + lane;
+    int n0 = get_group_id(1) * 128;
+    float acc[8][2] = {{0.0f}};
+    for (int kb = 0; kb < blocks * 32; kb += XE_PREFILL_KB) {
+        for (int x = lid; x < 16 * XE_PREFILL_KB; x += 128) {
+            int lm = x / XE_PREFILL_KB;
+            int lk = x - lm * XE_PREFILL_KB;
+            int gm = packed_m0 + lm;
+            la[x] = local_m0 + lm < count
+                    ? aq[(size_t)gm * blocks * 32 + kb + lk] : 0;
+        }
+        for (int x = lid; x < 128 * 8; x += 128) {
+            int ln = x >> 3;
+            int q = x & 7;
+            int lb = q >> 2;
+            int c = q & 3;
+            int gn = n0 + ln;
+            __global const uint *source = (__global const uint *)(
+                wq + (((size_t)expert * (n_count >> 3) + (gn >> 3))
+                      * blocks + kb / 32 + lb) * 128
+                + c * 32 + (gn & 7) * 4);
+            lw[(lb * 4 + c) * 128 + ln] = *source;
+        }
+        if (lid < 16 * 2) {
+            int lm = lid >> 1;
+            int lb = lid & 1;
+            int gm = packed_m0 + lm;
+            int valid = local_m0 + lm < count;
+            lad[lid] = valid
+                       ? ad[(size_t)gm * blocks + kb / 32 + lb] : (half)0;
+            las[lid] = valid
+                       ? as[(size_t)gm * blocks + kb / 32 + lb] : (short)0;
+        }
+        for (int x = lid; x < 128 * 2; x += 128) {
+            int ln = x >> 1;
+            int lb = x & 1;
+            int gn = n0 + ln;
+            lwd[lb * 128 + ln] =
+                wd[(((size_t)expert * (n_count >> 3) + (gn >> 3))
+                    * blocks + kb / 32 + lb) * 8 + (gn & 7)];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (int lb = 0; lb < 2; lb++) {
+            uchar4 packed00 = as_uchar4(lw[(lb * 4) * 128 + wn]);
+            uchar4 packed01 = as_uchar4(lw[(lb * 4 + 1) * 128 + wn]);
+            uchar4 packed02 = as_uchar4(lw[(lb * 4 + 2) * 128 + wn]);
+            uchar4 packed03 = as_uchar4(lw[(lb * 4 + 3) * 128 + wn]);
+            uchar4 packed10 = as_uchar4(lw[(lb * 4) * 128 + wn + 16]);
+            uchar4 packed11 = as_uchar4(lw[(lb * 4 + 1) * 128 + wn + 16]);
+            uchar4 packed12 = as_uchar4(lw[(lb * 4 + 2) * 128 + wn + 16]);
+            uchar4 packed13 = as_uchar4(lw[(lb * 4 + 3) * 128 + wn + 16]);
+            #pragma unroll
+            for (int im = 0; im < 8; im++) {
+                int lm = wm + im;
+                int correction = 8 * (int)las[lm * 2 + lb];
+                float da = (float)lad[lm * 2 + lb];
+                char4 lo0 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32);
+                char4 lo1 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 4);
+                char4 lo2 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 8);
+                char4 lo3 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 12);
+                char4 hi0 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 16);
+                char4 hi1 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 20);
+                char4 hi2 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 24);
+                char4 hi3 = vload4(
+                    0, la + lm * XE_PREFILL_KB + lb * 32 + 28);
+                int integer0 = dot(packed00 & (uchar4)(15), lo0)
+                               + dot(packed00 >> (uchar4)(4), hi0)
+                               + dot(packed01 & (uchar4)(15), lo1)
+                               + dot(packed01 >> (uchar4)(4), hi1)
+                               + dot(packed02 & (uchar4)(15), lo2)
+                               + dot(packed02 >> (uchar4)(4), hi2)
+                               + dot(packed03 & (uchar4)(15), lo3)
+                               + dot(packed03 >> (uchar4)(4), hi3);
+                int integer1 = dot(packed10 & (uchar4)(15), lo0)
+                               + dot(packed10 >> (uchar4)(4), hi0)
+                               + dot(packed11 & (uchar4)(15), lo1)
+                               + dot(packed11 >> (uchar4)(4), hi1)
+                               + dot(packed12 & (uchar4)(15), lo2)
+                               + dot(packed12 >> (uchar4)(4), hi2)
+                               + dot(packed13 & (uchar4)(15), lo3)
+                               + dot(packed13 >> (uchar4)(4), hi3);
+                acc[im][0] += (float)(integer0 - correction) * da
+                              * (float)lwd[lb * 128 + wn];
+                acc[im][1] += (float)(integer1 - correction) * da
+                              * (float)lwd[lb * 128 + wn + 16];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    #pragma unroll
+    for (int im = 0; im < 8; im++) {
+        int lm = wm + im;
+        if (local_m0 + lm >= count) continue;
+        int gm = packed_m0 + lm;
+        out[(size_t)gm * n_count + n0 + wn] = acc[im][0];
+        out[(size_t)gm * n_count + n0 + wn + 16] = acc[im][1];
+    }
+}
+
+static inline int xe_prefill_grouped_m8_integer(
+        uchar4 packed0, uchar4 packed1, uchar4 packed2, uchar4 packed3,
+        __local const char *activation, int correction) {
+    char4 lo0 = vload4(0, activation);
+    char4 lo1 = vload4(0, activation + 4);
+    char4 lo2 = vload4(0, activation + 8);
+    char4 lo3 = vload4(0, activation + 12);
+    char4 hi0 = vload4(0, activation + 16);
+    char4 hi1 = vload4(0, activation + 20);
+    char4 hi2 = vload4(0, activation + 24);
+    char4 hi3 = vload4(0, activation + 28);
+    return dot(packed0 & (uchar4)(15), lo0)
+           + dot(packed0 >> (uchar4)(4), hi0)
+           + dot(packed1 & (uchar4)(15), lo1)
+           + dot(packed1 >> (uchar4)(4), hi1)
+           + dot(packed2 & (uchar4)(15), lo2)
+           + dot(packed2 >> (uchar4)(4), hi2)
+           + dot(packed3 & (uchar4)(15), lo3)
+           + dot(packed3 >> (uchar4)(4), hi3) - correction;
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_q4q8_grouped_m8_n128(
+                                        __global const uchar *wq,
+                                        __global const half *wd,
+                                        __global const char *aq,
+                                        __global const half *ad,
+                                        __global const short *as,
+                                        __global float *out,
+                                        __global const int *expert_count,
+                                        __global const int *token_offset,
+                                        __global const int *tile_expert,
+                                        __global const int *tile_m0,
+    int n_count,
+    int blocks) {
+    __local char la[8 * XE_PREFILL_KB];
+    __local uint lw[128 * 8];
+    __local half lad[8 * 2];
+    __local short las[8 * 2];
+    __local half lwd[128 * 2];
+    int lid = get_local_id(0);
+    int tile = get_group_id(0);
+    int expert = tile_expert[tile];
+    if (expert < 0) return;
+    int local_m0 = tile_m0[tile];
+    int packed_m0 = token_offset[expert] + local_m0;
+    int count = expert_count[expert];
+    int subgroup = lid >> 4;
+    int lane = lid & 15;
+    int wn = subgroup * 16 + lane;
+    int n0 = get_group_id(1) * 128;
+    float8 acc = (float8)(0.0f);
+    for (int kb = 0; kb < blocks * 32; kb += XE_PREFILL_KB) {
+        for (int x = lid; x < 8 * XE_PREFILL_KB; x += 128) {
+            int lm = x / XE_PREFILL_KB;
+            int lk = x - lm * XE_PREFILL_KB;
+            int gm = packed_m0 + lm;
+            la[x] = local_m0 + lm < count
+                    ? aq[(size_t)gm * blocks * 32 + kb + lk] : 0;
+        }
+        for (int x = lid; x < 128 * 8; x += 128) {
+            int ln = x >> 3;
+            int q = x & 7;
+            int lb = q >> 2;
+            int c = q & 3;
+            int gn = n0 + ln;
+            __global const uint *source = (__global const uint *)(
+                wq + (((size_t)expert * (n_count >> 3) + (gn >> 3))
+                      * blocks + kb / 32 + lb) * 128
+                + c * 32 + (gn & 7) * 4);
+            lw[(lb * 4 + c) * 128 + ln] = *source;
+        }
+        if (lid < 8 * 2) {
+            int lm = lid >> 1;
+            int lb = lid & 1;
+            int gm = packed_m0 + lm;
+            int valid = local_m0 + lm < count;
+            lad[lid] = valid
+                       ? ad[(size_t)gm * blocks + kb / 32 + lb] : (half)0;
+            las[lid] = valid
+                       ? as[(size_t)gm * blocks + kb / 32 + lb] : (short)0;
+        }
+        for (int x = lid; x < 128 * 2; x += 128) {
+            int ln = x >> 1;
+            int lb = x & 1;
+            int gn = n0 + ln;
+            lwd[lb * 128 + ln] =
+                wd[(((size_t)expert * (n_count >> 3) + (gn >> 3))
+                    * blocks + kb / 32 + lb) * 8 + (gn & 7)];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (int lb = 0; lb < 2; lb++) {
+            uchar4 packed0 = as_uchar4(lw[(lb * 4) * 128 + wn]);
+            uchar4 packed1 = as_uchar4(lw[(lb * 4 + 1) * 128 + wn]);
+            uchar4 packed2 = as_uchar4(lw[(lb * 4 + 2) * 128 + wn]);
+            uchar4 packed3 = as_uchar4(lw[(lb * 4 + 3) * 128 + wn]);
+            float8 contribution = (float8)(
+                (float)xe_prefill_grouped_m8_integer(
+                    packed0, packed1, packed2, packed3,
+                    la + lb * 32, 8 * (int)las[lb]) * (float)lad[lb],
+                (float)xe_prefill_grouped_m8_integer(
+                    packed0, packed1, packed2, packed3,
+                    la + XE_PREFILL_KB + lb * 32,
+                    8 * (int)las[2 + lb]) * (float)lad[2 + lb],
+                (float)xe_prefill_grouped_m8_integer(
+                    packed0, packed1, packed2, packed3,
+                    la + 2 * XE_PREFILL_KB + lb * 32,
+                    8 * (int)las[4 + lb]) * (float)lad[4 + lb],
+                (float)xe_prefill_grouped_m8_integer(
+                    packed0, packed1, packed2, packed3,
+                    la + 3 * XE_PREFILL_KB + lb * 32,
+                    8 * (int)las[6 + lb]) * (float)lad[6 + lb],
+                (float)xe_prefill_grouped_m8_integer(
+                    packed0, packed1, packed2, packed3,
+                    la + 4 * XE_PREFILL_KB + lb * 32,
+                    8 * (int)las[8 + lb]) * (float)lad[8 + lb],
+                (float)xe_prefill_grouped_m8_integer(
+                    packed0, packed1, packed2, packed3,
+                    la + 5 * XE_PREFILL_KB + lb * 32,
+                    8 * (int)las[10 + lb]) * (float)lad[10 + lb],
+                (float)xe_prefill_grouped_m8_integer(
+                    packed0, packed1, packed2, packed3,
+                    la + 6 * XE_PREFILL_KB + lb * 32,
+                    8 * (int)las[12 + lb]) * (float)lad[12 + lb],
+                (float)xe_prefill_grouped_m8_integer(
+                    packed0, packed1, packed2, packed3,
+                    la + 7 * XE_PREFILL_KB + lb * 32,
+                    8 * (int)las[14 + lb]) * (float)lad[14 + lb]);
+            acc += contribution * (float)lwd[lb * 128 + wn];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    #pragma unroll
+    for (int lm = 0; lm < 8; lm++) {
+        if (local_m0 + lm >= count) continue;
+        int gm = packed_m0 + lm;
+        out[(size_t)gm * n_count + n0 + wn] = acc[lm];
     }
 }
 

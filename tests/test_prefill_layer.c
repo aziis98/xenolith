@@ -38,6 +38,55 @@ static int layer_run(xe_engine *e, int layer_index, int rows) {
     float *attention_snapshot = xe_alloc(
         NULL, (size_t)rows * XE_EMBD * sizeof(*attention_snapshot),
         XE_MEM_HOST);
+    float *hidden_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EMBD * sizeof(*hidden_snapshot), XE_MEM_HOST);
+    float *dense_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EMBD * sizeof(*dense_snapshot), XE_MEM_HOST);
+    float *moe_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EMBD * sizeof(*moe_snapshot), XE_MEM_HOST);
+    float *expert_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED * XE_EMBD
+              * sizeof(*expert_snapshot), XE_MEM_HOST);
+    float *expert_gate_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED * 2 * XE_EXPERT_FFN
+              * sizeof(*expert_gate_snapshot), XE_MEM_HOST);
+    int8_t *expert_activation_q_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED * XE_EXPERT_FFN,
+        XE_MEM_HOST);
+    _Float16 *expert_activation_d_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED * (XE_EXPERT_FFN / 32)
+              * sizeof(*expert_activation_d_snapshot), XE_MEM_HOST);
+    int16_t *expert_activation_s_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED * (XE_EXPERT_FFN / 32)
+              * sizeof(*expert_activation_s_snapshot), XE_MEM_HOST);
+    int *route_packed_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED
+              * sizeof(*route_packed_snapshot), XE_MEM_HOST);
+    int *packed_route_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED
+              * sizeof(*packed_route_snapshot), XE_MEM_HOST);
+    int *route_expert_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED
+              * sizeof(*route_expert_snapshot), XE_MEM_HOST);
+    float *route_weight_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED
+              * sizeof(*route_weight_snapshot), XE_MEM_HOST);
+    int8_t *packed_moe_q_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED * XE_EMBD, XE_MEM_HOST);
+    _Float16 *packed_moe_d_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED * (XE_EMBD / 32)
+              * sizeof(*packed_moe_d_snapshot), XE_MEM_HOST);
+    int16_t *packed_moe_s_snapshot = xe_alloc(
+        NULL, (size_t)rows * XE_EXPERTS_USED * (XE_EMBD / 32)
+              * sizeof(*packed_moe_s_snapshot), XE_MEM_HOST);
+    int *expert_count_snapshot = xe_alloc(
+        NULL, XE_EXPERTS * sizeof(*expert_count_snapshot), XE_MEM_HOST);
+    int *token_offset_snapshot = xe_alloc(
+        NULL, (XE_EXPERTS + 1) * sizeof(*token_offset_snapshot), XE_MEM_HOST);
+    int *tile_expert_snapshot = xe_alloc(
+        NULL, 256 * sizeof(*tile_expert_snapshot), XE_MEM_HOST);
+    int *tile_m0_snapshot = xe_alloc(
+        NULL, 256 * sizeof(*tile_m0_snapshot), XE_MEM_HOST);
     double start = layer_now();
     xe_prefill_attention_initial_append(e, layer_index, &workspace, rows);
     xe_ze_check("zeCommandListHostSynchronize prefill layer attention",
@@ -53,6 +102,50 @@ static int layer_run(xe_engine *e, int layer_index, int rows) {
     xe_prefill_ffn_append(e, layer_index, &workspace, rows);
     xe_ze_check("zeCommandListHostSynchronize prefill layer FFN",
                 zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
+    memcpy(hidden_snapshot, workspace.hidden[1],
+           (size_t)rows * XE_EMBD * sizeof(*hidden_snapshot));
+    memcpy(dense_snapshot, workspace.dense_down,
+           (size_t)rows * XE_EMBD * sizeof(*dense_snapshot));
+    memcpy(moe_snapshot, workspace.moe_output,
+           (size_t)rows * XE_EMBD * sizeof(*moe_snapshot));
+    memcpy(expert_snapshot, workspace.expert_down,
+           (size_t)rows * XE_EXPERTS_USED * XE_EMBD
+           * sizeof(*expert_snapshot));
+    memcpy(expert_gate_snapshot, workspace.expert_gate_up,
+           (size_t)rows * XE_EXPERTS_USED * 2 * XE_EXPERT_FFN
+           * sizeof(*expert_gate_snapshot));
+    memcpy(expert_activation_q_snapshot, workspace.expert_activation.qs,
+           (size_t)rows * XE_EXPERTS_USED * XE_EXPERT_FFN);
+    memcpy(expert_activation_d_snapshot, workspace.expert_activation.d,
+           (size_t)rows * XE_EXPERTS_USED * (XE_EXPERT_FFN / 32)
+           * sizeof(*expert_activation_d_snapshot));
+    memcpy(expert_activation_s_snapshot, workspace.expert_activation.sigma,
+           (size_t)rows * XE_EXPERTS_USED * (XE_EXPERT_FFN / 32)
+           * sizeof(*expert_activation_s_snapshot));
+    memcpy(route_packed_snapshot, workspace.routes.route_packed,
+           (size_t)rows * XE_EXPERTS_USED * sizeof(*route_packed_snapshot));
+    memcpy(packed_route_snapshot, workspace.routes.packed_route,
+           (size_t)rows * XE_EXPERTS_USED * sizeof(*packed_route_snapshot));
+    memcpy(route_expert_snapshot, workspace.route_expert,
+           (size_t)rows * XE_EXPERTS_USED * sizeof(*route_expert_snapshot));
+    memcpy(route_weight_snapshot, workspace.route_weight,
+           (size_t)rows * XE_EXPERTS_USED * sizeof(*route_weight_snapshot));
+    memcpy(packed_moe_q_snapshot, workspace.packed_moe.qs,
+           (size_t)rows * XE_EXPERTS_USED * XE_EMBD);
+    memcpy(packed_moe_d_snapshot, workspace.packed_moe.d,
+           (size_t)rows * XE_EXPERTS_USED * (XE_EMBD / 32)
+           * sizeof(*packed_moe_d_snapshot));
+    memcpy(packed_moe_s_snapshot, workspace.packed_moe.sigma,
+           (size_t)rows * XE_EXPERTS_USED * (XE_EMBD / 32)
+           * sizeof(*packed_moe_s_snapshot));
+    memcpy(expert_count_snapshot, workspace.routes.expert_count,
+           XE_EXPERTS * sizeof(*expert_count_snapshot));
+    memcpy(token_offset_snapshot, workspace.routes.token_offset,
+           (XE_EXPERTS + 1) * sizeof(*token_offset_snapshot));
+    memcpy(tile_expert_snapshot, workspace.routes.tile_expert,
+           256 * sizeof(*tile_expert_snapshot));
+    memcpy(tile_m0_snapshot, workspace.routes.tile_m0,
+           256 * sizeof(*tile_m0_snapshot));
     double cold_ms = (layer_now() - start) * 1000.0;
     const int repetitions = rows == 512 ? 5 : 10;
     start = layer_now();
@@ -62,8 +155,102 @@ static int layer_run(xe_engine *e, int layer_index, int rows) {
                 zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
     double warm_ms = (layer_now() - start) * 1000.0 / repetitions;
     int finite = 1;
-    for (size_t i = 0; i < (size_t)rows * XE_EMBD; i++)
+    size_t repeat_mismatches = 0;
+    size_t q_repeat_mismatches = 0;
+    size_t heads_repeat_mismatches = 0;
+    size_t projection_repeat_mismatches = 0;
+    size_t attention_repeat_mismatches = 0;
+    size_t dense_repeat_mismatches = 0;
+    size_t moe_repeat_mismatches = 0;
+    size_t expert_repeat_mismatches = 0;
+    size_t expert_gate_repeat_mismatches = 0;
+    size_t expert_activation_q_repeat_mismatches = 0;
+    size_t expert_activation_d_repeat_mismatches = 0;
+    size_t expert_activation_s_repeat_mismatches = 0;
+    size_t route_packed_repeat_mismatches = 0;
+    size_t packed_route_repeat_mismatches = 0;
+    size_t route_expert_repeat_mismatches = 0;
+    size_t route_weight_repeat_mismatches = 0;
+    size_t packed_moe_q_repeat_mismatches = 0;
+    size_t packed_moe_d_repeat_mismatches = 0;
+    size_t packed_moe_s_repeat_mismatches = 0;
+    size_t expert_count_repeat_mismatches = 0;
+    size_t token_offset_repeat_mismatches = 0;
+    size_t tile_expert_repeat_mismatches = 0;
+    size_t tile_m0_repeat_mismatches = 0;
+    for (size_t i = 0; i < (size_t)rows * q_width; i++) {
+        q_repeat_mismatches += workspace.q_heads[i] != q_snapshot[i];
+        heads_repeat_mismatches +=
+            workspace.attention_heads[i] != heads_snapshot[i];
+    }
+    for (size_t i = 0; i < (size_t)rows * XE_EMBD; i++) {
         finite &= isfinite(workspace.hidden[1][i]);
+        projection_repeat_mismatches +=
+            workspace.attention_projection[i] != projection_snapshot[i];
+        attention_repeat_mismatches +=
+            workspace.attention_output[i] != attention_snapshot[i];
+        dense_repeat_mismatches +=
+            workspace.dense_down[i] != dense_snapshot[i];
+        moe_repeat_mismatches +=
+            workspace.moe_output[i] != moe_snapshot[i];
+        repeat_mismatches += workspace.hidden[1][i] != hidden_snapshot[i];
+    }
+    for (size_t i = 0; i < (size_t)rows * XE_EXPERTS_USED * XE_EMBD; i++)
+        expert_repeat_mismatches +=
+            workspace.expert_down[i] != expert_snapshot[i];
+    for (size_t i = 0;
+         i < (size_t)rows * XE_EXPERTS_USED * 2 * XE_EXPERT_FFN; i++)
+        expert_gate_repeat_mismatches +=
+            workspace.expert_gate_up[i] != expert_gate_snapshot[i];
+    for (size_t i = 0;
+         i < (size_t)rows * XE_EXPERTS_USED * XE_EXPERT_FFN; i++)
+        expert_activation_q_repeat_mismatches +=
+            workspace.expert_activation.qs[i]
+            != expert_activation_q_snapshot[i];
+    for (size_t i = 0;
+         i < (size_t)rows * XE_EXPERTS_USED * (XE_EXPERT_FFN / 32); i++)
+        expert_activation_d_repeat_mismatches +=
+            workspace.expert_activation.d[i]
+            != expert_activation_d_snapshot[i];
+    for (size_t i = 0;
+         i < (size_t)rows * XE_EXPERTS_USED * (XE_EXPERT_FFN / 32); i++)
+        expert_activation_s_repeat_mismatches +=
+            workspace.expert_activation.sigma[i]
+            != expert_activation_s_snapshot[i];
+    for (size_t i = 0; i < (size_t)rows * XE_EXPERTS_USED; i++)
+        route_packed_repeat_mismatches +=
+            workspace.routes.route_packed[i] != route_packed_snapshot[i];
+    for (size_t i = 0; i < (size_t)rows * XE_EXPERTS_USED; i++) {
+        packed_route_repeat_mismatches +=
+            workspace.routes.packed_route[i] != packed_route_snapshot[i];
+        route_expert_repeat_mismatches +=
+            workspace.route_expert[i] != route_expert_snapshot[i];
+        route_weight_repeat_mismatches +=
+            workspace.route_weight[i] != route_weight_snapshot[i];
+    }
+    for (size_t i = 0; i < (size_t)rows * XE_EXPERTS_USED * XE_EMBD; i++)
+        packed_moe_q_repeat_mismatches +=
+            workspace.packed_moe.qs[i] != packed_moe_q_snapshot[i];
+    for (size_t i = 0;
+         i < (size_t)rows * XE_EXPERTS_USED * (XE_EMBD / 32); i++)
+        packed_moe_d_repeat_mismatches +=
+            workspace.packed_moe.d[i] != packed_moe_d_snapshot[i];
+    for (size_t i = 0;
+         i < (size_t)rows * XE_EXPERTS_USED * (XE_EMBD / 32); i++)
+        packed_moe_s_repeat_mismatches +=
+            workspace.packed_moe.sigma[i] != packed_moe_s_snapshot[i];
+    for (size_t i = 0; i < XE_EXPERTS; i++)
+        expert_count_repeat_mismatches +=
+            workspace.routes.expert_count[i] != expert_count_snapshot[i];
+    for (size_t i = 0; i < XE_EXPERTS + 1; i++)
+        token_offset_repeat_mismatches +=
+            workspace.routes.token_offset[i] != token_offset_snapshot[i];
+    for (size_t i = 0; i < 256; i++) {
+        tile_expert_repeat_mismatches +=
+            workspace.routes.tile_expert[i] != tile_expert_snapshot[i];
+        tile_m0_repeat_mismatches +=
+            workspace.routes.tile_m0[i] != tile_m0_snapshot[i];
+    }
     double error = 0.0;
     double attention_error = 0.0;
     double router_input_error = 0.0;
@@ -288,10 +475,26 @@ static int layer_run(xe_engine *e, int layer_index, int rows) {
         ref_state_free(&reference_state);
     }
     int routes_ok = route_set_mismatches == 0 || mismatched_margin < 5e-4f;
-    int ok = finite && (rows != 32 || (routes_ok && error < 5e-3));
-    printf("prefill-layer: L%d %s M%d arena %.3f MiB cold %.6f ms warm %.6f ms input-q8 %d delta %d q-projection %.3e ref-projection %.3e q-post %.3e q-reference %.3e/%.3e q %.3e heads %.3e projection %.3e attention %.3e router-input %.3e routes %d/%d margin %.3e rel %.3e %s\n",
+    int ok = finite && repeat_mismatches == 0
+             && (rows != 32 || (routes_ok && error < 5e-3));
+    printf("prefill-layer-sigma: expert %zu packed %zu\n",
+           expert_activation_s_repeat_mismatches,
+           packed_moe_s_repeat_mismatches);
+    printf("prefill-layer: L%d %s M%d arena %.3f MiB cold %.6f ms warm %.6f ms repeat %zu q-repeat %zu heads-repeat %zu projection-repeat %zu attention-repeat %zu dense-repeat %zu expert-gate-repeat %zu expert-act-q-repeat %zu expert-act-d-repeat %zu expert-repeat %zu route-expert-repeat %zu route-weight-repeat %zu packed-route-repeat %zu route-packed-repeat %zu packed-moe-q-repeat %zu packed-moe-d-repeat %zu expert-count-repeat %zu token-offset-repeat %zu tile-expert-repeat %zu tile-m0-repeat %zu moe-repeat %zu input-q8 %d delta %d q-projection %.3e ref-projection %.3e q-post %.3e q-reference %.3e/%.3e q %.3e heads %.3e projection %.3e attention %.3e router-input %.3e routes %d/%d margin %.3e rel %.3e %s\n",
            layer_index, XE_IS_GLOBAL(layer_index) ? "global" : "swa", rows,
            (double)workspace_size / (1024.0 * 1024.0), cold_ms, warm_ms,
+           repeat_mismatches, q_repeat_mismatches, heads_repeat_mismatches,
+           projection_repeat_mismatches, attention_repeat_mismatches,
+           dense_repeat_mismatches, expert_gate_repeat_mismatches,
+           expert_activation_q_repeat_mismatches,
+           expert_activation_d_repeat_mismatches,
+           expert_repeat_mismatches,
+           route_expert_repeat_mismatches, route_weight_repeat_mismatches,
+           packed_route_repeat_mismatches, route_packed_repeat_mismatches,
+           packed_moe_q_repeat_mismatches, packed_moe_d_repeat_mismatches,
+           expert_count_repeat_mismatches, token_offset_repeat_mismatches,
+           tile_expert_repeat_mismatches, tile_m0_repeat_mismatches,
+           moe_repeat_mismatches,
            input_q8_mismatches, input_q8_delta, q_projection_error,
            reference_projection_error, q_post_error, q_reference_error,
            q_reference_row0_error, q_error, heads_error,
@@ -301,6 +504,25 @@ static int layer_run(xe_engine *e, int layer_index, int rows) {
            error,
            ok ? "PASS" : "FAIL");
     xe_free(NULL, attention_snapshot, XE_MEM_HOST);
+    xe_free(NULL, route_packed_snapshot, XE_MEM_HOST);
+    xe_free(NULL, packed_moe_d_snapshot, XE_MEM_HOST);
+    xe_free(NULL, packed_moe_s_snapshot, XE_MEM_HOST);
+    xe_free(NULL, tile_m0_snapshot, XE_MEM_HOST);
+    xe_free(NULL, tile_expert_snapshot, XE_MEM_HOST);
+    xe_free(NULL, token_offset_snapshot, XE_MEM_HOST);
+    xe_free(NULL, expert_count_snapshot, XE_MEM_HOST);
+    xe_free(NULL, packed_moe_q_snapshot, XE_MEM_HOST);
+    xe_free(NULL, route_weight_snapshot, XE_MEM_HOST);
+    xe_free(NULL, route_expert_snapshot, XE_MEM_HOST);
+    xe_free(NULL, packed_route_snapshot, XE_MEM_HOST);
+    xe_free(NULL, expert_activation_d_snapshot, XE_MEM_HOST);
+    xe_free(NULL, expert_activation_s_snapshot, XE_MEM_HOST);
+    xe_free(NULL, expert_activation_q_snapshot, XE_MEM_HOST);
+    xe_free(NULL, expert_gate_snapshot, XE_MEM_HOST);
+    xe_free(NULL, expert_snapshot, XE_MEM_HOST);
+    xe_free(NULL, moe_snapshot, XE_MEM_HOST);
+    xe_free(NULL, dense_snapshot, XE_MEM_HOST);
+    xe_free(NULL, hidden_snapshot, XE_MEM_HOST);
     xe_free(NULL, projection_snapshot, XE_MEM_HOST);
     xe_free(NULL, heads_snapshot, XE_MEM_HOST);
     xe_free(NULL, q_snapshot, XE_MEM_HOST);
@@ -315,9 +537,18 @@ int main(int argc, char **argv) {
     }
     const char *model = argv[1];
     int rows = argc > 2 ? (int)strtol(argv[2], NULL, 10) : 32;
-    if (rows != 32 && rows != 512)
-        xe_fatal("prefill layer test supports M32 or M512");
+    if (rows < 1 || rows > 512)
+        xe_fatal("prefill layer test supports M1 through M512");
     xe_engine *e = xe_engine_open(model);
+    ze_kernel_properties_t properties = {
+        .stype = ZE_STRUCTURE_TYPE_KERNEL_PROPERTIES
+    };
+    xe_ze_check("zeKernelGetProperties prefill grouped m16",
+                zeKernelGetProperties(e->gpu.prefill_q4q8_grouped_m16_n64,
+                                      &properties));
+    printf("prefill-layer: m16 local %u private %u spill %u\n",
+           properties.localMemSize, properties.privateMemSize,
+           properties.spillMemSize);
     int ok = layer_run(e, 0, rows) & layer_run(e, 5, rows);
     xe_engine_close(e);
     return ok ? 0 : 1;

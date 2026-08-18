@@ -780,7 +780,7 @@ __kernel void prefill_q4q8_grouped32(__global const uchar *wq,
                                      int n_count,
                                      int blocks) {
     __local char la[TM * KB];
-    __local uchar lw[TN * (KB / 2)];
+    __local char lw[TN * KB];
     __local half lad[TM * 2];
     __local short las[TM * 2];
     __local half lwd[TN * 2];
@@ -843,21 +843,17 @@ __kernel void prefill_q4q8_grouped32(__global const uchar *wq,
             #pragma unroll
             for (int im = 0; im < 4; im++) {
                 int lm = wm + im * 8;
-                int correction = 8 * (int)las[lm * 2 + lb];
                 float da = (float)lad[lm * 2 + lb];
                 #pragma unroll
                 for (int in = 0; in < 2; in++) {
                     int ln = wn + in * 16;
                     int integer = 0;
                     #pragma unroll
-                    for (int c = 0; c < 4; c++) {
-                        uchar4 packed = vload4(0, lw + ln * 32 + lb * 16 + c * 4);
-                        char4 lo = vload4(0, la + lm * KB + lb * 32 + c * 4);
-                        char4 hi = vload4(0, la + lm * KB + lb * 32 + 16 + c * 4);
-                        integer += dot(packed & (uchar4)(15), lo)
-                                   + dot(packed >> (uchar4)(4), hi);
-                    }
-                    acc[im][in] += (float)(integer - correction) * da
+                    for (int c = 0; c < 8; c++)
+                        integer += dot(
+                            vload4(0, lw + ln * KB + lb * 32 + c * 4),
+                            vload4(0, la + lm * KB + lb * 32 + c * 4));
+                    acc[im][in] += (float)integer * da
                                    * (float)lwd[ln * 2 + lb];
                 }
             }

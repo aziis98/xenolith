@@ -1256,7 +1256,6 @@ static void bench_fusion_run(bench_gpu *gpu, const char *name, int rounds,
         bench_set_gemm(kernels[part], part_data[part].weight_x8,
                        part_data[part].weight_scale_x8, &part_data[part],
                        &parts[part]);
-
     double probes[2] = {
         bench_fusion_launch(gpu, &combined, parts, part_count, 0, 3) / 3.0,
         bench_fusion_launch(gpu, &combined, parts, part_count, 1, 3) / 3.0
@@ -4059,7 +4058,14 @@ static void bench_attention_shape_run(bench_gpu *gpu,
         "materialized", "online", "online-b4", "online-b8",
         "online-b8-stage", "gqa8"
     };
-    int variants = shape->window > 0 ? 5 : 4;
+    int active[BENCH_ATTN_VARIANTS] = {
+        BENCH_ATTN_MATERIALIZED, BENCH_ATTN_ONLINE,
+        BENCH_ATTN_ONLINE_B4, BENCH_ATTN_ONLINE_B8,
+        BENCH_ATTN_ONLINE_B8_RING, BENCH_ATTN_GQA8
+    };
+    int variants = shape->window > 0 ? 5 : shape->kv_heads == 2 ? 5 : 4;
+    if (!shape->window && shape->kv_heads == 2)
+        active[4] = BENCH_ATTN_GQA8;
     bench_attention_data data = {0};
     bench_attention_data_init(gpu, &data, shape);
     size_t score_bytes = (size_t)shape->heads * shape->m * shape->n * sizeof(float);
@@ -4087,14 +4093,15 @@ static void bench_attention_shape_run(bench_gpu *gpu,
     double frequencies[BENCH_ATTN_VARIANTS][BENCH_ROUNDS_MAX];
     for (int round = 0; round < rounds; round++) {
         for (int position = 0; position < variants; position++) {
-            int variant = (round + position) % variants;
+            int variant = active[(round + position) % variants];
             samples[variant][round] =
                 bench_attention_measure(gpu, variant, shape, repetitions);
             times[variant][round] = samples[variant][round].seconds;
             frequencies[variant][round] = samples[variant][round].actual_mhz;
         }
         printf("prefill-attention: round %d", round + 1);
-        for (int variant = 0; variant < variants; variant++) {
+        for (int position = 0; position < variants; position++) {
+            int variant = active[position];
             bench_sample *sample = &samples[variant][round];
             printf(" %s %.6f ms@%.0fMHz[%ld,%ld] throttle=%ld/%ld/%ld",
                    names[variant], sample->seconds * 1e3, sample->actual_mhz,
@@ -4109,6 +4116,8 @@ static void bench_attention_shape_run(bench_gpu *gpu,
     double online_b8 = bench_median(times[BENCH_ATTN_ONLINE_B8], rounds);
     double online_b8_ring = shape->window > 0
         ? bench_median(times[BENCH_ATTN_ONLINE_B8_RING], rounds) : online_b8;
+    double gqa8 = shape->kv_heads == 2
+        ? bench_median(times[BENCH_ATTN_GQA8], rounds) : online_b8;
     double materialized_frequency =
         bench_median(frequencies[BENCH_ATTN_MATERIALIZED], rounds);
     double online_frequency = bench_median(frequencies[BENCH_ATTN_ONLINE], rounds);
@@ -4118,6 +4127,9 @@ static void bench_attention_shape_run(bench_gpu *gpu,
         bench_median(frequencies[BENCH_ATTN_ONLINE_B8], rounds);
     double online_b8_ring_frequency = shape->window > 0
         ? bench_median(frequencies[BENCH_ATTN_ONLINE_B8_RING], rounds)
+        : online_b8_frequency;
+    double gqa8_frequency = shape->kv_heads == 2
+        ? bench_median(frequencies[BENCH_ATTN_GQA8], rounds)
         : online_b8_frequency;
     int64_t visible = 0;
     for (int query = 0; query < shape->m; query++) {
@@ -4136,6 +4148,10 @@ static void bench_attention_shape_run(bench_gpu *gpu,
     if (shape->window > 0) {
         frequency_max = fmax(frequency_max, online_b8_ring_frequency);
         frequency_min = fmin(frequency_min, online_b8_ring_frequency);
+    }
+    if (shape->kv_heads == 2) {
+        frequency_max = fmax(frequency_max, gqa8_frequency);
+        frequency_min = fmin(frequency_min, gqa8_frequency);
     }
     double frequency_span = frequency_max / frequency_min;
     const char *decision = materialized <= online
@@ -4156,6 +4172,12 @@ static void bench_attention_shape_run(bench_gpu *gpu,
            online_b8_ring * 1e3, online_b8_ring_frequency,
            online_b8_ring / online_b8, frequency_span,
            frequency_span <= 1.05 ? decision : "frequency-reject");
+    if (shape->kv_heads == 2)
+        printf("prefill-attention: median gqa8 %.6f ms %.6f TFLOP/s @%.0fMHz speedup-vs-b8 %.6fx decision %s\n",
+               gqa8 * 1e3, operations / gqa8 / 1e12, gqa8_frequency,
+               online_b8 / gqa8,
+               frequency_span <= 1.05 && gqa8 <= online_b8 * 0.97
+               ? "gqa8-go" : "reject");
     if (shape->window > 0) {
         double stage_probe = bench_swa_stage_launch(gpu, shape, 2) / 2.0;
         int stage_repetitions = (int)ceil(target_seconds / stage_probe);
