@@ -30,6 +30,16 @@ static int sync_counts(size_t batches, size_t decodes, size_t outputs) {
            && xe_test_output_calls == outputs;
 }
 
+static double sync_logits_rel_rms(const float *a, const float *b) {
+    double num = 0.0, den = 0.0;
+    for (int i = 0; i < XE_VOCAB; i++) {
+        double d = (double)a[i] - (double)b[i];
+        num += d * d;
+        den += (double)b[i] * (double)b[i];
+    }
+    return sqrt(num / (den > 0.0 ? den : 1.0));
+}
+
 int main(int argc, char **argv) {
     if (argc < 2 || !argv[1][0]) {
         fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]);
@@ -41,6 +51,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 1568; i++) original[i] = 2 + i;
     xe_engine *e = xe_engine_open(model);
     xe_session *s = xe_session_new(e);
+    float *extension_logits = malloc(XE_VOCAB * sizeof(float));
+    float *decode_logits = malloc(XE_VOCAB * sizeof(float));
+    if (!extension_logits || !decode_logits) return 1;
     size_t allocations = xe_test_allocations;
     int ok = 1;
 
@@ -122,9 +135,55 @@ int main(int argc, char **argv) {
     printf("session-sync: wrapped SWA GPU extension %s\n",
            wrapped_batch ? "PASS" : "FAIL");
 
+    xe_session_reset(s);
+    prefix.v = original;
+    prefix.len = 64;
+    xe_session_sync(s, &prefix);
+    sync_counts_reset();
+    prefix.len = 65;
+    xe_session_sync(s, &prefix);
+    int single_a = sync_counts(0, 1, 1)
+                   && xe_session_position(s) == 65
+                   && sync_tokens_equal(s, original, 65)
+                   && sync_logits_finite(s);
+    sync_counts_reset();
+    prefix.len = 66;
+    xe_session_sync(s, &prefix);
+    int single_b = sync_counts(0, 1, 1)
+                   && xe_session_position(s) == 66
+                   && sync_tokens_equal(s, original, 66)
+                   && sync_logits_finite(s);
+    int single = single_a && single_b;
+    ok &= single;
+    printf("session-sync: single-token CPU decode handoff %s\n",
+           single ? "PASS" : "FAIL");
+
+    xe_session_reset(s);
+    prefix.len = 64;
+    xe_session_sync(s, &prefix);
+    prefix.len = 84;
+    xe_session_sync(s, &prefix);
+    memcpy(extension_logits, s->logits, XE_VOCAB * sizeof(float));
+    xe_session_rewind(s, 0);
+    prefix.len = 64;
+    xe_session_sync(s, &prefix);
+    while (prefix.len < 84) {
+        prefix.len++;
+        xe_session_sync(s, &prefix);
+    }
+    memcpy(decode_logits, s->logits, XE_VOCAB * sizeof(float));
+    double extension_rel = sync_logits_rel_rms(extension_logits,
+                                               decode_logits);
+    int extension_parity = extension_rel < 0.60;
+    ok &= extension_parity;
+    printf("session-sync: GPU extension decode parity %s (rel_rms %.4f)\n",
+           extension_parity ? "PASS" : "FAIL", extension_rel);
+
     int hot = allocations == xe_test_allocations;
     ok &= hot;
     printf("session-sync: hot allocation %s\n", hot ? "PASS" : "FAIL");
+    free(extension_logits);
+    free(decode_logits);
     xe_session_free(s);
     xe_engine_close(e);
     return ok ? 0 : 1;

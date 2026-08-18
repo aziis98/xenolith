@@ -527,7 +527,7 @@ static void xe_gpu_init(xe_engine *e) {
         &e->gpu.prefill_ffn_finish
     };
     uint32_t prefill_group_sizes[39] = {
-        128, 128, 128, 128, 256, 256, 256, 256, 256, 256, 256, 256, 256, 128, 128, 128, 128, 128, 128, 128, 256, 256, 128,
+        128, 128, 128, 128, 256, 256, 256, 256, 256, 256, 256, 256, 256, 128, 128, 128, 128, 128, 128, 256, 256, 128, 128,
         128, 128, 128, 128, 128, 128, 128, 256, 256, 256, 128, 128, 128, 128, 128,
         128
     };
@@ -4826,7 +4826,6 @@ static void xe_session_extend(xe_session *s, const int32_t *tokens, int end,
                                  XE_MOE_GENERIC_BATCHED, 1,
                                  XE_SOFTCAP_SECOND_LOOP, 1);
             s->tokens[pos] = tokens[pos];
-            s->n_tokens++;
             continue;
         }
         xe_prefill_batch_run(s, tokens + start, rows, start,
