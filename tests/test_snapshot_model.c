@@ -14,9 +14,9 @@ int main(int argc, char **argv) {
     const char *model = argv[1];
     xe_engine *engine = xe_engine_open(model);
     xe_session *session = xe_session_new(engine);
-    int32_t ids[65];
+    int32_t ids[72];
     for (int i = 0; i < 64; i++) ids[i] = 2 + i;
-    xe_tokens prefix = { ids, 64, 65 };
+    xe_tokens prefix = { ids, 64, 72 };
     xe_session_sync(session, &prefix);
 
     float *checkpoint_logits = malloc(XE_VOCAB * sizeof(*checkpoint_logits));
@@ -61,10 +61,36 @@ int main(int argc, char **argv) {
     ok &= memcmp(xe_session_logits(session), continuation_logits,
                  XE_VOCAB * sizeof(*continuation_logits)) == 0;
 
-    printf("snapshot-model: %llu bytes next=%d zero-prefill exact-continuation %s\n",
-           (unsigned long long)snapshot_size, live_next,
+    float *extension_logits = malloc(XE_VOCAB * sizeof(*extension_logits));
+    ok &= extension_logits != NULL;
+    for (int i = 65; i < 72; i++) ids[i] = 1000 + i;
+    prefix.len = 72;
+    xe_test_prefill_batches = 0;
+    if (ok) xe_session_sync(session, &prefix);
+    ok &= xe_test_prefill_batches == 1;
+    if (ok) memcpy(extension_logits, xe_session_logits(session),
+                   XE_VOCAB * sizeof(*extension_logits));
+
+    xe_session_reset(session);
+    prefix.len = 64;
+    if (ok) xe_session_sync(session, &prefix);
+    int deterministic = ok && memcmp(xe_session_logits(session),
+                                     checkpoint_logits,
+                                     XE_VOCAB * sizeof(*checkpoint_logits)) == 0;
+    ok &= deterministic;
+    prefix.len = 65;
+    if (ok) xe_session_sync(session, &prefix);
+    prefix.len = 72;
+    if (ok) xe_session_sync(session, &prefix);
+    ok &= memcmp(xe_session_logits(session), extension_logits,
+                 XE_VOCAB * sizeof(*extension_logits)) == 0;
+
+    printf("snapshot-model: %llu bytes next=%d deterministic=%d zero-prefill "
+           "exact-continuation gpu-extension %s\n",
+           (unsigned long long)snapshot_size, live_next, deterministic,
            ok ? "PASS" : "FAIL");
     if (file) fclose(file);
+    free(extension_logits);
     free(continuation_logits);
     free(checkpoint_logits);
     xe_session_free(session);

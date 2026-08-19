@@ -11,13 +11,14 @@ LDLIBS=-lm -lze_loader
 GPU_SPV=xenolith_gpu.spv
 GPU_OBJ=xenolith_gpu_spv.o
 
-xenolith: main.o xenolith.o format.o kvstore.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -o $@ main.o xenolith.o format.o kvstore.o $(GPU_OBJ) $(LDLIBS)
+xenolith: main.o xenolith.o format.o kvstore.o conversation.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -o $@ main.o xenolith.o format.o kvstore.o conversation.o $(GPU_OBJ) $(LDLIBS)
 
 main.o: main.c xenolith.h
 xenolith.o: xenolith.c xenolith.h format.h
 format.o: format.c format.h
 kvstore.o: kvstore.c kvstore.h xenolith.h format.h
+conversation.o: conversation.c conversation.h kvstore.h xenolith.h format.h
 
 clean:
 	rm -f *.o xenolith tests/certify tests/test_kv tests/test_decode \
@@ -26,7 +27,8 @@ clean:
 		tests/test_prefill_dense tests/test_prefill_layer tests/test_prefill_session \
 		tests/test_session_sync tests/test_format tests/test_snapshot \
 		tests/test_snapshot_model \
-		tests/test_kvstore \
+		tests/test_kvstore tests/test_conversation \
+		tests/test_conversation_model \
 		tests/bench_attention tests/bench_tg tests/bench_b3b tests/bench_b3b_8e \
 		tests/bench_b3b.spv tests/bench_b3b_adlp.spv \
 		tests/bench_prefill_gemm tests/bench_prefill_gemm_down \
@@ -68,6 +70,12 @@ tests/test_snapshot_model: tests/test_snapshot_model.c xenolith.c xenolith.h for
 
 tests/test_kvstore: tests/test_kvstore.c xenolith.c xenolith.h kvstore.o kvstore.c kvstore.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_kvstore.c kvstore.o format.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_conversation: tests/test_conversation.c conversation.o conversation.h kvstore.o kvstore.h xenolith.o xenolith.h format.o format.h $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_conversation.c conversation.o kvstore.o xenolith.o format.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_conversation_model: tests/test_conversation_model.c xenolith.c xenolith.h conversation.o conversation.h kvstore.o kvstore.h format.o format.h $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_conversation_model.c conversation.o kvstore.o format.o $(GPU_OBJ) $(LDLIBS)
 
 tests/test_kv: tests/test_kv.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_kv.c format.o $(GPU_OBJ) $(LDLIBS)
