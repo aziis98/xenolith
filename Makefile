@@ -11,14 +11,18 @@ LDLIBS=-lm -lze_loader
 GPU_SPV=xenolith_gpu.spv
 GPU_OBJ=xenolith_gpu_spv.o
 
-xenolith: main.o xenolith.o format.o kvstore.o conversation.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -o $@ main.o xenolith.o format.o kvstore.o conversation.o $(GPU_OBJ) $(LDLIBS)
+xenolith: main.o xenolith.o format.o json.o profile.o kvstore.o conversation.o wire.o serve.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -o $@ main.o xenolith.o format.o json.o profile.o kvstore.o conversation.o wire.o serve.o $(GPU_OBJ) $(LDLIBS)
 
-main.o: main.c xenolith.h
+main.o: main.c xenolith.h profile.h serve.h conversation.h
 xenolith.o: xenolith.c xenolith.h format.h
 format.o: format.c format.h
+json.o: json.c json.h
+profile.o: profile.c profile.h xenolith.h format.h json.h
 kvstore.o: kvstore.c kvstore.h xenolith.h format.h
 conversation.o: conversation.c conversation.h kvstore.h xenolith.h format.h
+wire.o: wire.c wire.h xenolith.h kvstore.h conversation.h profile.h format.h json.h
+serve.o: serve.c serve.h wire.h xenolith.h kvstore.h conversation.h profile.h json.h
 
 clean:
 	rm -f *.o xenolith tests/certify tests/test_kv tests/test_decode \
@@ -29,6 +33,8 @@ clean:
 		tests/test_snapshot_model \
 		tests/test_kvstore tests/test_conversation \
 		tests/test_conversation_model \
+		tests/test_json tests/test_profile tests/test_wire \
+		tests/test_wire_model tests/test_serve tests/test_serve_model \
 		tests/bench_attention tests/bench_tg tests/bench_b3b tests/bench_b3b_8e \
 		tests/bench_b3b.spv tests/bench_b3b_adlp.spv \
 		tests/bench_prefill_gemm tests/bench_prefill_gemm_down \
@@ -56,11 +62,29 @@ MODEL?=
 GOLDEN_PROMPTS=short long mixed ws nl nlonly json
 ORACLE_PROMPTS=short long
 
-tests/certify: tests/certify.c xenolith.o format.o xenolith.h $(GPU_OBJ)
-	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/certify.c xenolith.o format.o $(GPU_OBJ) $(LDLIBS)
+tests/certify: tests/certify.c xenolith.o format.o profile.o json.o xenolith.h profile.h $(GPU_OBJ)
+	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/certify.c xenolith.o format.o profile.o json.o $(GPU_OBJ) $(LDLIBS)
 
 tests/test_format: tests/test_format.c format.o format.h
 	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_format.c format.o -pthread
+
+tests/test_json: tests/test_json.c json.o json.h
+	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_json.c json.o -pthread -lm
+
+tests/test_profile: tests/test_profile.c profile.o profile.h json.o format.o xenolith.o xenolith.h $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_profile.c profile.o json.o format.o xenolith.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_wire: tests/test_wire.c wire.o wire.h profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_wire.c wire.o profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_wire_model: tests/test_wire_model.c wire.o wire.h profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_wire_model.c wire.o profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_serve: tests/test_serve.c serve.o serve.h wire.o wire.h profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_serve.c serve.o wire.o profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_serve_model: tests/test_serve_model.c json.o json.h xenolith
+	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_serve_model.c json.o -pthread -lm
 
 tests/test_snapshot: tests/test_snapshot.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_snapshot.c format.o $(GPU_OBJ) $(LDLIBS)
@@ -157,6 +181,17 @@ check: require-model tests/certify tests/test_kv tests/test_decode
 	./tests/test_decode
 	XENOLITH_MODEL="$(MODEL)" ./tests/certify
 
+check-serve: require-model xenolith tests/test_serve tests/test_serve_model
+	./tests/test_serve "$(MODEL)"
+	./tests/test_serve_model "$(MODEL)"
+
+check-wire: require-model xenolith tests/test_json tests/test_profile tests/test_wire \
+		tests/test_wire_model
+	./tests/test_json
+	./tests/test_profile "$(MODEL)"
+	./tests/test_wire "$(MODEL)"
+	./tests/test_wire_model "$(MODEL)"
+
 golden: require-model test-tools
 	mkdir -p tests/golden tests/fixtures
 	for p in $(GOLDEN_PROMPTS); do \
@@ -188,5 +223,5 @@ test-tools-clean:
 require-model:
 	@test -f "$(MODEL)" || { printf '%s\n' 'Set MODEL to the path of the Gemma 4 GGUF file.' >&2; exit 2; }
 
-.PHONY: require-model clean check check-kv golden test-tools test-tools-clean bench-b3b bench-b14 \
-	bench-prefill-gemm
+.PHONY: require-model clean check check-kv check-wire check-serve golden test-tools test-tools-clean \
+	bench-b3b bench-b14 bench-prefill-gemm

@@ -42,8 +42,11 @@ typedef enum {
     CONVERSATION_EVENT_TOOL_RESULT = 8,
     CONVERSATION_EVENT_SNAPSHOT_REF = 9,
     CONVERSATION_EVENT_CACHE_EPOCH = 10,
-    CONVERSATION_EVENT_COMMIT = 11
+    CONVERSATION_EVENT_COMMIT = 11,
+    CONVERSATION_EVENT_REWIND = 12
 } conversation_event_type;
+
+#define CONVERSATION_REWIND_ALL UINT64_MAX
 
 typedef enum {
     CONVERSATION_ROLE_SYSTEM = 1,
@@ -63,7 +66,8 @@ typedef enum {
     CONVERSATION_STOP_EOT_SYNTHETIC = 2,
     CONVERSATION_STOP_EOS = 3,
     CONVERSATION_STOP_LIMIT = 4,
-    CONVERSATION_STOP_CANCELLED = 5
+    CONVERSATION_STOP_CANCELLED = 5,
+    CONVERSATION_STOP_TOOL_CALLS = 6
 } conversation_stop_reason;
 
 typedef enum {
@@ -125,6 +129,7 @@ typedef struct {
     kvstore_id snapshot;
     uint64_t snapshot_boundary;
     uint64_t epoch;
+    uint64_t rewind_target;
 } conversation_event;
 
 typedef struct {
@@ -184,6 +189,8 @@ conversation_status conversation_append_tool_result(
 conversation_status conversation_append_snapshot_ref(
     conversation *c, const kvstore_id *snapshot, uint64_t token_boundary);
 conversation_status conversation_append_cache_epoch(conversation *c);
+conversation_status conversation_append_rewind(conversation *c,
+                                               uint64_t target_event);
 conversation_status conversation_commit(conversation *c);
 
 const conversation_id *conversation_get_id(const conversation *c);
@@ -200,6 +207,13 @@ int conversation_snapshot_current(const conversation *c, kvstore_id *id,
 uint64_t conversation_event_count(const conversation *c);
 const conversation_event *conversation_event_at(const conversation *c,
                                                 uint64_t index);
+uint64_t conversation_visible_count(const conversation *c);
+uint64_t conversation_visible_index(const conversation *c,
+                                    uint64_t position);
+uint64_t conversation_visible_boundary(const conversation *c,
+                                       uint64_t position);
+int conversation_visible_position(const conversation *c,
+                                  uint64_t event_index, uint64_t *position);
 int conversation_generation_interrupted(const conversation *c);
 size_t conversation_unknown_tool_calls(const conversation *c,
                                        uint64_t *call_ids, size_t cap);

@@ -62,7 +62,7 @@ int xe_engine_worker_cpu(const xe_engine *e, int worker);
 
 void xe_tokens_push(xe_tokens *tokens, int32_t token);
 void xe_tokens_free(xe_tokens *tokens);
-int xe_chat_prepare_reply(const xe_engine *e, xe_tokens *tokens, const char *user_text);
+const char *xe_chat_template(const xe_engine *e, uint64_t *length);
 
 void xe_oracle(xe_engine *e, const int32_t *tokens, int n_tokens, const char *dump_path,
                const char *layers_dir, int q8_mode, FILE *out);
@@ -73,7 +73,16 @@ void xe_session_reset(xe_session *s);
 void xe_session_rewind(xe_session *s, int position);
 int xe_session_position(xe_session *s);
 
+typedef struct {
+    int reused;
+    int prefilled;
+    int restarted;
+} xe_sync_report;
+
 void xe_session_sync(xe_session *s, const xe_tokens *prefix);
+void xe_session_sync_report(xe_session *s, const xe_tokens *prefix,
+                            xe_sync_report *report);
+int xe_session_common(const xe_session *s, const xe_tokens *prefix);
 const float *xe_session_logits(xe_session *s);
 int32_t xe_session_next(xe_session *s, xe_sampler *sp);
 

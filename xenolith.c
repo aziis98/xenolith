@@ -3184,6 +3184,14 @@ static void xe_tok_build(xe_engine *e, const char *gguf_path) {
     }
 
     static const struct { const char *piece; int32_t id; } controls[] = {
+        { "<|tool>", 46 },
+        { "<tool|>", 47 },
+        { "<|tool_call>", 48 },
+        { "<tool_call|>", 49 },
+        { "<|tool_response>", 50 },
+        { "<tool_response|>", 51 },
+        { "<|\"|>", 52 },
+        { "<|think|>", 98 },
         { "<|channel>", XE_CHANNEL_BEGIN_ID },
         { "<channel|>", XE_CHANNEL_END_ID },
         { "<|turn>", XE_TURN_BEGIN_ID },
@@ -3899,66 +3907,10 @@ void xe_tokens_free(xe_tokens *tokens) {
     memset(tokens, 0, sizeof(*tokens));
 }
 
-static int xe_chat_space(unsigned char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
-}
-
-static void xe_chat_control(int32_t *out, int *n, int32_t token) {
-    out[(*n)++] = token;
-}
-
-static void xe_chat_text(const xe_engine *e, int32_t *out, int *n, int cap, const char *text) {
-    *n += xe_encode_text(e, text, out + *n, cap - *n);
-}
-
-int xe_chat_prepare_reply(const xe_engine *e, xe_tokens *tokens, const char *user_text) {
-    if (!e || !tokens || !user_text) xe_fatal("chat_prepare_reply: missing input");
-    if (!xe_tokens_valid(tokens)) xe_fatal("chat_prepare_reply: invalid token vector");
-    if (tokens->len && tokens->v[0] != e->bos_id)
-        xe_fatal("chat_prepare_reply: conversation does not begin at BOS");
-    if (tokens->len && tokens->v[tokens->len - 1] != e->eot_id)
-        xe_fatal("chat_prepare_reply: assistant turn is still open");
-
-    const char *begin = user_text;
-    const char *end = user_text + strlen(user_text);
-    while (begin < end && xe_chat_space((unsigned char)*begin)) begin++;
-    while (end > begin && xe_chat_space((unsigned char)end[-1])) end--;
-    size_t content_len = (size_t)(end - begin);
-    if (content_len > (SIZE_MAX - 80) / 3 || content_len > (size_t)(INT_MAX - 69) / 3)
-        xe_fatal("chat_prepare_reply: input too large");
-
-    size_t span_len = 5 + content_len;
-    char *span = xe_alloc(e, span_len + 1, XE_MEM_HOST);
-    memcpy(span, "user\n", 5);
-    memcpy(span + 5, begin, content_len);
-    span[span_len] = '\0';
-
-    int suffix_cap = (int)(3 * (content_len + 20) + 9);
-    int32_t *suffix = xe_alloc(e, (size_t)suffix_cap * sizeof(*suffix),
-                               XE_MEM_HOST);
-    int n = 0;
-    if (!tokens->len) xe_chat_control(suffix, &n, e->bos_id);
-    else xe_chat_text(e, suffix, &n, suffix_cap, "\n");
-    xe_chat_control(suffix, &n, XE_TURN_BEGIN_ID);
-    xe_chat_text(e, suffix, &n, suffix_cap, span);
-    xe_chat_control(suffix, &n, XE_TURN_END_ID);
-    xe_chat_text(e, suffix, &n, suffix_cap, "\n");
-    xe_chat_control(suffix, &n, XE_TURN_BEGIN_ID);
-    xe_chat_text(e, suffix, &n, suffix_cap, "model\n");
-    xe_chat_control(suffix, &n, XE_CHANNEL_BEGIN_ID);
-    xe_chat_text(e, suffix, &n, suffix_cap, "thought\n");
-    xe_chat_control(suffix, &n, XE_CHANNEL_END_ID);
-
-    xe_free(e, span, XE_MEM_HOST);
-    if (n > XE_CTX - 1 - tokens->len) {
-        xe_free(e, suffix, XE_MEM_HOST);
-        return 0;
-    }
-    xe_tokens_reserve(tokens, tokens->len + n);
-    memcpy(tokens->v + tokens->len, suffix, (size_t)n * sizeof(*suffix));
-    tokens->len += n;
-    xe_free(e, suffix, XE_MEM_HOST);
-    return 1;
+const char *xe_chat_template(const xe_engine *e, uint64_t *length) {
+    if (!e) xe_fatal("chat_template: missing engine");
+    if (length) *length = e->chat_template.len;
+    return e->chat_template.p;
 }
 
 static inline __m256 xe_load_f16x8(const _Float16 *p) {
@@ -4847,7 +4799,8 @@ void xe_session_rewind(xe_session *s, int position) {
     xe_session_sync(s, &prefix);
 }
 
-void xe_session_sync(xe_session *s, const xe_tokens *prefix) {
+void xe_session_sync_report(xe_session *s, const xe_tokens *prefix,
+                            xe_sync_report *report) {
     if (!s || !prefix) xe_fatal("session_sync: missing session or prefix");
     if (!xe_tokens_valid(prefix)) xe_fatal("session_sync: invalid prefix");
     xe_require_owner(s->engine);
@@ -4864,17 +4817,45 @@ void xe_session_sync(xe_session *s, const xe_tokens *prefix) {
     int common = 0;
     while (common < common_limit && prefix->v[common] == s->tokens[common])
         common++;
-    if (common == n && common == current) return;
+    if (report) {
+        report->reused = 0;
+        report->prefilled = 0;
+        report->restarted = 0;
+    }
+    if (common == n && common == current) {
+        if (report) report->reused = n;
+        return;
+    }
 
     if (common < current) {
         int resume = common < n ? common : n - 1;
-        if (xe_session_swa_can_resume(current, resume))
+        if (xe_session_swa_can_resume(current, resume)) {
             s->n_tokens = resume;
-        else
+        } else {
             s->n_tokens = 0;
+            if (report) report->restarted = 1;
+        }
+    }
+    if (report) {
+        report->reused = s->n_tokens;
+        report->prefilled = n - s->n_tokens;
     }
     xe_session_extend(s, prefix->v, n,
                       common == current && n == current + 1);
+}
+
+void xe_session_sync(xe_session *s, const xe_tokens *prefix) {
+    xe_session_sync_report(s, prefix, NULL);
+}
+
+int xe_session_common(const xe_session *s, const xe_tokens *prefix) {
+    if (!s || !prefix) xe_fatal("session_common: missing session or prefix");
+    if (!xe_tokens_valid(prefix)) xe_fatal("session_common: invalid prefix");
+    int limit = prefix->len < s->n_tokens ? prefix->len : s->n_tokens;
+    int common = 0;
+    while (common < limit && prefix->v[common] == s->tokens[common])
+        common++;
+    return common;
 }
 
 const float *xe_session_logits(xe_session *s) {
@@ -5013,7 +4994,7 @@ static void xe_snapshot_fingerprints_init(xe_engine *e) {
     if (e->chat_template.len)
         format_sha256_update(&hash, e->chat_template.p,
                              (size_t)e->chat_template.len);
-    xe_snapshot_hash_string(&hash, "xe_chat_prepare_reply/v1");
+    xe_snapshot_hash_string(&hash, "xe_profile_render/v1");
     xe_snapshot_hash_u32(&hash, XE_CHANNEL_BEGIN_ID);
     xe_snapshot_hash_u32(&hash, XE_CHANNEL_END_ID);
     xe_snapshot_hash_u32(&hash, XE_TURN_BEGIN_ID);

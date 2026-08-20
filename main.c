@@ -1,6 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "xenolith.h"
+#include "profile.h"
+#include "conversation.h"
+#include "serve.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -21,14 +24,54 @@ static void usage(void) {
 "  chat     [-n max] [--temp F] [--top-k N] [--top-p F] [--seed S]\n"
 "  oracle   -t \"id,id,id\" [-o logits.bin] [--layers dir] [--q8]\n"
 "  bench    [-p N] [-n N] [-r N] [--delay S] [--no-warmup] [--progress] [-o md|jsonl]\n"
-"  agent    (not yet)\n");
+"  wire     [--state DIR] [--cache DIR]\n"
+"  serve    [--state DIR] [--cache DIR] [--socket PATH] [--idle-shutdown MIN]\n");
     exit(1);
 }
 
+static int cli_lock_fd = -1;
+
+static void cli_state_dir(const char *override, char *out, size_t cap) {
+    if (override) {
+        int n = snprintf(out, cap, "%s", override);
+        if (n > 0 && (size_t)n < cap) return;
+        fprintf(stderr, "xenolith: state directory path is too long\n");
+        exit(1);
+    }
+    if (conversation_default_state_dir(out, cap)) return;
+    fprintf(stderr, "xenolith: cannot resolve the default state directory\n");
+    exit(1);
+}
+
+static void cli_lock(const char *socket_path) {
+    char holder[512];
+    int fd = serve_lock(socket_path, holder, sizeof holder);
+    if (fd < 0) {
+        char path[4096];
+        if (!serve_lock_path(path, sizeof path))
+            snprintf(path, sizeof path, "engine.lock");
+        if (holder[0])
+            fprintf(stderr,
+                    "xenolith: another engine already owns the weights "
+                    "(%s held by %s)\n", path, holder);
+        else
+            fprintf(stderr, "xenolith: cannot acquire %s\n", path);
+        exit(1);
+    }
+    cli_lock_fd = fd;
+}
+
+static void cli_unlock(void) {
+    if (cli_lock_fd >= 0) close(cli_lock_fd);
+    cli_lock_fd = -1;
+}
+
 static int cmd_info(const char *model) {
+    cli_lock(NULL);
     xe_engine *e = xe_engine_open(model);
     xe_engine_info(e, stdout);
     xe_engine_close(e);
+    cli_unlock();
     return 0;
 }
 
@@ -215,6 +258,8 @@ static int cmd_run(const char *model, int argc, char **argv) {
     }
     if (!prompt) usage();
 
+    cli_lock(NULL);
+
     xe_engine *e = xe_engine_open(model);
     int ctx = xe_context_size(e);
     if (top_k > ctx) {
@@ -260,6 +305,7 @@ static int cmd_run(const char *model, int argc, char **argv) {
     xe_tokens_free(&tokens);
     xe_session_free(s);
     xe_engine_close(e);
+    cli_unlock();
     return 0;
 }
 
@@ -311,10 +357,18 @@ static int cmd_chat(const char *model, int argc, char **argv) {
         }
     }
 
+    cli_lock(NULL);
+
     xe_engine *e = xe_engine_open(model);
     int ctx = xe_context_size(e);
     if (top_k > ctx) {
         fprintf(stderr, "xenolith: chat: top-k %d out of range [0, %d]\n", top_k, ctx);
+        exit(1);
+    }
+
+    profile *pf = NULL;
+    if (profile_open(&pf, e) != PROFILE_OK) {
+        fprintf(stderr, "xenolith: chat: model profile mismatch\n");
         exit(1);
     }
 
@@ -326,6 +380,15 @@ static int cmd_chat(const char *model, int argc, char **argv) {
     char *line = NULL;
     size_t line_cap = 0;
     int stop = 0;
+    uint32_t turn = PROFILE_TURN_PADDED;
+    profile_render render;
+
+    if (profile_render_system(pf, NULL, NULL, 0, &render) != PROFILE_OK) {
+        fprintf(stderr, "xenolith: chat: render failed\n");
+        exit(1);
+    }
+    for (uint32_t i = 0; i < render.token_count; i++)
+        xe_tokens_push(&transcript, render.tokens[i]);
 
     while (!stop) {
         fputs("you> ", stdout);
@@ -335,25 +398,38 @@ static int cmd_chat(const char *model, int argc, char **argv) {
         while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r'))
             line[--nread] = '\0';
         if (!strcmp(line, "/exit")) break;
-        if (!xe_chat_prepare_reply(e, &transcript, line)) {
+        if (profile_render_user(pf, line, turn, &render) != PROFILE_OK) {
+            fprintf(stderr, "xenolith: chat: render failed\n");
+            break;
+        }
+        if (transcript.len + (int)render.token_count >= ctx - 1) {
             fprintf(stderr, "xenolith: chat: conversation exceeds context capacity\n");
             break;
         }
+        for (uint32_t i = 0; i < render.token_count; i++)
+            xe_tokens_push(&transcript, render.tokens[i]);
+        if (profile_render_reply_open(pf, PROFILE_TURN_PADDED, &render)
+                != PROFILE_OK ||
+            transcript.len + (int)render.token_count >= ctx - 1) {
+            fprintf(stderr, "xenolith: chat: conversation exceeds context capacity\n");
+            break;
+        }
+        for (uint32_t i = 0; i < render.token_count; i++)
+            xe_tokens_push(&transcript, render.tokens[i]);
+        turn = PROFILE_TURN_OPEN;
 
         fputs("assistant> ", stdout);
         fflush(stdout);
-        int closed = 0;
         for (int i = 0; i < max_n && transcript.len < ctx - 1; i++) {
             xe_session_sync(s, &transcript);
             int32_t t = xe_session_next(s, &sp);
             if (t == eos) {
                 stop = 1;
-                closed = 1;
                 break;
             }
             xe_tokens_push(&transcript, t);
             if (t == eot) {
-                closed = 1;
+                turn = PROFILE_TURN_BARE;
                 break;
             }
             char buf[256];
@@ -361,14 +437,15 @@ static int cmd_chat(const char *model, int argc, char **argv) {
             fwrite(buf, 1, (size_t)nb, stdout);
             fflush(stdout);
         }
-        if (!closed) xe_tokens_push(&transcript, eot);
         putchar('\n');
     }
 
     free(line);
     xe_tokens_free(&transcript);
     xe_session_free(s);
+    profile_close(pf);
     xe_engine_close(e);
+    cli_unlock();
     return 0;
 }
 
@@ -426,9 +503,12 @@ static int cmd_oracle(const char *model, int argc, char **argv) {
     }
     if (n == 0) usage();
 
+    cli_lock(NULL);
+
     xe_engine *e = xe_engine_open(model);
     xe_oracle(e, toks, n, dump_path, layers_dir, q8_mode, stdout);
     xe_engine_close(e);
+    cli_unlock();
     return 0;
 }
 
@@ -679,6 +759,8 @@ static int cmd_bench(const char *model, int argc, char **argv) {
     }
     if (params.n_prompt == 0 && params.n_gen == 0) usage();
 
+    cli_lock(NULL);
+
     xe_engine *e = xe_engine_open(model);
     int ctx = xe_context_size(e);
     if (params.n_prompt > ctx || params.n_gen > ctx) {
@@ -713,7 +795,77 @@ static int cmd_bench(const char *model, int argc, char **argv) {
 
     if (!params.jsonl) printf("\nbuild: xenolith\n");
     xe_engine_close(e);
+    cli_unlock();
     return 0;
+}
+
+static int cmd_wire(const char *model, int argc, char **argv) {
+    const char *state_option = NULL;
+    const char *cache_dir = NULL;
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--state")) {
+            if (++i >= argc) usage();
+            state_option = argv[i];
+        } else if (!strcmp(argv[i], "--cache")) {
+            if (++i >= argc) usage();
+            cache_dir = argv[i];
+        } else {
+            usage();
+        }
+    }
+    char state_dir[4096];
+    cli_state_dir(state_option, state_dir, sizeof state_dir);
+    cli_lock(NULL);
+
+    xe_engine *e = xe_engine_open(model);
+    int status = serve_stdio(e, state_dir, cache_dir);
+    xe_engine_close(e);
+    cli_unlock();
+    return status;
+}
+
+static int cmd_serve(const char *model, int argc, char **argv) {
+    const char *state_option = NULL;
+    const char *cache_dir = NULL;
+    const char *socket_option = NULL;
+    double idle_minutes = 0.0;
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--state")) {
+            if (++i >= argc) usage();
+            state_option = argv[i];
+        } else if (!strcmp(argv[i], "--cache")) {
+            if (++i >= argc) usage();
+            cache_dir = argv[i];
+        } else if (!strcmp(argv[i], "--socket")) {
+            if (++i >= argc) usage();
+            socket_option = argv[i];
+        } else if (!strcmp(argv[i], "--idle-shutdown")) {
+            if (++i >= argc) usage();
+            errno = 0;
+            char *end;
+            double value = strtod(argv[i], &end);
+            if (errno || *end || !isfinite(value) || value <= 0.0) usage();
+            idle_minutes = value;
+        } else {
+            usage();
+        }
+    }
+    char state_dir[4096];
+    cli_state_dir(state_option, state_dir, sizeof state_dir);
+    char socket_path[4096];
+    if (!serve_socket_path(socket_option, state_dir, socket_path,
+                           sizeof socket_path)) {
+        fprintf(stderr, "xenolith: serve: socket path is too long\n");
+        exit(1);
+    }
+    cli_lock(socket_path);
+
+    xe_engine *e = xe_engine_open(model);
+    int status = serve_run(e, state_dir, cache_dir, socket_path,
+                           idle_minutes);
+    xe_engine_close(e);
+    cli_unlock();
+    return status;
 }
 
 int main(int argc, char **argv) {
@@ -728,10 +880,8 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "chat")) return cmd_chat(model, argc, argv);
     if (!strcmp(cmd, "oracle")) return cmd_oracle(model, argc, argv);
     if (!strcmp(cmd, "bench")) return cmd_bench(model, argc, argv);
-    if (!strcmp(cmd, "agent")) {
-        fprintf(stderr, "xenolith: %s: not implemented yet\n", cmd);
-        exit(1);
-    }
+    if (!strcmp(cmd, "wire")) return cmd_wire(model, argc, argv);
+    if (!strcmp(cmd, "serve")) return cmd_serve(model, argc, argv);
 
     usage();
     return 0;

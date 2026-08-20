@@ -20,7 +20,7 @@ enum {
     CONVERSATION_FRAME_HEADER_SIZE = 32,
     CONVERSATION_SETTINGS_SIZE = 40,
     CONVERSATION_FRAME_CRITICAL = 1,
-    CONVERSATION_MAX_EVENT_TYPE = 11,
+    CONVERSATION_MAX_EVENT_TYPE = 12,
     CONVERSATION_TOKEN_LIMIT = 262143,
     CONVERSATION_CONTEXT_CAPACITY = 262144
 };
@@ -51,7 +51,14 @@ typedef struct {
 typedef struct {
     uint64_t call_id;
     int has_result;
+    uint64_t event_index;
+    uint64_t result_index;
 } conversation_call;
+
+typedef struct {
+    uint64_t index;
+    uint64_t boundary;
+} conversation_visible;
 
 struct conversation_store {
     int sessions_fd;
@@ -87,6 +94,11 @@ struct conversation {
     conversation_call *calls;
     size_t call_count;
     size_t call_capacity;
+    conversation_visible *visible;
+    size_t visible_count;
+    size_t visible_capacity;
+    uint64_t applied_events;
+    uint64_t appended_tokens;
     uint8_t chain[32];
     format_sha256 chain_hasher;
     format_sha256 token_hasher;
@@ -441,7 +453,7 @@ static int conversation_node_parse(conversation_node *node) {
             !conversation_field_u64(&fields[0], &view->generation_id) ||
             !conversation_field_u32(&fields[1], &view->stop_reason) ||
             view->stop_reason < CONVERSATION_STOP_EOT_SAMPLED ||
-            view->stop_reason > CONVERSATION_STOP_CANCELLED ||
+            view->stop_reason > CONVERSATION_STOP_TOOL_CALLS ||
             !conversation_field_u64(&fields[2], &view->rng_after) ||
             !fields[4].present) return 0;
         int blocks = conversation_blocks_parse(&fields[3], &node->blocks,
@@ -503,6 +515,9 @@ static int conversation_node_parse(conversation_node *node) {
     case CONVERSATION_EVENT_CACHE_EPOCH:
         return conversation_fields_parse(payload, length, fields, 1) &&
                conversation_field_u64(&fields[0], &view->epoch);
+    case CONVERSATION_EVENT_REWIND:
+        return conversation_fields_parse(payload, length, fields, 1) &&
+               conversation_field_u64(&fields[0], &view->rewind_target);
     default:
         return 0;
     }
@@ -524,7 +539,8 @@ static conversation_call *conversation_call_find(conversation *c,
 }
 
 static conversation_status conversation_call_add(conversation *c,
-                                                 uint64_t call_id) {
+                                                 uint64_t call_id,
+                                                 uint64_t event_index) {
     if (c->call_count == c->call_capacity) {
         size_t capacity = c->call_capacity ? c->call_capacity * 2 : 8;
         conversation_call *grown = realloc(c->calls,
@@ -535,7 +551,25 @@ static conversation_status conversation_call_add(conversation *c,
     }
     c->calls[c->call_count].call_id = call_id;
     c->calls[c->call_count].has_result = 0;
+    c->calls[c->call_count].event_index = event_index;
+    c->calls[c->call_count].result_index = 0;
     c->call_count++;
+    return CONVERSATION_OK;
+}
+
+static conversation_status conversation_visible_push(conversation *c,
+                                                     uint64_t index) {
+    if (c->visible_count == c->visible_capacity) {
+        size_t capacity = c->visible_capacity ? c->visible_capacity * 2 : 16;
+        conversation_visible *grown = realloc(c->visible,
+                                              capacity * sizeof(*grown));
+        if (!grown) return CONVERSATION_NOMEM;
+        c->visible = grown;
+        c->visible_capacity = capacity;
+    }
+    c->visible[c->visible_count].index = index;
+    c->visible[c->visible_count].boundary = c->token_count;
+    c->visible_count++;
     return CONVERSATION_OK;
 }
 
@@ -557,6 +591,7 @@ static int conversation_tokens_append(conversation *c, const int32_t *tokens,
     memcpy(c->tokens + c->token_count, tokens,
            (size_t)count * sizeof(*tokens));
     c->token_count = need;
+    c->appended_tokens += count;
     format_sha256_update(&c->token_hasher, tokens,
                          (size_t)count * sizeof(*tokens));
     return 1;
@@ -574,72 +609,128 @@ static conversation_status conversation_text_replace(char **slot,
     return CONVERSATION_OK;
 }
 
+static conversation_status conversation_rewind_apply(conversation *c,
+                                                     uint64_t target) {
+    if (target == CONVERSATION_REWIND_ALL) {
+        c->token_count = 0;
+        c->visible_count = 0;
+        c->call_count = 0;
+    } else {
+        uint64_t position = c->visible_count;
+        for (uint64_t i = 0; i < c->visible_count; i++)
+            if (c->visible[i].index == target) {
+                position = i;
+                break;
+            }
+        if (position == c->visible_count) return CONVERSATION_FORMAT;
+        c->token_count = c->visible[position].boundary;
+        c->visible_count = position + 1;
+        size_t kept = 0;
+        for (size_t i = 0; i < c->call_count; i++) {
+            if (c->calls[i].event_index > target) continue;
+            if (c->calls[i].has_result &&
+                c->calls[i].result_index > target) {
+                c->calls[i].has_result = 0;
+                c->calls[i].result_index = 0;
+            }
+            c->calls[kept++] = c->calls[i];
+        }
+        c->call_count = kept;
+    }
+    if (c->has_snapshot && c->snapshot_boundary > c->token_count) {
+        c->has_snapshot = 0;
+        c->snapshot_boundary = 0;
+    }
+    return CONVERSATION_OK;
+}
+
 static conversation_status conversation_apply(conversation *c,
                                               conversation_node *node) {
     conversation_event *view = &node->view;
+    uint64_t index = c->applied_events;
+    conversation_status status = CONVERSATION_FORMAT;
     switch (view->type) {
     case CONVERSATION_EVENT_TITLE:
         if (view->render_length > CONVERSATION_TITLE_MAX ||
             !conversation_utf8_valid(view->render, view->render_length) ||
-            memchr(view->render, 0, view->render_length))
-            return CONVERSATION_FORMAT;
-        return conversation_text_replace(&c->title, view->render,
-                                         view->render_length);
+            memchr(view->render, 0, view->render_length)) break;
+        status = conversation_text_replace(&c->title, view->render,
+                                           view->render_length);
+        break;
     case CONVERSATION_EVENT_WORKSPACE:
         if (view->render_length > CONVERSATION_WORKSPACE_MAX ||
             view->render_length == 0 || view->render[0] != '/' ||
-            memchr(view->render, 0, view->render_length))
-            return CONVERSATION_FORMAT;
-        return conversation_text_replace(&c->workspace, view->render,
-                                         view->render_length);
+            memchr(view->render, 0, view->render_length)) break;
+        status = conversation_text_replace(&c->workspace, view->render,
+                                           view->render_length);
+        break;
     case CONVERSATION_EVENT_SETTINGS:
         c->settings = view->settings;
         c->has_settings = 1;
-        return CONVERSATION_OK;
+        status = CONVERSATION_OK;
+        break;
     case CONVERSATION_EVENT_MESSAGE:
     case CONVERSATION_EVENT_TOOL_RESULT:
         if (view->type == CONVERSATION_EVENT_TOOL_RESULT) {
             conversation_call *call = conversation_call_find(c,
                                                              view->call_id);
-            if (!call || call->has_result) return CONVERSATION_FORMAT;
+            if (!call || call->has_result) break;
             call->has_result = 1;
+            call->result_index = index;
         }
-        if (!conversation_tokens_append(c, view->tokens, view->token_count))
-            return CONVERSATION_NOMEM;
-        return CONVERSATION_OK;
+        if (!conversation_tokens_append(c, view->tokens,
+                                        view->token_count)) {
+            status = CONVERSATION_NOMEM;
+            break;
+        }
+        status = conversation_visible_push(c, index);
+        break;
     case CONVERSATION_EVENT_GENERATION_STARTED:
         c->last_generation_id = view->generation_id;
         c->generation_pending = 1;
-        return CONVERSATION_OK;
+        status = CONVERSATION_OK;
+        break;
     case CONVERSATION_EVENT_GENERATION_RESULT:
         if (c->generation_pending &&
             view->generation_id == c->last_generation_id)
             c->generation_pending = 0;
         if (c->has_settings) c->settings.rng_state = view->rng_after;
-        if (!conversation_tokens_append(c, view->tokens, view->token_count))
-            return CONVERSATION_NOMEM;
-        return CONVERSATION_OK;
+        if (!conversation_tokens_append(c, view->tokens,
+                                        view->token_count)) {
+            status = CONVERSATION_NOMEM;
+            break;
+        }
+        status = conversation_visible_push(c, index);
+        break;
     case CONVERSATION_EVENT_TOOL_STARTED:
-        if (conversation_call_find(c, view->call_id))
-            return CONVERSATION_FORMAT;
-        return conversation_call_add(c, view->call_id);
+        if (conversation_call_find(c, view->call_id)) break;
+        status = conversation_call_add(c, view->call_id, index);
+        break;
     case CONVERSATION_EVENT_SNAPSHOT_REF:
-        if (view->epoch != c->epoch) return CONVERSATION_FORMAT;
-        if (view->snapshot_boundary > c->token_count)
-            return CONVERSATION_FORMAT;
+        if (view->epoch != c->epoch) break;
+        if (view->snapshot_boundary > c->token_count) break;
         c->snapshot = view->snapshot;
         c->snapshot_boundary = view->snapshot_boundary;
         c->has_snapshot = 1;
-        return CONVERSATION_OK;
+        status = CONVERSATION_OK;
+        break;
     case CONVERSATION_EVENT_CACHE_EPOCH:
-        if (view->epoch != c->epoch + 1) return CONVERSATION_FORMAT;
+        if (view->epoch != c->epoch + 1) break;
         c->epoch = view->epoch;
         c->has_snapshot = 0;
         c->snapshot_boundary = 0;
-        return CONVERSATION_OK;
+        status = CONVERSATION_OK;
+        break;
+    case CONVERSATION_EVENT_REWIND:
+        if (view->rewind_target != CONVERSATION_REWIND_ALL &&
+            view->rewind_target >= index) break;
+        status = conversation_rewind_apply(c, view->rewind_target);
+        break;
     default:
-        return CONVERSATION_FORMAT;
+        break;
     }
+    if (status == CONVERSATION_OK) c->applied_events++;
+    return status;
 }
 
 static conversation_status conversation_node_store(conversation *c,
@@ -867,7 +958,7 @@ static conversation_status conversation_scan_pass(
             conversation_node_free(&node);
             break;
         }
-        running_tokens = c->token_count;
+        running_tokens = c->appended_tokens;
         if (build) {
             conversation_status stored = conversation_node_store(c, &node);
             if (stored != CONVERSATION_OK) {
@@ -895,6 +986,7 @@ static void conversation_state_reset(conversation *c) {
     free(c->title);
     free(c->workspace);
     free(c->calls);
+    free(c->visible);
     c->events = NULL;
     c->event_count = 0;
     c->event_capacity = 0;
@@ -906,6 +998,11 @@ static void conversation_state_reset(conversation *c) {
     c->calls = NULL;
     c->call_count = 0;
     c->call_capacity = 0;
+    c->visible = NULL;
+    c->visible_count = 0;
+    c->visible_capacity = 0;
+    c->applied_events = 0;
+    c->appended_tokens = 0;
     c->has_settings = 0;
     c->epoch = 0;
     c->has_snapshot = 0;
@@ -1343,7 +1440,7 @@ conversation_status conversation_commit(conversation *c) {
 
     conversation_buffer payload = {0};
     conversation_status status = CONVERSATION_IO;
-    if (conversation_buffer_field_u64(&payload, 1, c->token_count) &&
+    if (conversation_buffer_field_u64(&payload, 1, c->appended_tokens) &&
         conversation_buffer_field(&payload, 2, digest_now, 32) &&
         conversation_buffer_field(&payload, 3, chain_now, 32)) {
         status = conversation_frame_write(c, CONVERSATION_EVENT_COMMIT,
@@ -1585,6 +1682,19 @@ conversation_status conversation_append_cache_epoch(conversation *c) {
     return status;
 }
 
+conversation_status conversation_append_rewind(conversation *c,
+                                               uint64_t target_event) {
+    if (!c) return CONVERSATION_INVALID_ARGUMENT;
+    conversation_buffer payload = {0};
+    conversation_status status = CONVERSATION_NOMEM;
+    if (conversation_buffer_field_u64(&payload, 1, target_event))
+        status = conversation_frame_write(c, CONVERSATION_EVENT_REWIND,
+                                          CONVERSATION_FRAME_CRITICAL,
+                                          &payload);
+    free(payload.data);
+    return status;
+}
+
 const conversation_id *conversation_get_id(const conversation *c) {
     return &c->id;
 }
@@ -1637,6 +1747,32 @@ const conversation_event *conversation_event_at(const conversation *c,
                                                 uint64_t index) {
     if (index >= c->event_count) return NULL;
     return &c->events[index].view;
+}
+
+uint64_t conversation_visible_count(const conversation *c) {
+    return c->visible_count;
+}
+
+uint64_t conversation_visible_index(const conversation *c,
+                                    uint64_t position) {
+    if (position >= c->visible_count) return UINT64_MAX;
+    return c->visible[position].index;
+}
+
+uint64_t conversation_visible_boundary(const conversation *c,
+                                       uint64_t position) {
+    if (position >= c->visible_count) return 0;
+    return c->visible[position].boundary;
+}
+
+int conversation_visible_position(const conversation *c,
+                                  uint64_t event_index, uint64_t *position) {
+    for (uint64_t i = 0; i < c->visible_count; i++)
+        if (c->visible[i].index == event_index) {
+            if (position) *position = i;
+            return 1;
+        }
+    return 0;
 }
 
 int conversation_generation_interrupted(const conversation *c) {

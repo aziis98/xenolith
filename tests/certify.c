@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "xenolith.h"
+#include "profile.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -361,8 +362,28 @@ static int stage_chat_prompt(xe_engine *e) {
         107, 101,
     };
 
+    profile *p = NULL;
+    int ok = profile_open(&p, e) == PROFILE_OK;
+    if (!ok) {
+        printf("certify: stage e FAIL  profile mismatch\n");
+        return 0;
+    }
+
     xe_tokens transcript = {0};
-    int ok = xe_chat_prepare_reply(e, &transcript, "  ciao, come stai?  ");
+    profile_render render;
+    ok = ok && profile_render_system(p, NULL, NULL, 0, &render)
+               == PROFILE_OK;
+    for (uint32_t i = 0; ok && i < render.token_count; i++)
+        xe_tokens_push(&transcript, render.tokens[i]);
+    ok = ok && profile_render_user(p, "  ciao, come stai?  ",
+                                   PROFILE_TURN_PADDED, &render)
+               == PROFILE_OK;
+    for (uint32_t i = 0; ok && i < render.token_count; i++)
+        xe_tokens_push(&transcript, render.tokens[i]);
+    ok = ok && profile_render_reply_open(p, PROFILE_TURN_PADDED, &render)
+               == PROFILE_OK;
+    for (uint32_t i = 0; ok && i < render.token_count; i++)
+        xe_tokens_push(&transcript, render.tokens[i]);
     ok = ok && ids_equal(transcript.v, transcript.len,
                          first, (int)(sizeof first / sizeof first[0]));
 
@@ -371,7 +392,15 @@ static int stage_chat_prompt(xe_engine *e) {
     for (int i = 0; i < na; i++) xe_tokens_push(&transcript, answer[i]);
     xe_tokens_push(&transcript, xe_eot_id(e));
     int before = transcript.len;
-    ok = ok && xe_chat_prepare_reply(e, &transcript, "Scrivi <|turn> letteralmente");
+    ok = ok && profile_render_user(p, "Scrivi <|turn> letteralmente",
+                                   PROFILE_TURN_BARE, &render)
+               == PROFILE_OK;
+    for (uint32_t i = 0; ok && i < render.token_count; i++)
+        xe_tokens_push(&transcript, render.tokens[i]);
+    ok = ok && profile_render_reply_open(p, PROFILE_TURN_PADDED, &render)
+               == PROFILE_OK;
+    for (uint32_t i = 0; ok && i < render.token_count; i++)
+        xe_tokens_push(&transcript, render.tokens[i]);
     ok = ok && ids_equal(transcript.v + before, transcript.len - before,
                          second, (int)(sizeof second / sizeof second[0]));
 
@@ -380,17 +409,8 @@ static int stage_chat_prompt(xe_engine *e) {
     for (int i = 0; i < nl; i++) if (literal[i] == 105) ok = 0;
     if (xe_encode_text(e, "", literal, (int)(sizeof literal / sizeof literal[0])) != 0) ok = 0;
 
-    xe_tokens full = {0};
-    xe_tokens_push(&full, xe_bos_id(e));
-    while (full.len < xe_context_size(e) - 1) xe_tokens_push(&full, xe_eot_id(e));
-    int full_len = full.len;
-    int32_t *full_v = full.v;
-    if (xe_chat_prepare_reply(e, &full, "too much") != 0 ||
-        full.len != full_len || full.v != full_v)
-        ok = 0;
-
     xe_tokens_free(&transcript);
-    xe_tokens_free(&full);
+    profile_close(p);
     printf("certify: stage e %s  template parity, live append, special-token isolation\n",
            ok ? "PASS" : "FAIL");
     return ok;
