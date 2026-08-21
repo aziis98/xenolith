@@ -619,8 +619,10 @@ int main(int argc, char **argv) {
     CHECK(lock_fd >= 0);
     if (lock_fd >= 0) close(lock_fd);
 
-    char idle_socket[256], late_socket[256];
+    char idle_socket[256], fragment_socket[256], late_socket[256];
     snprintf(idle_socket, sizeof idle_socket, "%s/idle.sock", state_dir);
+    snprintf(fragment_socket, sizeof fragment_socket, "%s/fragment.sock",
+             state_dir);
     snprintf(late_socket, sizeof late_socket, "%s/late.sock", state_dir);
 
     fflush(NULL);
@@ -646,6 +648,34 @@ int main(int argc, char **argv) {
     CHECK(idle_code == 0);
     CHECK(idle_elapsed < 10000);
     client_close(&k);
+
+    fflush(NULL);
+    pid_t fragment_server = fork();
+    CHECK(fragment_server >= 0);
+    if (fragment_server == 0)
+        _exit(serve_run(e, state_dir, cache_dir, fragment_socket, 0.03));
+    client fragment;
+    CHECK(client_connect(&fragment, fragment_socket));
+    test_sleep_ms(1200);
+    CHECK(client_send(&fragment, "{\"op\":\"desc"));
+    test_sleep_ms(1200);
+    CHECK(client_send(&fragment, "ribe\"}\n"));
+    CHECK(client_recv(&fragment, line, sizeof line, 15000));
+    CHECK(strstr(line, "\"ok\":true") != NULL);
+    CHECK(client_send(&fragment, "{"));
+    int fragment_code = -2;
+    for (int i = 0; i < 50; i++) {
+        int fragment_status = 0;
+        if (waitpid(fragment_server, &fragment_status, WNOHANG) ==
+            fragment_server) {
+            fragment_code = WIFEXITED(fragment_status)
+                            ? WEXITSTATUS(fragment_status) : -1;
+            break;
+        }
+        test_sleep_ms(200);
+    }
+    CHECK(fragment_code == 0);
+    client_close(&fragment);
 
     fflush(NULL);
     pid_t late = fork();

@@ -1328,6 +1328,11 @@ static void serve_read(serve *s, serve_conn *c) {
         if (!room) return;
         ssize_t n = read(c->in_fd, c->in + c->in_length, room);
         if (n > 0) {
+            for (ssize_t i = 0; i < n; i++)
+                if ((unsigned char)c->in[c->in_length + (size_t)i] > ' ') {
+                    s->active_at = serve_now_ms();
+                    break;
+                }
             c->in_length += (size_t)n;
             c->head_checked = 0;
             if (c->in_length >= s->max_frame &&
@@ -1512,8 +1517,6 @@ static int serve_timeout(const serve *s) {
 
 static int serve_idle_expired(const serve *s) {
     if (s->idle_ms <= 0 || s->generating || s->queue_count) return 0;
-    for (int i = 0; i < SERVE_MAX_CONNECTIONS; i++)
-        if (s->conns[i].active && s->conns[i].in_length) return 0;
     return serve_now_ms() - s->active_at >= s->idle_ms;
 }
 
