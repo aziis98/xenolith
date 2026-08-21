@@ -29,7 +29,48 @@ typedef struct {
     const char *model;
     int context_window;
     int max_output;
+    int kvstore;            /* 1 when the snapshot store opened */
 } wire_info;
+
+/* Why a checkpoint did not save. Checkpoints are never fatal (the
+ * transcript is the source of truth and replay always works); the
+ * report makes the outcome visible to the client, the log and tests. */
+typedef enum {
+    WIRE_CKPT_SAVED,
+    WIRE_CKPT_NO_KVSTORE,    /* store never opened: permanent for the process */
+    WIRE_CKPT_EMPTY,         /* nothing computed yet (no tokens, or KV not loaded) */
+    WIRE_CKPT_NOTHING_NEW,   /* already saved up to the current boundary */
+    WIRE_CKPT_KV_DIVERGED,   /* KV is not a prefix of the transcript (transient) */
+    WIRE_CKPT_BUDGET,        /* snapshot does not fit the store budget: permanent for the session */
+    WIRE_CKPT_IO,            /* store write failed */
+    WIRE_CKPT_REJECTED,      /* engine refused the snapshot */
+    WIRE_CKPT_RECORD_FAILED  /* snapshot written, transcript record failed */
+} wire_ckpt_reason;
+
+typedef struct {
+    int saved;
+    wire_ckpt_reason reason;
+    uint64_t tokens;        /* boundary saved, or current size when not saved */
+} wire_checkpoint_report;
+
+/* Why a resume did not load the snapshot it was expected to. */
+typedef enum {
+    WIRE_RESUME_LOADED,
+    WIRE_RESUME_EVICTED,        /* snapshot file gone from the store */
+    WIRE_RESUME_MODEL_MISMATCH,
+    WIRE_RESUME_TOKEN_MISMATCH, /* transcript no longer matches the snapshot */
+    WIRE_RESUME_IO,
+    WIRE_RESUME_REJECTED        /* any other engine refusal */
+} wire_resume_reason;
+
+typedef struct {
+    int loaded;
+    wire_resume_reason reason;
+    uint64_t tokens;        /* boundary loaded or attempted */
+} wire_resume_report;
+
+const char *wire_ckpt_reason_name(wire_ckpt_reason reason);
+const char *wire_resume_reason_name(wire_resume_reason reason);
 
 typedef enum {
     WIRE_MESSAGE_USER = 1,
@@ -94,6 +135,10 @@ typedef struct {
     wire_marker marker;
     uint32_t error;
     const char *error_text;
+    int checkpoint_attempted;          /* done: autosave ran at end of turn */
+    wire_checkpoint_report checkpoint;
+    int resume_attempted;              /* done: a snapshot load was tried */
+    wire_resume_report resume;
 } wire_event;
 
 typedef struct {
@@ -101,6 +146,7 @@ typedef struct {
     wire_marker marker;
     int turn_open;
     int zero_prefill;
+    int resume_stale;       /* a snapshot exists but behind the current boundary */
     size_t pending_calls;
 } wire_open_report;
 
@@ -159,7 +205,9 @@ wire_status wire_rebuild(wire *w, const char *system,
                          const profile_tool *tools, size_t tool_count,
                          const wire_message *messages, size_t count,
                          wire_marker *out);
-wire_status wire_checkpoint(wire *w);
+wire_status wire_checkpoint(wire *w, wire_checkpoint_report *out);
+/* Status of the snapshot store at open; KVSTORE_OK when it works. */
+int wire_kvstore_open_status(const wire *w);
 
 const char *wire_status_code(wire_status status);
 const char *wire_error_text(const wire *w);

@@ -520,6 +520,34 @@ static void serve_params_parse(const json_value *request,
     if (serve_u64(request, "seed", &seed)) params->rng_seed = seed;
 }
 
+static int serve_ckpt_noteworthy(const wire_checkpoint_report *r) {
+    return !r->saved && r->reason != WIRE_CKPT_NOTHING_NEW &&
+           r->reason != WIRE_CKPT_EMPTY;
+}
+
+static void serve_log_checkpoint(const char *where,
+                                 const wire_checkpoint_report *r) {
+    if (!serve_ckpt_noteworthy(r)) return;
+    fprintf(stderr, "xenolith: checkpoint (%s): not saved, %s, %llu tokens\n",
+            where, wire_ckpt_reason_name(r->reason),
+            (unsigned long long)r->tokens);
+}
+
+static void serve_log_resume(const wire_resume_report *r) {
+    if (r->loaded) return;
+    fprintf(stderr, "xenolith: resume: snapshot not loaded, %s, %llu tokens\n",
+            wire_resume_reason_name(r->reason), (unsigned long long)r->tokens);
+}
+
+static void serve_log_kvstore(const wire *w, const char *cache_dir) {
+    int status = wire_kvstore_open_status(w);
+    if (status == KVSTORE_OK) return;
+    fprintf(stderr, "xenolith: kvstore disabled: open failed (%s) at %s; "
+            "sessions will not resume from cache\n",
+            kvstore_status_name((kvstore_status)status),
+            cache_dir ? cache_dir : "default cache dir");
+}
+
 static void serve_emit_event(serve *s, serve_conn *c,
                              const wire_event *event) {
     json_writer *out = &s->out;
@@ -570,6 +598,32 @@ static void serve_emit_event(serve *s, serve_conn *c,
         json_raw(out, "},\"marker\":");
         if (event->marker == WIRE_MARKER_NONE) json_raw(out, "null");
         else json_u64(out, event->marker);
+        if (event->checkpoint_attempted) {
+            const char *reason = wire_ckpt_reason_name(event->checkpoint.reason);
+            serve_log_checkpoint("autosave", &event->checkpoint);
+            json_raw(out, ",\"checkpoint\":{\"saved\":");
+            json_raw(out, event->checkpoint.saved ? "true" : "false");
+            if (!event->checkpoint.saved) {
+                json_raw(out, ",\"reason\":");
+                json_string(out, reason, strlen(reason));
+            }
+            json_raw(out, ",\"tokens\":");
+            json_u64(out, event->checkpoint.tokens);
+            json_raw(out, "}");
+        }
+        if (event->resume_attempted) {
+            const char *reason = wire_resume_reason_name(event->resume.reason);
+            serve_log_resume(&event->resume);
+            json_raw(out, ",\"resume\":{\"loaded\":");
+            json_raw(out, event->resume.loaded ? "true" : "false");
+            if (!event->resume.loaded) {
+                json_raw(out, ",\"reason\":");
+                json_string(out, reason, strlen(reason));
+            }
+            json_raw(out, ",\"tokens\":");
+            json_u64(out, event->resume.tokens);
+            json_raw(out, "}");
+        }
         json_raw(out, "}");
         break;
     case WIRE_EVENT_ERROR:
@@ -610,6 +664,8 @@ static int serve_dispatch(serve *s, serve_conn *c,
         json_i64(out, info.context_window);
         json_raw(out, ",\"max_output\":");
         json_i64(out, info.max_output);
+        json_raw(out, ",\"kvstore\":");
+        json_raw(out, info.kvstore ? "true" : "false");
         json_raw(out, "}");
         serve_emit(s, c);
         return 0;
@@ -708,6 +764,9 @@ static int serve_dispatch(serve *s, serve_conn *c,
         json_raw(out, report.turn_open ? "true" : "false");
         json_raw(out, ",\"zero_prefill\":");
         json_raw(out, report.zero_prefill ? "true" : "false");
+        json_raw(out, ",\"resume\":");
+        json_raw(out, report.zero_prefill ? "\"snapshot\""
+                      : report.resume_stale ? "\"stale\"" : "\"none\"");
         json_raw(out, ",\"pending\":[");
         uint64_t pending[64];
         size_t pending_count = wire_pending_calls(
@@ -886,10 +945,21 @@ static int serve_dispatch(serve *s, serve_conn *c,
         return 0;
     }
     if (!strcmp(op, "checkpoint")) {
-        status = wire_checkpoint(s->w);
+        wire_checkpoint_report report;
+        status = wire_checkpoint(s->w, &report);
         if (status != WIRE_OK) serve_wire_error(s, c, status);
         else {
+            serve_log_checkpoint("checkpoint", &report);
             serve_ok_begin(s);
+            json_raw(out, ",\"saved\":");
+            json_raw(out, report.saved ? "true" : "false");
+            if (!report.saved) {
+                const char *reason = wire_ckpt_reason_name(report.reason);
+                json_raw(out, ",\"reason\":");
+                json_string(out, reason, strlen(reason));
+            }
+            json_raw(out, ",\"tokens\":");
+            json_u64(out, report.tokens);
             json_raw(out, "}");
             serve_emit(s, c);
         }
@@ -1439,12 +1509,17 @@ static void serve_loop(serve *s) {
     }
 }
 
+static void serve_shutdown_checkpoint(serve *s) {
+    wire_checkpoint_report r;
+    if (wire_checkpoint(s->w, &r) == WIRE_OK) serve_log_checkpoint("shutdown", &r);
+}
+
 static void serve_shutdown(serve *s) {
     if (s->generating) {
         wire_cancel(s->w);
         while (s->generating) serve_stream_pull(s);
     }
-    wire_checkpoint(s->w);
+    serve_shutdown_checkpoint(s);
     for (int i = 0; i < SERVE_MAX_CONNECTIONS; i++) {
         serve_conn *c = &s->conns[i];
         if (!c->active) continue;
@@ -1483,6 +1558,7 @@ int serve_stdio(xe_engine *engine, const char *state_dir,
         fprintf(stderr, "xenolith: wire: %s\n", wire_status_code(status));
         return 1;
     }
+    serve_log_kvstore(s.w, cache_dir);
     serve_conn *c = &s.conns[0];
     c->active = 1;
     c->is_socket = 0;
@@ -1491,7 +1567,7 @@ int serve_stdio(xe_engine *engine, const char *state_dir,
     c->sequential = !serve_stdin_interactive();
     s.active_at = serve_now_ms();
     serve_loop(&s);
-    wire_checkpoint(s.w);
+    serve_shutdown_checkpoint(&s);
     for (int i = 0; i < SERVE_MAX_CONNECTIONS; i++) {
         if (s.conns[i].active) {
             serve_residue(&s, &s.conns[i]);
@@ -1547,6 +1623,7 @@ int serve_run(xe_engine *engine, const char *state_dir, const char *cache_dir,
         fprintf(stderr, "xenolith: serve: %s\n", wire_status_code(status));
         return 1;
     }
+    serve_log_kvstore(s.w, cache_dir);
     signal(SIGPIPE, SIG_IGN);
     if (pipe(serve_signal_fd) == 0) {
         fcntl(serve_signal_fd[0], F_SETFL, O_NONBLOCK);

@@ -301,12 +301,14 @@ int main(int argc, char **argv) {
     CHECK(client_call(&a, "{\"op\":\"describe\"}\n", line, sizeof line));
     CHECK(strstr(line, "\"ok\":true") != NULL);
     CHECK(strstr(line, "\"protocol\":1") != NULL);
+    CHECK(strstr(line, "\"kvstore\":true") != NULL);
 
     CHECK(client_call(&b, "{\"op\":\"append\",\"role\":\"user\","
                           "\"text\":\"no session\"}\n", line, sizeof line));
     CHECK(strstr(line, "\"ok\":false") != NULL);
 
     char session_a[64], session_b[64];
+    char request[512];
     CHECK(client_call(&a, "{\"op\":\"create\",\"system\":\"A\"}\n", line,
                       sizeof line));
     CHECK(strstr(line, "\"ok\":true") != NULL);
@@ -314,12 +316,22 @@ int main(int argc, char **argv) {
     CHECK(client_call(&a, "{\"op\":\"append\",\"role\":\"user\","
                           "\"text\":\"hello\"}\n", line, sizeof line));
     CHECK(strstr(line, "\"ok\":true") != NULL);
+    /* 3.7 finding 2: the checkpoint op reports its outcome. A vocab-only
+     * engine never computes KV, so the honest answer is "empty". */
+    CHECK(client_call(&a, "{\"op\":\"checkpoint\"}\n", line, sizeof line));
+    CHECK(strstr(line, "\"ok\":true") != NULL);
+    CHECK(strstr(line, "\"saved\":false") != NULL);
+    CHECK(strstr(line, "\"reason\":\"empty\"") != NULL);
+    snprintf(request, sizeof request,
+             "{\"op\":\"open\",\"session\":\"%s\"}\n", session_a);
+    CHECK(client_call(&a, request, line, sizeof line));
+    CHECK(strstr(line, "\"zero_prefill\":false") != NULL);
+    CHECK(strstr(line, "\"resume\":\"none\"") != NULL);
 
     CHECK(client_call(&b, "{\"op\":\"create\",\"system\":\"B\"}\n", line,
                       sizeof line));
     CHECK(session_of(line, session_b));
 
-    char request[512];
     snprintf(request, sizeof request,
              "{\"op\":\"delete\",\"session\":\"%s\"}\n", session_a);
     CHECK(client_call(&b, request, line, sizeof line));

@@ -18,6 +18,11 @@ static int failures;
     } \
 } while (0)
 
+static const char *store_fault_point;
+int kvstore_fault(const char *point) {
+    return store_fault_point && strcmp(store_fault_point, point) == 0;
+}
+
 typedef struct {
     char text[16384];
     size_t text_length;
@@ -30,6 +35,10 @@ typedef struct {
     wire_marker marker;
     int error;
     int progress_events;
+    int checkpoint_attempted;
+    wire_checkpoint_report checkpoint;
+    int resume_attempted;
+    wire_resume_report resume;
 } run_result;
 
 static void run_generation(wire *w, run_result *out, int cancel_after_text) {
@@ -74,6 +83,10 @@ static void run_generation(wire *w, run_result *out, int cancel_after_text) {
             out->stop = event.stop;
             out->usage = event.usage;
             out->marker = event.marker;
+            out->checkpoint_attempted = event.checkpoint_attempted;
+            out->checkpoint = event.checkpoint;
+            out->resume_attempted = event.resume_attempted;
+            out->resume = event.resume;
             return;
         case WIRE_EVENT_ERROR:
             out->error = 1;
@@ -193,7 +206,21 @@ int main(int argc, char **argv) {
     CHECK(turn3.usage.input <= 2);
     CHECK(turn3.usage.cache_read > 0);
 
-    CHECK(wire_checkpoint(w) == WIRE_OK);
+    /* 3.7 finding 2: a failed save is reported, never silent. */
+    wire_checkpoint_report ckpt;
+    store_fault_point = "snapshot-synced";
+    CHECK(wire_checkpoint(w, &ckpt) == WIRE_OK);
+    CHECK(ckpt.saved == 0 && ckpt.reason == WIRE_CKPT_IO);
+    CHECK(ckpt.tokens == turn3.usage.total);
+    wire_open_report failed_report;
+    CHECK(wire_session_open(w, &id, &failed_report) == WIRE_OK);
+    CHECK(failed_report.zero_prefill == 0);
+    store_fault_point = NULL;
+    CHECK(wire_checkpoint(w, &ckpt) == WIRE_OK);
+    CHECK(ckpt.saved == 1 && ckpt.reason == WIRE_CKPT_SAVED);
+    CHECK(ckpt.tokens == turn3.usage.total);
+    CHECK(wire_checkpoint(w, &ckpt) == WIRE_OK);
+    CHECK(ckpt.saved == 0 && ckpt.reason == WIRE_CKPT_NOTHING_NEW);
     uint64_t tokens_before;
     tokens_before = turn3.usage.total;
     wire_close(w);
@@ -203,16 +230,23 @@ int main(int argc, char **argv) {
     CHECK(wire_session_open(w, &id, &report) == WIRE_OK);
     CHECK(report.token_count == tokens_before);
     CHECK(report.zero_prefill == 1);
+    CHECK(report.resume_stale == 0);
     CHECK(report.turn_open == 0);
 
     user.text = "Thanks. Reply with one short sentence.";
     CHECK(wire_append(w, &user, &marker) == WIRE_OK);
+    wire_open_report stale_report;
+    CHECK(wire_session_open(w, &id, &stale_report) == WIRE_OK);
+    CHECK(stale_report.zero_prefill == 0 && stale_report.resume_stale == 1);
     CHECK(wire_generate(w, &greedy) == WIRE_OK);
     run_result turn4;
     run_generation(w, &turn4, 0);
     CHECK(!turn4.error);
     CHECK(turn4.usage.cache_read >= tokens_before);
     CHECK(turn4.usage.input < 40);
+    CHECK(turn4.resume_attempted == 1);
+    CHECK(turn4.resume.loaded == 1);
+    CHECK(turn4.resume.tokens == tokens_before);
 
     user.text = "Tell me a very long story about the sea.";
     CHECK(wire_append(w, &user, &marker) == WIRE_OK);

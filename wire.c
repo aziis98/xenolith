@@ -39,6 +39,13 @@ struct wire {
     uint64_t next_call_id;
     uint64_t saved_tokens;
     int64_t saved_at;
+    int ckpt_failures;        /* consecutive autosave failures (backoff) */
+    int ckpt_autosave_off;    /* set on budget: the session cannot fit, stop trying */
+    int kv_open_status;       /* kvstore_status of the open attempt */
+    int autosave_attempted;   /* last turn ran an autosave */
+    wire_checkpoint_report autosave;
+    int resume_attempted;     /* last generation tried a snapshot load */
+    wire_resume_report resume;
 
     xe_session *session;
     xe_session *ephemeral;
@@ -189,11 +196,45 @@ wire_status wire_open(wire **out, xe_engine *engine, const char *state_dir,
     char cache_path[4096];
     if (!cache_dir && wire_default_cache_dir(cache_path, sizeof cache_path))
         cache_dir = cache_path;
-    if (cache_dir &&
-        kvstore_open(&w->kv, cache_dir, KVSTORE_DEFAULT_BUDGET) != KVSTORE_OK)
-        w->kv = NULL;
+    w->kv_open_status = KVSTORE_OK;
+    if (cache_dir) {
+        w->kv_open_status = (int)kvstore_open(&w->kv, cache_dir,
+                                              KVSTORE_DEFAULT_BUDGET);
+        if (w->kv_open_status != KVSTORE_OK) w->kv = NULL;
+    }
     *out = w;
     return WIRE_OK;
+}
+
+int wire_kvstore_open_status(const wire *w) {
+    return w ? w->kv_open_status : (int)KVSTORE_INVALID_ARGUMENT;
+}
+
+const char *wire_ckpt_reason_name(wire_ckpt_reason reason) {
+    switch (reason) {
+    case WIRE_CKPT_SAVED: return "saved";
+    case WIRE_CKPT_NO_KVSTORE: return "no_kvstore";
+    case WIRE_CKPT_EMPTY: return "empty";
+    case WIRE_CKPT_NOTHING_NEW: return "nothing_new";
+    case WIRE_CKPT_KV_DIVERGED: return "kv_diverged";
+    case WIRE_CKPT_BUDGET: return "budget";
+    case WIRE_CKPT_IO: return "io";
+    case WIRE_CKPT_REJECTED: return "rejected";
+    case WIRE_CKPT_RECORD_FAILED: return "record_failed";
+    }
+    return "unknown";
+}
+
+const char *wire_resume_reason_name(wire_resume_reason reason) {
+    switch (reason) {
+    case WIRE_RESUME_LOADED: return "loaded";
+    case WIRE_RESUME_EVICTED: return "evicted";
+    case WIRE_RESUME_MODEL_MISMATCH: return "model_mismatch";
+    case WIRE_RESUME_TOKEN_MISMATCH: return "token_mismatch";
+    case WIRE_RESUME_IO: return "io";
+    case WIRE_RESUME_REJECTED: return "rejected";
+    }
+    return "unknown";
 }
 
 static void wire_calls_reset(wire *w) {
@@ -228,6 +269,7 @@ wire_status wire_describe(wire *w, wire_info *out) {
     out->model = profile_model(w->prof);
     out->context_window = w->context;
     out->max_output = w->context;
+    out->kvstore = w->kv != NULL;
     return WIRE_OK;
 }
 
@@ -327,41 +369,87 @@ static wire_status wire_append_system_event(wire *w, conversation *c,
     return WIRE_OK;
 }
 
-static wire_status wire_checkpoint_now(wire *w) {
-    if (!w->kv || !w->session || !w->has_current) return WIRE_OK;
+/* Consecutive transient failures push the next autosave out: 30 s, then
+ * +30, +90, +210, +450 s on top of the 30 s window, capped. The explicit
+ * checkpoint op bypasses this and a success resets it. */
+static void wire_ckpt_backoff(wire *w, int64_t now) {
+    if (w->ckpt_failures < 5) w->ckpt_failures++;
+    int64_t window = INT64_C(30000000000);
+    int64_t extra = window * ((INT64_C(1) << w->ckpt_failures) - 2);
+    w->saved_at = now + extra;
+}
+
+static void wire_ckpt_reset(wire *w) {
+    w->ckpt_failures = 0;
+    w->ckpt_autosave_off = 0;
+}
+
+static void wire_checkpoint_now(wire *w, wire_checkpoint_report *out) {
+    wire_checkpoint_report report;
+    memset(&report, 0, sizeof report);
+    if (!out) out = &report;
+    memset(out, 0, sizeof *out);
+    if (!w->kv) { out->reason = WIRE_CKPT_NO_KVSTORE; return; }
+    if (!w->session || !w->has_current) { out->reason = WIRE_CKPT_EMPTY; return; }
     conversation *c = w->current;
     uint64_t total;
     const int32_t *tokens = conversation_tokens(c, &total);
-    if (!total || total > (uint64_t)w->context) return WIRE_OK;
+    out->tokens = total;
+    if (!total) { out->reason = WIRE_CKPT_EMPTY; return; }
     int position = xe_session_position(w->session);
-    if (position <= 0 || (uint64_t)position > total) return WIRE_OK;
+    if (position <= 0) { out->reason = WIRE_CKPT_EMPTY; return; }
+    if ((uint64_t)position > total) { out->reason = WIRE_CKPT_KV_DIVERGED; return; }
     xe_tokens full = { (int32_t *)tokens, (int)total, (int)total };
-    if (xe_session_common(w->session, &full) < position) return WIRE_OK;
+    if (xe_session_common(w->session, &full) < position) {
+        out->reason = WIRE_CKPT_KV_DIVERGED;
+        return;
+    }
     if ((uint64_t)position < total) {
         xe_session_sync(w->session, &full);
         position = (int)total;
     }
-    if ((uint64_t)position <= w->saved_tokens) return WIRE_OK;
+    if ((uint64_t)position <= w->saved_tokens) {
+        out->reason = WIRE_CKPT_NOTHING_NEW;
+        return;
+    }
     kvstore_save_options options;
     memset(&options, 0, sizeof options);
     options.rebuild_cost = (uint64_t)position;
     kvstore_id id;
     xe_snapshot_status snapshot_status;
-    if (kvstore_save(w->kv, w->session, &options, &id,
-                     &snapshot_status) != KVSTORE_OK)
-        return WIRE_OK;
+    kvstore_status ks = kvstore_save(w->kv, w->session, &options, &id,
+                                     &snapshot_status);
+    int64_t now = wire_now();
+    if (ks != KVSTORE_OK) {
+        if (ks == KVSTORE_BUDGET) {
+            out->reason = WIRE_CKPT_BUDGET;
+            w->ckpt_autosave_off = 1;
+        } else {
+            out->reason = ks == KVSTORE_REJECTED ? WIRE_CKPT_REJECTED
+                                                 : WIRE_CKPT_IO;
+            wire_ckpt_backoff(w, now);
+        }
+        return;
+    }
     if (conversation_append_snapshot_ref(c, &id, (uint64_t)position)
-            != CONVERSATION_OK)
-        return WIRE_OK;
-    if (conversation_commit(c) != CONVERSATION_OK) return WIRE_OK;
+            != CONVERSATION_OK ||
+        conversation_commit(c) != CONVERSATION_OK) {
+        out->reason = WIRE_CKPT_RECORD_FAILED;
+        wire_ckpt_backoff(w, now);
+        return;
+    }
     w->saved_tokens = (uint64_t)position;
-    w->saved_at = wire_now();
-    return WIRE_OK;
+    w->saved_at = now;
+    wire_ckpt_reset(w);
+    out->saved = 1;
+    out->reason = WIRE_CKPT_SAVED;
+    out->tokens = (uint64_t)position;
 }
 
-static void wire_park(wire *w) {
+static void wire_park(wire *w, wire_checkpoint_report *out) {
+    if (out) memset(out, 0, sizeof *out);
     if (!w->has_current) return;
-    wire_checkpoint_now(w);
+    wire_checkpoint_now(w, out);
     conversation_close(w->current);
     w->current = NULL;
     w->has_current = 0;
@@ -387,13 +475,14 @@ wire_status wire_session_create(wire *w, const char *system,
         conversation_delete(w->cstore, id);
         return status;
     }
-    wire_park(w);
+    wire_park(w, NULL);
     w->current = c;
     w->current_id = *id;
     w->has_current = 1;
     w->next_call_id = 1;
     w->saved_tokens = 0;
     w->saved_at = 0;
+    wire_ckpt_reset(w);
     if (marker) *marker = system_marker;
     return WIRE_OK;
 }
@@ -421,9 +510,9 @@ static void wire_open_report_fill(wire *w, wire_open_report *out) {
     out->turn_open = wire_turn(c) == PROFILE_TURN_OPEN;
     kvstore_id snapshot;
     uint64_t boundary = 0;
-    out->zero_prefill = conversation_snapshot_current(c, &snapshot,
-                                                      &boundary) &&
-                        boundary == tokens && tokens > 0;
+    int has_snapshot = conversation_snapshot_current(c, &snapshot, &boundary);
+    out->zero_prefill = has_snapshot && boundary == tokens && tokens > 0;
+    out->resume_stale = has_snapshot && !out->zero_prefill && boundary > 0;
     out->pending_calls = conversation_unknown_tool_calls(c, NULL, 0);
 }
 
@@ -441,7 +530,7 @@ wire_status wire_session_open(wire *w, const conversation_id *id,
     wire_status status = wire_from_conversation(
         w, conversation_open(w->cstore, id, &c));
     if (status != WIRE_OK) return status;
-    wire_park(w);
+    wire_park(w, NULL);
     w->current = c;
     w->current_id = *id;
     w->has_current = 1;
@@ -451,6 +540,7 @@ wire_status wire_session_open(wire *w, const conversation_id *id,
     w->saved_tokens = conversation_snapshot_current(c, &snapshot, &boundary)
                       ? boundary : 0;
     w->saved_at = 0;
+    wire_ckpt_reset(w);
     if (out) wire_open_report_fill(w, out);
     return WIRE_OK;
 }
@@ -716,6 +806,8 @@ static wire_status wire_best_snapshot(conversation *c, uint64_t limit,
 static wire_status wire_gen_prepare(wire *w, xe_session *session,
                                     conversation *c) {
     w->gen_session = session;
+    w->autosave_attempted = 0;
+    w->resume_attempted = 0;
     xe_tokens prompt = { w->prompt, w->prompt_length, w->context };
     int common = xe_session_common(session, &prompt);
     if (c && w->kv) {
@@ -727,9 +819,31 @@ static wire_status wire_gen_prepare(wire *w, xe_session *session,
             xe_tokens expected = { w->prompt, (int)boundary,
                                    (int)boundary };
             xe_snapshot_status snapshot_status;
-            if (kvstore_load(w->kv, &id, session, &expected,
-                             &snapshot_status) == KVSTORE_OK)
+            kvstore_status ks = kvstore_load(w->kv, &id, session, &expected,
+                                             &snapshot_status);
+            w->resume_attempted = 1;
+            memset(&w->resume, 0, sizeof w->resume);
+            w->resume.tokens = boundary;
+            if (ks == KVSTORE_OK) {
                 common = xe_session_common(session, &prompt);
+                w->resume.loaded = 1;
+                w->resume.reason = WIRE_RESUME_LOADED;
+            } else if (ks == KVSTORE_MISS) {
+                w->resume.reason = WIRE_RESUME_EVICTED;
+            } else if (ks == KVSTORE_REJECTED) {
+                switch (snapshot_status) {
+                case XE_SNAPSHOT_MODEL_MISMATCH:
+                    w->resume.reason = WIRE_RESUME_MODEL_MISMATCH; break;
+                case XE_SNAPSHOT_TOKEN_MISMATCH:
+                    w->resume.reason = WIRE_RESUME_TOKEN_MISMATCH; break;
+                case XE_SNAPSHOT_IO:
+                    w->resume.reason = WIRE_RESUME_IO; break;
+                default:
+                    w->resume.reason = WIRE_RESUME_REJECTED; break;
+                }
+            } else {
+                w->resume.reason = WIRE_RESUME_IO;
+            }
         }
     }
     w->prompt_common = common;
@@ -1032,9 +1146,12 @@ static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
         uint64_t total;
         conversation_tokens(c, &total);
         w->usage.total = total;
-        if (w->kv && conversation_autosave_due(total, w->saved_tokens,
-                                               w->saved_at, wire_now()))
-            wire_checkpoint_now(w);
+        if (w->kv && !w->ckpt_autosave_off &&
+            conversation_autosave_due(total, w->saved_tokens,
+                                      w->saved_at, wire_now())) {
+            w->autosave_attempted = 1;
+            wire_checkpoint_now(w, &w->autosave);
+        }
     } else {
         w->usage.total = (uint64_t)(w->prompt_length + w->sampled_length);
     }
@@ -1046,6 +1163,10 @@ static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
     out->stop = wire_stop_reason;
     out->usage = usage;
     out->marker = marker;
+    out->checkpoint_attempted = w->autosave_attempted;
+    out->checkpoint = w->autosave;
+    out->resume_attempted = w->resume_attempted;
+    out->resume = w->resume;
     return WIRE_OK;
 }
 
@@ -1209,6 +1330,7 @@ wire_status wire_rewind(wire *w, wire_marker marker) {
     uint64_t boundary = 0;
     w->saved_tokens = conversation_snapshot_current(c, &snapshot, &boundary)
                       ? boundary : 0;
+    wire_ckpt_reset(w);
     return WIRE_OK;
 }
 
@@ -1413,15 +1535,21 @@ wire_status wire_rebuild(wire *w, const char *system,
     if (status != WIRE_OK) return status;
     w->saved_tokens = 0;
     w->saved_at = 0;
+    wire_ckpt_reset(w);
     if (out) *out = conversation_event_count(c) - 1;
     return WIRE_OK;
 }
 
-wire_status wire_checkpoint(wire *w) {
+wire_status wire_checkpoint(wire *w, wire_checkpoint_report *out) {
     if (!w) return WIRE_INVALID_ARGUMENT;
     if (w->gen_kind != WIRE_GEN_NONE)
         return wire_fail(w, WIRE_BUSY, "generation in progress");
     if (!w->has_current)
         return wire_fail(w, WIRE_SESSION_NOT_FOUND, "no open session");
-    return wire_checkpoint_now(w);
+    /* Explicit: bypass the autosave backoff and re-arm it on success. */
+    w->ckpt_autosave_off = 0;
+    int64_t now = wire_now();
+    if (w->saved_at > now) w->saved_at = now;
+    wire_checkpoint_now(w, out);
+    return WIRE_OK;
 }

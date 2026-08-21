@@ -37,6 +37,8 @@ int main(int argc, char **argv) {
     CHECK(wire_describe(w, &info) == WIRE_OK);
     CHECK(info.context_window == xe_context_size(e));
     CHECK(strcmp(info.model, "gemma-4-26B-A4B-it-qat") == 0);
+    CHECK(info.kvstore == 1);
+    CHECK(wire_kvstore_open_status(w) == KVSTORE_OK);
 
     profile_tool tool = {
         "read",
@@ -201,6 +203,33 @@ int main(int argc, char **argv) {
     }
 
     wire_close(w);
+
+    /* 3.7 finding 2: a store that cannot open is reported, not hidden. */
+    {
+        char blocked[4096];
+        snprintf(blocked, sizeof blocked, "%s/file/kv", cache_dir);
+        char file_path[4096];
+        snprintf(file_path, sizeof file_path, "%s/file", cache_dir);
+        FILE *f = fopen(file_path, "w");
+        CHECK(f != NULL);
+        if (f) fclose(f);
+        wire *nokv = NULL;
+        CHECK(wire_open(&nokv, e, state_dir, blocked) == WIRE_OK);
+        if (nokv) {
+            wire_info info2;
+            CHECK(wire_describe(nokv, &info2) == WIRE_OK);
+            CHECK(info2.kvstore == 0);
+            CHECK(wire_kvstore_open_status(nokv) != KVSTORE_OK);
+            conversation_id cid;
+            wire_marker m;
+            CHECK(wire_session_create(nokv, "S", NULL, 0, &cid, &m) == WIRE_OK);
+            wire_checkpoint_report r;
+            CHECK(wire_checkpoint(nokv, &r) == WIRE_OK);
+            CHECK(r.saved == 0 && r.reason == WIRE_CKPT_NO_KVSTORE);
+            CHECK(strcmp(wire_ckpt_reason_name(r.reason), "no_kvstore") == 0);
+            wire_close(nokv);
+        }
+    }
     xe_engine_close(e);
 
     if (failures) {
