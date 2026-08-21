@@ -17,6 +17,17 @@ static int failures;
     } \
 } while (0)
 
+/* 3.7 finding 4: wire error texts carry no digits and no client strings;
+ * quantities travel as structured fields. */
+static int text_is_digit_free(const char *text) {
+    for (; *text; text++) if (*text >= '0' && *text <= '9') return 0;
+    return 1;
+}
+#define CHECK_FAIL(expr, expected) do { \
+    CHECK((expr) == (expected)); \
+    CHECK(text_is_digit_free(wire_error_text(w))); \
+} while (0)
+
 int main(int argc, char **argv) {
     if (argc < 2 || !argv[1][0]) {
         fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]);
@@ -78,13 +89,13 @@ int main(int argc, char **argv) {
     bad_result.kind = WIRE_MESSAGE_TOOL_RESULT;
     bad_result.call_id = 7;
     bad_result.text = "output";
-    CHECK(wire_append(w, &bad_result, NULL) == WIRE_INVALID_ARGUMENT);
+    CHECK_FAIL(wire_append(w, &bad_result, NULL), WIRE_INVALID_ARGUMENT);
 
     CHECK(wire_rewind(w, 1) == WIRE_OK);
     CHECK(wire_history_count(w) == 2);
     CHECK(wire_rewind(w, 0) == WIRE_OK);
     CHECK(wire_history_count(w) == 1);
-    CHECK(wire_rewind(w, 1) == WIRE_MARKER_UNAVAILABLE);
+    CHECK_FAIL(wire_rewind(w, 1), WIRE_MARKER_UNAVAILABLE);
     uint64_t cost = 0;
     CHECK(wire_rewind_cost(w, 0, &cost) == WIRE_OK);
     CHECK(cost > 0 && cost < 10000);
@@ -114,7 +125,7 @@ int main(int argc, char **argv) {
     CHECK(wire_rebuild(w, "You are a coding agent.", &tool, 1, messages, 4,
                        &marker) == WIRE_OK);
     CHECK(wire_history_count(w) == 5);
-    CHECK(wire_rewind(w, 3) == WIRE_MARKER_UNAVAILABLE);
+    CHECK_FAIL(wire_rewind(w, 3), WIRE_MARKER_UNAVAILABLE);
     CHECK(wire_pending_calls(w, NULL, 0) == 0);
     CHECK(wire_history_at(w, 2, &entry) == WIRE_OK);
     CHECK(entry.kind == WIRE_MESSAGE_ASSISTANT);
@@ -157,7 +168,7 @@ int main(int argc, char **argv) {
     CHECK(stat.token_count > 0);
     conversation_id missing;
     memset(&missing, 0x5a, sizeof missing);
-    CHECK(wire_session_stat(w, &missing, &stat) == WIRE_SESSION_NOT_FOUND);
+    CHECK_FAIL(wire_session_stat(w, &missing, &stat), WIRE_SESSION_NOT_FOUND);
 
     wire_open_report report;
     CHECK(wire_session_open(w, &first_id, &report) == WIRE_OK);
@@ -178,7 +189,7 @@ int main(int argc, char **argv) {
     CHECK(wire_session_open(w, &first_id, &report) == WIRE_OK);
     CHECK(wire_history_count(w) == before_close);
     CHECK(report.turn_open == 1);
-    CHECK(wire_rewind(w, 3) == WIRE_MARKER_UNAVAILABLE);
+    CHECK_FAIL(wire_rewind(w, 3), WIRE_MARKER_UNAVAILABLE);
     CHECK(wire_history_at(w, 1, &entry) == WIRE_OK);
     CHECK(entry.kind == WIRE_MESSAGE_USER &&
           entry.text_length == strlen("summary of history"));
@@ -194,11 +205,17 @@ int main(int argc, char **argv) {
             big_text[i] = "qwe rty uio zxc vbn "[i % 20];
         big_text[big] = '\0';
         oversized.text = big_text;
-        CHECK(wire_append(w, &oversized, NULL)
-              == WIRE_CONTEXT_LENGTH_EXCEEDED);
-        CHECK(strstr(wire_error_text(w),
-                     "tokens, but the configured context size is")
-              != NULL);
+        CHECK_FAIL(wire_append(w, &oversized, NULL),
+                   WIRE_CONTEXT_LENGTH_EXCEEDED);
+        CHECK(strcmp(wire_error_text(w),
+                     "prompt does not fit the context window") == 0);
+        uint64_t over_tokens = 0, over_context = 0;
+        CHECK(wire_error_detail(w, &over_tokens, &over_context) == 1);
+        CHECK(over_context == (uint64_t)xe_context_size(e));
+        CHECK(over_tokens + 1 >= over_context);
+        /* the detail belongs to that failure only */
+        CHECK_FAIL(wire_rewind(w, 999), WIRE_MARKER_UNAVAILABLE);
+        CHECK(wire_error_detail(w, NULL, NULL) == 0);
         free(big_text);
     }
 

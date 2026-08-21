@@ -114,6 +114,85 @@ static int client_eof(client *c, int timeout_ms) {
     return 0;
 }
 
+
+/* Large-frame helpers (3.7 finding 3): a growable reader for responses
+ * beyond the fixed client buffer. */
+static int client_recv_big(client *c, char **out, size_t *out_length,
+                           int timeout_ms) {
+    size_t cap = 1 << 20, length = 0;
+    char *buf = malloc(cap);
+    if (!buf) return 0;
+    if (c->length) {
+        memcpy(buf, c->buf, c->length);
+        length = c->length;
+        c->length = 0;
+    }
+    for (;;) {
+        char *nl = memchr(buf, '\n', length);
+        if (nl) {
+            size_t used = (size_t)(nl - buf) + 1;
+            *nl = '\0';
+            if (length > used) {
+                memcpy(c->buf, buf + used, length - used);
+                c->length = length - used;
+            }
+            *out = buf;
+            *out_length = used - 1;
+            return 1;
+        }
+        if (length == cap) {
+            cap *= 2;
+            char *grown = realloc(buf, cap);
+            if (!grown) { free(buf); return 0; }
+            buf = grown;
+        }
+        struct pollfd pfd = { c->fd, POLLIN, 0 };
+        if (poll(&pfd, 1, timeout_ms) <= 0) { free(buf); return 0; }
+        ssize_t n = read(c->fd, buf + length, cap - length);
+        if (n <= 0) { free(buf); return 0; }
+        length += (size_t)n;
+    }
+}
+
+static const char *italian_paragraph =
+    "Il problema \xc3\xa8 che la compaction, per costruzione, \xc3\xa8 a zero "
+    "prefill: il riassunto viene generato accodando alla sessione viva, quindi "
+    "la cache \xc3\xa8 gi\xc3\xa0 calcolata. Per\xc3\xb2 prima della compaction "
+    "la sessione pu\xc3\xb2 avvicinarsi alla finestra, ed \xc3\xa8 l\xc3\xac che "
+    "il limite per riga pu\xc3\xb2 mordere: una ricostruzione strutturale o una "
+    "riconciliazione dopo il riavvio devono trasportare l'intero trascritto in "
+    "una sola riga. Perci\xc3\xb2 misuriamo, non stimiamo: quanti byte costa "
+    "davvero un token di prosa italiana, e dove cade il confine.";
+
+/* Builds a rebuild request of `pairs` user/assistant turns, each side
+ * `reps` paragraphs long (127 tokens per paragraph on this tokenizer). */
+static char *build_rebuild(int pairs, int reps, size_t *length) {
+    size_t para = strlen(italian_paragraph);
+    size_t cap = 256 + (size_t)pairs * 2 * ((size_t)reps * (para + 1) + 64);
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    size_t n = 0;
+    n += (size_t)snprintf(out + n, cap - n,
+                          "{\"op\":\"rebuild\",\"system\":\"Sei un assistente.\","
+                          "\"messages\":[");
+    for (int i = 0; i < pairs; i++) {
+        for (int side = 0; side < 2; side++) {
+            n += (size_t)snprintf(out + n, cap - n, "%s{\"role\":\"%s\",\"text\":\"",
+                                  (i || side) ? "," : "",
+                                  side ? "assistant" : "user");
+            for (int r = 0; r < reps; r++) {
+                memcpy(out + n, italian_paragraph, para);
+                n += para;
+                out[n++] = ' ';
+            }
+            n += (size_t)snprintf(out + n, cap - n, "\"}");
+        }
+    }
+    n += (size_t)snprintf(out + n, cap - n, "]}\n");
+    *length = n;
+    return out;
+}
+
 static int client_call(client *c, const char *request, char *out,
                        size_t cap) {
     if (!client_send(c, request)) return 0;
@@ -377,7 +456,7 @@ int main(int argc, char **argv) {
     CHECK(strstr(line, "\"ok\":true") != NULL);
 
     CHECK(client_connect(&c, socket_path));
-    size_t big = 1400000;
+    size_t big = 4500000;   /* over the 4 MiB frame bound (262144 x 16) */
     char *chunk = malloc(65536);
     CHECK(chunk != NULL);
     if (chunk) {
@@ -452,6 +531,79 @@ int main(int argc, char **argv) {
     CHECK(strstr(line, "\"marker\":") != NULL);
     CHECK(client_eof(&w, 5000) == 1);
     client_close(&w);
+
+    /* 3.7 finding 3: frames are bounded by the context window, not by a
+     * fixed MiB. describe advertises the bound; a transcript near the
+     * window round-trips through rebuild and history in one line each. */
+    {
+        client big;
+        CHECK(client_connect(&big, socket_path));
+        CHECK(client_call(&big, "{\"op\":\"describe\"}\n", line, sizeof line));
+        CHECK(strstr(line, "\"max_frame\":4194304") != NULL);
+        CHECK(client_call(&big, "{\"op\":\"create\",\"system\":\"L\"}\n",
+                          line, sizeof line));
+        CHECK(strstr(line, "\"ok\":true") != NULL);
+        char session_l[64];
+        CHECK(session_of(line, session_l));
+
+        /* 120 pairs x 2 sides x 8 paragraphs x 127 tokens = ~244k tokens,
+         * ~1.0 MB of JSON: beyond the old 900 KB client guard, inside the
+         * 262144-token window. */
+        size_t request_length = 0;
+        char *request_big = build_rebuild(120, 8, &request_length);
+        CHECK(request_big != NULL);
+        CHECK(request_length > 1000000);
+        long long t0 = now_ms();
+        CHECK(client_send(&big, request_big));
+        free(request_big);
+        CHECK(client_recv(&big, line, sizeof line, 120000));
+        CHECK(strstr(line, "\"ok\":true") != NULL);
+        long long rebuild_ms = now_ms() - t0;
+        snprintf(request, sizeof request,
+                 "{\"op\":\"stat\",\"session\":\"%s\"}\n", session_l);
+        CHECK(client_call(&big, request, line, sizeof line));
+        const char *tok = strstr(line, "\"tokens\":");
+        long long tokens = tok ? atoll(tok + 9) : 0;
+        CHECK(tokens > 230000 && tokens <= 262144);
+
+        t0 = now_ms();
+        CHECK(client_send(&big, "{\"op\":\"history\"}\n"));
+        char *history = NULL;
+        size_t history_length = 0;
+        CHECK(client_recv_big(&big, &history, &history_length, 120000));
+        long long history_ms = now_ms() - t0;
+        if (history) {
+            CHECK(history_length > 1000000);
+            CHECK(strncmp(history, "{\"ok\":true", 10) == 0);
+            CHECK(strstr(history, "\"entries\":[") != NULL);
+            free(history);
+        }
+        printf("test_serve: long session %lld tokens, rebuild %zu bytes in %lld ms, "
+               "history %zu bytes in %lld ms\n",
+               tokens, request_length, rebuild_ms, history_length, history_ms);
+
+        /* Transport bound alone: a 1.5 MiB line within the token budget
+         * (byte-heavy, token-cheap filler) is accepted, not dropped. */
+        size_t filler = 1536 * 1024;
+        char *append = malloc(filler + 128);
+        CHECK(append != NULL);
+        if (append) {
+            size_t n = (size_t)snprintf(append, 128,
+                "{\"op\":\"append\",\"role\":\"user\",\"text\":\"");
+            for (size_t i = 0; i < filler; i++)
+                append[n + i] = (i % 32 == 0) ? 'x' : ' ';
+            n += filler;
+            n += (size_t)snprintf(append + n, 128, "\"}\n");
+            (void)n;
+            CHECK(client_call(&big, "{\"op\":\"create\",\"system\":\"F\"}\n",
+                              line, sizeof line));
+            CHECK(client_send(&big, append));
+            free(append);
+            CHECK(client_recv(&big, line, sizeof line, 120000));
+            CHECK(strstr(line, "\"ok\":true") != NULL);
+        }
+        client_close(&big);
+    }
 
     client_close(&a);
     client_close(&b);

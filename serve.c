@@ -22,8 +22,13 @@
 
 enum {
     SERVE_MAX_CONNECTIONS = 64,
-    SERVE_MAX_LINE = 1048576,
-    SERVE_MAX_OUTPUT = 1048576,
+    /* Frame cap per request line and per response, derived from the
+     * advertised context window: the worst transcript measured is ~4.2
+     * JSON bytes per token (Italian prose), 16 leaves headroom for
+     * multibyte text, double-escaped tool results and call arguments.
+     * Single-line frames are a deliberate limit of protocol 1; see
+     * NOTES "3.7 finding 3" for the bound and when chunking replaces it. */
+    SERVE_FRAME_BYTES_PER_TOKEN = 16,
     SERVE_READ_CHUNK = 4096,
     SERVE_BACKLOG = 64,
     SERVE_ACCEPT_RETRY_MS = 1000,
@@ -70,6 +75,7 @@ typedef struct {
     int stop;
     int accept_paused;
     int64_t idle_ms;
+    size_t max_frame;        /* context_window * SERVE_FRAME_BYTES_PER_TOKEN */
     int64_t active_at;
     json_writer out;
 } serve;
@@ -275,7 +281,7 @@ static void serve_flush(serve *s, serve_conn *c) {
 static void serve_push(serve *s, serve_conn *c, const void *data,
                        size_t length) {
     if (!c->active) return;
-    if (c->out_length + length > SERVE_MAX_OUTPUT) {
+    if (c->out_length + length > s->max_frame) {
         serve_drop(s, c);
         return;
     }
@@ -313,8 +319,18 @@ static void serve_ok_begin(serve *s) {
     json_raw(&s->out, "{\"ok\":true");
 }
 
-static void serve_error(serve *s, serve_conn *c, wire_status status,
-                        const char *text) {
+static void serve_error_detail(json_writer *out, wire_status status,
+                               uint64_t tokens, uint64_t context) {
+    if (status != WIRE_CONTEXT_LENGTH_EXCEEDED || !context) return;
+    json_raw(out, ",\"tokens\":");
+    json_u64(out, tokens);
+    json_raw(out, ",\"context\":");
+    json_u64(out, context);
+}
+
+static void serve_error_with(serve *s, serve_conn *c, wire_status status,
+                             const char *text, uint64_t tokens,
+                             uint64_t context) {
     json_writer *out = &s->out;
     json_writer_reset(out);
     json_raw(out, "{\"ok\":false,\"code\":");
@@ -322,13 +338,22 @@ static void serve_error(serve *s, serve_conn *c, wire_status status,
                 strlen(wire_status_code(status)));
     json_raw(out, ",\"error\":");
     json_string(out, text, strlen(text));
+    serve_error_detail(out, status, tokens, context);
     json_raw(out, "}");
     serve_emit(s, c);
 }
 
+static void serve_error(serve *s, serve_conn *c, wire_status status,
+                        const char *text) {
+    serve_error_with(s, c, status, text, 0, 0);
+}
+
 static void serve_wire_error(serve *s, serve_conn *c, wire_status status) {
     const char *text = wire_error_text(s->w);
-    serve_error(s, c, status, *text ? text : wire_status_code(status));
+    uint64_t tokens = 0, context = 0;
+    wire_error_detail(s->w, &tokens, &context);
+    serve_error_with(s, c, status, *text ? text : wire_status_code(status),
+                     tokens, context);
 }
 
 static const char *serve_stop_name(uint32_t stop) {
@@ -633,6 +658,8 @@ static void serve_emit_event(serve *s, serve_conn *c,
         json_raw(out, ",\"error\":");
         json_string(out, event->error_text ? event->error_text : "",
                     event->error_text ? strlen(event->error_text) : 0);
+        serve_error_detail(out, (wire_status)event->error,
+                           event->error_tokens, event->error_context);
         json_raw(out, "}");
         break;
     }
@@ -664,6 +691,8 @@ static int serve_dispatch(serve *s, serve_conn *c,
         json_i64(out, info.context_window);
         json_raw(out, ",\"max_output\":");
         json_i64(out, info.max_output);
+        json_raw(out, ",\"max_frame\":");
+        json_u64(out, (uint64_t)s->max_frame);
         json_raw(out, ",\"kvstore\":");
         json_raw(out, info.kvstore ? "true" : "false");
         json_raw(out, "}");
@@ -1264,7 +1293,7 @@ static void serve_input(serve *s, serve_conn *c) {
         serve_consume(c, length);
         serve_handle_request(s, c, request);
     }
-    if (c->active && c->in_length >= SERVE_MAX_LINE &&
+    if (c->active && c->in_length >= s->max_frame &&
         !memchr(c->in, '\n', c->in_length)) {
         serve_error(s, c, WIRE_INVALID_ARGUMENT, "request line is too long");
         serve_drop(s, c);
@@ -1293,22 +1322,22 @@ static void serve_read(serve *s, serve_conn *c) {
             c->in_capacity = capacity;
         }
         size_t room = c->in_capacity - c->in_length;
-        if (c->in_length <= SERVE_MAX_LINE &&
-            room > SERVE_MAX_LINE - c->in_length + 1)
-            room = SERVE_MAX_LINE - c->in_length + 1;
+        if (c->in_length <= s->max_frame &&
+            room > s->max_frame - c->in_length + 1)
+            room = s->max_frame - c->in_length + 1;
         if (!room) return;
         ssize_t n = read(c->in_fd, c->in + c->in_length, room);
         if (n > 0) {
             c->in_length += (size_t)n;
             c->head_checked = 0;
-            if (c->in_length >= SERVE_MAX_LINE &&
+            if (c->in_length >= s->max_frame &&
                 !memchr(c->in, '\n', c->in_length)) {
                 serve_error(s, c, WIRE_INVALID_ARGUMENT,
                             "request line is too long");
                 serve_drop(s, c);
                 return;
             }
-            if (c->in_length >= SERVE_MAX_LINE || !c->is_socket) return;
+            if (c->in_length >= s->max_frame || !c->is_socket) return;
             continue;
         }
         if (n == 0) {
@@ -1327,7 +1356,7 @@ static void serve_read(serve *s, serve_conn *c) {
 static int serve_can_read(const serve *s, const serve_conn *c) {
     if (c->eof) return 0;
     if (c->sequential && s->generating) return 0;
-    return c->in_length < SERVE_MAX_LINE;
+    return c->in_length < s->max_frame;
 }
 
 static void serve_reap(serve *s) {
@@ -1533,9 +1562,11 @@ static void serve_shutdown(serve *s) {
     }
 }
 
-static void serve_init(serve *s) {
+static void serve_init(serve *s, const xe_engine *engine) {
     memset(s, 0, sizeof *s);
     s->listen_fd = -1;
+    s->max_frame = (size_t)xe_context_size(engine) *
+                   SERVE_FRAME_BYTES_PER_TOKEN;
     s->gen_owner = -1;
     for (int i = 0; i < SERVE_MAX_CONNECTIONS; i++) {
         s->conns[i].in_fd = -1;
@@ -1552,7 +1583,7 @@ static int serve_stdin_interactive(void) {
 int serve_stdio(xe_engine *engine, const char *state_dir,
                 const char *cache_dir) {
     serve s;
-    serve_init(&s);
+    serve_init(&s, engine);
     wire_status status = wire_open(&s.w, engine, state_dir, cache_dir);
     if (status != WIRE_OK) {
         fprintf(stderr, "xenolith: wire: %s\n", wire_status_code(status));
@@ -1612,7 +1643,7 @@ static int serve_listen(serve *s, const char *path) {
 int serve_run(xe_engine *engine, const char *state_dir, const char *cache_dir,
               const char *socket_path, double idle_minutes) {
     serve s;
-    serve_init(&s);
+    serve_init(&s, engine);
     if (idle_minutes > 0.0) {
         double ms = idle_minutes * 60000.0;
         if (ms > 9.0e15) ms = 9.0e15;

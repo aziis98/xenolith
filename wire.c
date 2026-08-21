@@ -77,6 +77,8 @@ struct wire {
     int call_open;
 
     char error_text[512];
+    uint64_t error_tokens;    /* context_length_exceeded: prompt size */
+    uint64_t error_context;   /* context_length_exceeded: window */
     json_writer tools_scratch;
     json_writer calls_scratch;
 };
@@ -99,13 +101,29 @@ const char *wire_error_text(const wire *w) {
     return w && w->error_text[0] ? w->error_text : "";
 }
 
+/* Error texts are short phrases from a closed set: no digits, no
+ * client-supplied strings. Harnesses classify provider errors by regex on
+ * the text (pi matches bare "429"/"5xx" substrings as retryable), so a
+ * marker, call id or tool name inside the text can turn a deterministic
+ * error into a retried one. Quantities travel as structured fields
+ * (see wire_error_detail). test_wire enforces the rule on every failure
+ * it provokes. */
 static wire_status wire_fail(wire *w, wire_status status,
                              const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     vsnprintf(w->error_text, sizeof w->error_text, fmt, args);
     va_end(args);
+    w->error_tokens = 0;
+    w->error_context = 0;
     return status;
+}
+
+int wire_error_detail(const wire *w, uint64_t *tokens, uint64_t *context) {
+    if (!w || !w->error_context) return 0;
+    if (tokens) *tokens = w->error_tokens;
+    if (context) *context = w->error_context;
+    return 1;
 }
 
 static wire_status wire_from_conversation(wire *w, conversation_status s) {
@@ -330,10 +348,11 @@ static wire_status wire_tools_json(wire *w, const profile_tool *tools,
 
 static wire_status wire_budget_check(wire *w, uint64_t total) {
     if (total + 1 < (uint64_t)w->context) return WIRE_OK;
-    return wire_fail(w, WIRE_CONTEXT_LENGTH_EXCEEDED,
-                     "prompt has %llu tokens, but the configured context "
-                     "size is %d tokens",
-                     (unsigned long long)total, w->context);
+    wire_status status = wire_fail(w, WIRE_CONTEXT_LENGTH_EXCEEDED,
+                                   "prompt does not fit the context window");
+    w->error_tokens = total;
+    w->error_context = (uint64_t)w->context;
+    return status;
 }
 
 static wire_status wire_append_system_event(wire *w, conversation *c,
@@ -694,8 +713,7 @@ wire_status wire_append(wire *w, const wire_message *message,
         const char *name = wire_tool_name_of(c, message->call_id);
         if (!name)
             return wire_fail(w, WIRE_INVALID_ARGUMENT,
-                             "unknown tool call id %llu",
-                             (unsigned long long)message->call_id);
+                             "unknown tool call id");
         status = wire_from_profile(
             w, profile_render_tool_result(w->prof, name, message->text,
                                           &render));
@@ -1081,6 +1099,8 @@ static wire_status wire_gen_error(wire *w, wire_status status,
     out->kind = WIRE_EVENT_ERROR;
     out->error = status;
     out->error_text = w->error_text;
+    out->error_tokens = w->error_tokens;
+    out->error_context = w->error_context;
     return WIRE_OK;
 }
 
@@ -1318,8 +1338,7 @@ wire_status wire_rewind(wire *w, wire_marker marker) {
     uint64_t position;
     if (!conversation_visible_position(c, marker, &position))
         return wire_fail(w, WIRE_MARKER_UNAVAILABLE,
-                         "marker %llu is not addressable",
-                         (unsigned long long)marker);
+                         "marker is not addressable");
     if (position + 1 == conversation_visible_count(c)) return WIRE_OK;
     wire_status status = wire_from_conversation(
         w, conversation_append_rewind(c, marker));
@@ -1343,8 +1362,7 @@ wire_status wire_rewind_cost(wire *w, wire_marker marker,
     uint64_t position;
     if (!conversation_visible_position(c, marker, &position))
         return wire_fail(w, WIRE_MARKER_UNAVAILABLE,
-                         "marker %llu is not addressable",
-                         (unsigned long long)marker);
+                         "marker is not addressable");
     uint64_t boundary = conversation_visible_boundary(c, position);
     if (w->session && boundary) {
         uint64_t total;
@@ -1504,8 +1522,7 @@ wire_status wire_rebuild(wire *w, const char *system,
                 }
                 if (k == pending_count)
                     return wire_fail(w, WIRE_INVALID_ARGUMENT,
-                                     "no pending call for tool %s",
-                                     m->tool_name);
+                                     "no pending call for that tool");
             }
             if (!name)
                 return wire_fail(w, WIRE_INVALID_ARGUMENT,

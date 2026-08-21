@@ -135,6 +135,8 @@ typedef struct {
     wire_marker marker;
     uint32_t error;
     const char *error_text;
+    uint64_t error_tokens;     /* error: context_length_exceeded detail */
+    uint64_t error_context;
     int checkpoint_attempted;          /* done: autosave ran at end of turn */
     wire_checkpoint_report checkpoint;
     int resume_attempted;              /* done: a snapshot load was tried */
@@ -211,5 +213,8 @@ int wire_kvstore_open_status(const wire *w);
 
 const char *wire_status_code(wire_status status);
 const char *wire_error_text(const wire *w);
+/* Structured detail of the last context_length_exceeded failure; 0 when
+ * the last failure was something else. */
+int wire_error_detail(const wire *w, uint64_t *tokens, uint64_t *context);
 
 #endif
