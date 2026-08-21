@@ -220,6 +220,7 @@ struct xe_engine {
     void *map;
     size_t map_len;
     const void *data;
+    size_t header_len;   /* bytes before the tensor data section: metadata + tensor directory */
     uint32_t gguf_version;
     char *name;
 
@@ -3323,6 +3324,7 @@ static void xe_bind_tensors(xe_engine *e, xe_cur *c, const char *gguf_path) {
     if (data_off > e->map_len) xe_fatal("%s: data section start %llu beyond file size %zu", gguf_path, (unsigned long long)data_off, e->map_len);
     const uint8_t *data_base = (const uint8_t *)e->map + data_off;
     e->data = data_base;
+    e->header_len = (size_t)data_off;
 
     uint64_t avail = e->map_len - data_off;
     for (uint64_t i = 0; i < XE_TENSOR_COUNT; i++) {
@@ -3512,6 +3514,8 @@ static xe_engine *xe_open_common(const char *gguf_path, int vocab_only, xe_cur *
     return e;
 }
 
+static void xe_snapshot_fingerprints_init(xe_engine *e);
+
 xe_engine *xe_engine_open(const char *gguf_path) {
     xe_cur c;
     xe_engine *e = xe_open_common(gguf_path, 0, &c);
@@ -3520,6 +3524,7 @@ xe_engine *xe_engine_open(const char *gguf_path) {
     xe_constants_init(e);
     xe_gpu_init(e);
     xe_repack(e, gguf_path);
+    xe_snapshot_fingerprints_init(e);
     return e;
 }
 
@@ -4946,11 +4951,18 @@ static void xe_snapshot_fingerprints_init(xe_engine *e) {
     if (e->snapshot_fingerprint_ready) return;
     format_sha256 hash;
 
+    /* MODEL covers the GGUF header (every metadata key plus the full
+     * tensor directory: names, shapes, types, offsets) and the file size,
+     * never the tensor bytes. The v1 fingerprint hashed the whole 14 GB
+     * file, lazily, on the first checkpoint or resume (55 s). Same-shape
+     * requants and fine-tunes with identical metadata are deliberately
+     * not detected; see NOTES "3.7 finding 1". */
     format_sha256_init(&hash);
-    format_sha256_update(&hash, "xenolith-model-v1",
-                         sizeof("xenolith-model-v1") - 1);
+    format_sha256_update(&hash, "xenolith-model-v2",
+                         sizeof("xenolith-model-v2") - 1);
     xe_snapshot_hash_u64(&hash, e->map_len);
-    if (e->map_len) format_sha256_update(&hash, e->map, e->map_len);
+    xe_snapshot_hash_u64(&hash, e->header_len);
+    if (e->header_len) format_sha256_update(&hash, e->map, e->header_len);
     format_sha256_final(&hash, e->snapshot_fingerprint[XE_SNAPSHOT_FP_MODEL]);
 
     format_sha256_init(&hash);

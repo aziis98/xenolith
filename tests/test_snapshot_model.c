@@ -30,7 +30,22 @@ int main(int argc, char **argv) {
     uint64_t snapshot_size = 0;
     if (ok) ok &= xe_session_snapshot_size(session, &snapshot_size) ==
                   XE_SNAPSHOT_OK;
+    /* 3.7 finding 1: the first checkpoint of a fresh process must cost
+     * the same as the second (the MODEL fingerprint is no longer a lazy
+     * SHA-256 of the whole GGUF). */
+    struct timespec t0, t1, t2;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     if (ok) ok &= xe_session_snapshot_save(session, file) == XE_SNAPSHOT_OK;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    FILE *second = tmpfile();
+    ok &= second != NULL;
+    if (ok) ok &= xe_session_snapshot_save(session, second) == XE_SNAPSHOT_OK;
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    if (second) fclose(second);
+    double first_ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    double second_ms = (double)(t2.tv_sec - t1.tv_sec) * 1e3 + (double)(t2.tv_nsec - t1.tv_nsec) / 1e6;
+    printf("snapshot model: first save %.1f ms, second save %.1f ms\n", first_ms, second_ms);
+    ok &= first_ms < 1000.0;
 
     xe_sampler greedy = { 0.0f, 1, 1.0f, 1 };
     int32_t live_next = ok ? xe_session_next(session, &greedy) : -1;
