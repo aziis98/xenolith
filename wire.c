@@ -1405,10 +1405,10 @@ wire_status wire_rebuild(wire *w, const char *system,
         w, conversation_append_rewind(c, CONVERSATION_REWIND_ALL));
     if (status != WIRE_OK) return status;
     status = wire_from_conversation(w, conversation_append_cache_epoch(c));
-    if (status != WIRE_OK) return status;
+    if (status != WIRE_OK) goto abort;
     status = wire_append_system_event(w, c, system, tools, tool_count,
                                       NULL);
-    if (status != WIRE_OK) return status;
+    if (status != WIRE_OK) goto abort;
 
     uint32_t turn = PROFILE_TURN_PADDED;
     profile_render render;
@@ -1423,44 +1423,49 @@ wire_status wire_rebuild(wire *w, const char *system,
         blocks[0].length = m->text ? strlen(m->text) : 0;
         switch (m->kind) {
         case WIRE_MESSAGE_USER:
-            if (!m->text)
-                return wire_fail(w, WIRE_INVALID_ARGUMENT, "missing text");
+            if (!m->text) {
+                status = wire_fail(w, WIRE_INVALID_ARGUMENT,
+                                   "missing text");
+                goto abort;
+            }
             status = wire_from_profile(
                 w, profile_render_user(w->prof, m->text, turn, &render));
-            if (status != WIRE_OK) return status;
+            if (status != WIRE_OK) goto abort;
             status = wire_budget_check(w, tokens + render.token_count);
-            if (status != WIRE_OK) return status;
+            if (status != WIRE_OK) goto abort;
             status = wire_from_conversation(
                 w, conversation_append_message(c, CONVERSATION_ROLE_USER,
                                                blocks, 1, render.render,
                                                render.render_length,
                                                render.tokens,
                                                render.token_count));
-            if (status != WIRE_OK) return status;
+            if (status != WIRE_OK) goto abort;
             turn = PROFILE_TURN_PADDED;
             break;
         case WIRE_MESSAGE_ASSISTANT: {
             status = wire_from_profile(
                 w, profile_render_assistant(w->prof, m->text, m->calls,
                                             m->call_count, turn, &render));
-            if (status != WIRE_OK) return status;
+            if (status != WIRE_OK) goto abort;
             status = wire_budget_check(w, tokens + render.token_count);
-            if (status != WIRE_OK) return status;
+            if (status != WIRE_OK) goto abort;
             wire_calls_reset(w);
             for (size_t j = 0; j < m->call_count; j++) {
                 status = wire_call_register(w, m->calls[j].name);
-                if (status != WIRE_OK) return status;
+                if (status != WIRE_OK) goto abort;
                 w->calls[j].arguments = strdup(
                     m->calls[j].arguments_json
                     ? m->calls[j].arguments_json : "{}");
                 w->calls[j].complete = 1;
-                if (!w->calls[j].arguments)
-                    return wire_fail(w, WIRE_NOMEM, "out of memory");
+                if (!w->calls[j].arguments) {
+                    status = wire_fail(w, WIRE_NOMEM, "out of memory");
+                    goto abort;
+                }
             }
             w->call_open = -1;
             if (m->call_count) {
                 status = wire_calls_json(w);
-                if (status != WIRE_OK) return status;
+                if (status != WIRE_OK) goto abort;
                 blocks[1].format = CONVERSATION_BLOCK_JSON;
                 blocks[1].data = w->calls_scratch.data;
                 blocks[1].length = w->calls_scratch.length;
@@ -1471,7 +1476,7 @@ wire_status wire_rebuild(wire *w, const char *system,
                        c, CONVERSATION_ROLE_ASSISTANT, blocks, block_count,
                        render.render, render.render_length, render.tokens,
                        render.token_count));
-            if (status != WIRE_OK) return status;
+            if (status != WIRE_OK) goto abort;
             for (size_t j = 0; j < w->call_count; j++) {
                 conversation_tool_call call;
                 memset(&call, 0, sizeof call);
@@ -1489,23 +1494,30 @@ wire_status wire_rebuild(wire *w, const char *system,
                 format_sha256_final(&hasher, call.fingerprint);
                 status = wire_from_conversation(
                     w, conversation_append_tool_started(c, &call));
-                if (status != WIRE_OK) return status;
+                if (status != WIRE_OK) goto abort;
             }
             turn = m->call_count ? PROFILE_TURN_OPEN : PROFILE_TURN_BARE;
             break;
         }
         case WIRE_MESSAGE_TOOL_RESULT: {
-            if (turn != PROFILE_TURN_OPEN)
-                return wire_fail(w, WIRE_INVALID_ARGUMENT,
-                                 "no open model turn for a tool result");
-            if (!m->text)
-                return wire_fail(w, WIRE_INVALID_ARGUMENT, "missing text");
+            if (turn != PROFILE_TURN_OPEN) {
+                status = wire_fail(w, WIRE_INVALID_ARGUMENT,
+                                   "no open model turn for a tool result");
+                goto abort;
+            }
+            if (!m->text) {
+                status = wire_fail(w, WIRE_INVALID_ARGUMENT,
+                                   "missing text");
+                goto abort;
+            }
             uint64_t pending[64];
             size_t pending_count = conversation_unknown_tool_calls(
                 c, pending, sizeof pending / sizeof pending[0]);
-            if (!pending_count)
-                return wire_fail(w, WIRE_INVALID_ARGUMENT,
-                                 "no pending tool call");
+            if (!pending_count) {
+                status = wire_fail(w, WIRE_INVALID_ARGUMENT,
+                                   "no pending tool call");
+                goto abort;
+            }
             uint64_t call_id = pending[0];
             const char *name = wire_tool_name_of(c, call_id);
             if (m->tool_name) {
@@ -1520,19 +1532,23 @@ wire_status wire_rebuild(wire *w, const char *system,
                         break;
                     }
                 }
-                if (k == pending_count)
-                    return wire_fail(w, WIRE_INVALID_ARGUMENT,
-                                     "no pending call for that tool");
+                if (k == pending_count) {
+                    status = wire_fail(w, WIRE_INVALID_ARGUMENT,
+                                       "no pending call for that tool");
+                    goto abort;
+                }
             }
-            if (!name)
-                return wire_fail(w, WIRE_INVALID_ARGUMENT,
-                                 "unknown tool call");
+            if (!name) {
+                status = wire_fail(w, WIRE_INVALID_ARGUMENT,
+                                   "unknown tool call");
+                goto abort;
+            }
             status = wire_from_profile(
                 w, profile_render_tool_result(w->prof, name, m->text,
                                               &render));
-            if (status != WIRE_OK) return status;
+            if (status != WIRE_OK) goto abort;
             status = wire_budget_check(w, tokens + render.token_count);
-            if (status != WIRE_OK) return status;
+            if (status != WIRE_OK) goto abort;
             uint32_t tool_status = m->tool_status ? m->tool_status
                                                   : CONVERSATION_TOOL_OK;
             status = wire_from_conversation(
@@ -1540,21 +1556,30 @@ wire_status wire_rebuild(wire *w, const char *system,
                        c, call_id, tool_status, blocks, 1, render.render,
                        render.render_length, render.tokens,
                        render.token_count));
-            if (status != WIRE_OK) return status;
+            if (status != WIRE_OK) goto abort;
             break;
         }
         default:
-            return wire_fail(w, WIRE_INVALID_ARGUMENT,
-                             "unsupported message kind");
+            status = wire_fail(w, WIRE_INVALID_ARGUMENT,
+                               "unsupported message kind");
+            goto abort;
         }
     }
     status = wire_from_conversation(w, conversation_commit(c));
-    if (status != WIRE_OK) return status;
+    if (status != WIRE_OK) goto abort;
     w->saved_tokens = 0;
     w->saved_at = 0;
     wire_ckpt_reset(w);
     if (out) *out = conversation_event_count(c) - 1;
     return WIRE_OK;
+
+abort:
+    {
+        conversation_status rollback = conversation_rollback(c);
+        if (rollback != CONVERSATION_OK)
+            return wire_from_conversation(w, rollback);
+    }
+    return status;
 }
 
 wire_status wire_checkpoint(wire *w, wire_checkpoint_report *out) {

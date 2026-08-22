@@ -192,6 +192,7 @@ conversation_status conversation_append_cache_epoch(conversation *c);
 conversation_status conversation_append_rewind(conversation *c,
                                                uint64_t target_event);
 conversation_status conversation_commit(conversation *c);
+conversation_status conversation_rollback(conversation *c);
 
 const conversation_id *conversation_get_id(const conversation *c);
 int64_t conversation_created(const conversation *c);

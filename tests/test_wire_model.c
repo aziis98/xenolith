@@ -206,6 +206,33 @@ int main(int argc, char **argv) {
     CHECK(turn3.usage.input <= 2);
     CHECK(turn3.usage.cache_read > 0);
 
+    size_t too_big_length = 2400000;
+    char *too_big = malloc(too_big_length + 1);
+    CHECK(too_big != NULL);
+    if (too_big) {
+        for (size_t i = 0; i < too_big_length; i++)
+            too_big[i] = "qwe rty uio zxc vbn "[i % 20];
+        too_big[too_big_length] = '\0';
+        wire_message failed_rebuild[2];
+        memset(failed_rebuild, 0, sizeof failed_rebuild);
+        failed_rebuild[0].kind = WIRE_MESSAGE_USER;
+        failed_rebuild[0].text = "replacement prefix";
+        failed_rebuild[1].kind = WIRE_MESSAGE_USER;
+        failed_rebuild[1].text = too_big;
+        uint64_t history_before_rebuild = wire_history_count(w);
+        wire_open_report before_rebuild;
+        CHECK(wire_session_open(w, &id, &before_rebuild) == WIRE_OK);
+        CHECK(wire_rebuild(w, "A different system prompt.", &weather, 1,
+                           failed_rebuild, 2, NULL) ==
+              WIRE_CONTEXT_LENGTH_EXCEEDED);
+        wire_open_report after_rebuild;
+        CHECK(wire_session_open(w, &id, &after_rebuild) == WIRE_OK);
+        CHECK(after_rebuild.token_count == before_rebuild.token_count);
+        CHECK(after_rebuild.marker == before_rebuild.marker);
+        CHECK(wire_history_count(w) == history_before_rebuild);
+        free(too_big);
+    }
+
     /* 3.7 finding 2: a failed save is reported, never silent. */
     wire_checkpoint_report ckpt;
     store_fault_point = "snapshot-synced";

@@ -197,7 +197,7 @@ int main(int argc, char **argv) {
     wire_message oversized;
     memset(&oversized, 0, sizeof oversized);
     oversized.kind = WIRE_MESSAGE_USER;
-    size_t big = 1600000;
+    size_t big = 2400000;
     char *big_text = malloc(big + 1);
     CHECK(big_text != NULL);
     if (big_text) {
@@ -216,6 +216,36 @@ int main(int argc, char **argv) {
         /* the detail belongs to that failure only */
         CHECK_FAIL(wire_rewind(w, 999), WIRE_MARKER_UNAVAILABLE);
         CHECK(wire_error_detail(w, NULL, NULL) == 0);
+
+        wire_open_report before_rebuild;
+        CHECK(wire_session_open(w, &first_id, &before_rebuild) == WIRE_OK);
+        uint64_t history_before_rebuild = wire_history_count(w);
+        size_t pending_before_rebuild = wire_pending_calls(w, NULL, 0);
+        CHECK(wire_history_at(w, history_before_rebuild - 1, &entry) ==
+              WIRE_OK);
+        wire_marker last_marker = entry.marker;
+        uint32_t last_kind = entry.kind;
+        wire_message failed_rebuild[2];
+        memset(failed_rebuild, 0, sizeof failed_rebuild);
+        failed_rebuild[0].kind = WIRE_MESSAGE_USER;
+        failed_rebuild[0].text = "replacement prefix";
+        failed_rebuild[1] = oversized;
+        CHECK_FAIL(wire_rebuild(w, "A different system prompt.", &tool, 1,
+                                failed_rebuild, 2, NULL),
+                   WIRE_CONTEXT_LENGTH_EXCEEDED);
+        CHECK(wire_error_detail(w, &over_tokens, &over_context) == 1);
+        CHECK(over_context == (uint64_t)xe_context_size(e));
+        CHECK(over_tokens + 1 >= over_context);
+        wire_open_report after_rebuild;
+        CHECK(wire_session_open(w, &first_id, &after_rebuild) == WIRE_OK);
+        CHECK(after_rebuild.token_count == before_rebuild.token_count);
+        CHECK(after_rebuild.marker == before_rebuild.marker);
+        CHECK(after_rebuild.turn_open == before_rebuild.turn_open);
+        CHECK(wire_history_count(w) == history_before_rebuild);
+        CHECK(wire_pending_calls(w, NULL, 0) == pending_before_rebuild);
+        CHECK(wire_history_at(w, history_before_rebuild - 1, &entry) ==
+              WIRE_OK);
+        CHECK(entry.marker == last_marker && entry.kind == last_kind);
         free(big_text);
     }
 

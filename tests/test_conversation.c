@@ -656,6 +656,54 @@ static int test_autosave_policy(void) {
     return ok;
 }
 
+static int test_rollback(const char *root) {
+    conversation_store *store = NULL;
+    int ok = conversation_store_open(&store, root) == CONVERSATION_OK;
+    conversation *c = NULL;
+    conversation_id id;
+    ok &= conversation_create(store, &c, &id) == CONVERSATION_OK;
+    int32_t original[2] = { 5, 6 };
+    ok &= conversation_append_message(c, CONVERSATION_ROLE_USER, NULL, 0,
+                                      "a", 1, original, 2) ==
+          CONVERSATION_OK;
+    ok &= conversation_commit(c) == CONVERSATION_OK;
+    uint64_t events = conversation_event_count(c);
+    ok &= conversation_append_rewind(c, CONVERSATION_REWIND_ALL) ==
+          CONVERSATION_OK;
+    ok &= conversation_append_cache_epoch(c) == CONVERSATION_OK;
+    int32_t replacement[3] = { 9, 10, 11 };
+    ok &= conversation_append_message(c, CONVERSATION_ROLE_USER, NULL, 0,
+                                      "b", 1, replacement, 3) ==
+          CONVERSATION_OK;
+    uint64_t count = 0;
+    const int32_t *tokens = conversation_tokens(c, &count);
+    ok &= count == 3 && tokens[0] == 9 &&
+          conversation_epoch_current(c) == 1;
+    ok &= conversation_uncommitted(c) == 3;
+    ok &= conversation_rollback(c) == CONVERSATION_OK;
+    tokens = conversation_tokens(c, &count);
+    ok &= count == 2 && tokens[0] == 5 && tokens[1] == 6;
+    ok &= conversation_epoch_current(c) == 0;
+    ok &= conversation_event_count(c) == events;
+    ok &= conversation_visible_count(c) == 1;
+    ok &= conversation_uncommitted(c) == 0;
+    int32_t after[1] = { 7 };
+    ok &= conversation_append_message(c, CONVERSATION_ROLE_USER, NULL, 0,
+                                      "c", 1, after, 1) ==
+          CONVERSATION_OK;
+    ok &= conversation_commit(c) == CONVERSATION_OK;
+    conversation_close(c);
+    c = NULL;
+    ok &= conversation_open(store, &id, &c) == CONVERSATION_OK;
+    tokens = conversation_tokens(c, &count);
+    ok &= count == 3 && tokens[0] == 5 && tokens[1] == 6 && tokens[2] == 7;
+    conversation_close(c);
+    conversation_store_close(store);
+    printf("conversation: rollback to durable commit %s\n",
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static int test_unknown_events(const char *root, const char *copy_root) {
     conversation_store *store = NULL;
     int ok = conversation_store_open(&store, root) == CONVERSATION_OK;
@@ -749,8 +797,8 @@ static int test_unknown_events(const char *root, const char *copy_root) {
 int main(void) {
     char root[] = "/tmp/xenolith-conversation-XXXXXX";
     if (!mkdtemp(root)) return 1;
-    char sub[8][1024];
-    for (int i = 0; i < 8; i++)
+    char sub[9][1024];
+    for (int i = 0; i < 9; i++)
         snprintf(sub[i], sizeof sub[i], "%s/case%d", root, i);
     char copy_root[1024];
     snprintf(copy_root, sizeof copy_root, "%s/copies", root);
@@ -773,6 +821,7 @@ int main(void) {
     ok &= test_snapshot_epoch(sub[5]);
     ok &= test_list_delete(sub[6]);
     ok &= test_rejections(sub[7]);
+    ok &= test_rollback(sub[8]);
     ok &= test_state_dir();
     ok &= test_autosave_policy();
     char unknown_root[1024];

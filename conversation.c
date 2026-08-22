@@ -1272,6 +1272,20 @@ conversation_status conversation_open(conversation_store *store,
     return conversation_open_mode(store, id, out, 0, &resumable);
 }
 
+conversation_status conversation_rollback(conversation *c) {
+    if (!c || c->readonly) return CONVERSATION_INVALID_ARGUMENT;
+    if (ftruncate(c->fd, (off_t)c->valid_end) != 0 || fsync(c->fd) != 0) {
+        c->failed = 1;
+        return CONVERSATION_IO;
+    }
+    conversation_state_reset(c);
+    c->failed = 0;
+    int resumable = 0;
+    conversation_status status = conversation_load(c, &resumable);
+    if (status != CONVERSATION_OK) c->failed = 1;
+    return status;
+}
+
 conversation_status conversation_delete(conversation_store *store,
                                         const conversation_id *id) {
     if (!store || !id) return CONVERSATION_INVALID_ARGUMENT;
