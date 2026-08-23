@@ -707,8 +707,12 @@ __kernel void xe_prefill_attn_online_b8_global_shared(
                                         int query_offset,
                                         int window) {
     __local half lk[8 * 512];
+    __local float lalpha[8];
+    __local float lbeta[8 * 8];
+    __local float ldenominator[8];
     int lid = get_local_id(0);
     int subgroup = get_sub_group_id();
+    int lane = get_sub_group_local_id();
     int query_kv = get_group_id(0);
     int query = query_kv % m_count;
     int kv_head = query_kv / m_count;
@@ -774,36 +778,55 @@ __kernel void xe_prefill_attn_online_b8_global_shared(
             block_denominator += beta[local_key];
         }
         denominator = denominator * alpha + block_denominator;
-        acc0 *= alpha;
-        acc1 *= alpha;
-        acc2 *= alpha;
-        acc3 *= alpha;
+        if (lane == 0) {
+            lalpha[subgroup] = alpha;
+            ldenominator[subgroup] = denominator;
+            for (int local_key = 0; local_key < keys; local_key++)
+                lbeta[local_key * 8 + subgroup] = beta[local_key];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float8 shared_alpha = vload8(0, lalpha);
+        acc0 *= shared_alpha;
+        acc1 *= shared_alpha;
+        acc2 *= shared_alpha;
+        acc3 *= shared_alpha;
         for (int local_key = 0; local_key < keys; local_key++) {
             __global const ushort *source = (__global const ushort *)(
-                v + ((size_t)kv_head * n_count + key0 + local_key) * 512);
-            float weight = beta[local_key];
-            acc0 += weight * convert_float8(as_half8(
-                intel_sub_group_block_read_us8(source)));
-            acc1 += weight * convert_float8(as_half8(
-                intel_sub_group_block_read_us8(source + 128)));
-            acc2 += weight * convert_float8(as_half8(
-                intel_sub_group_block_read_us8(source + 256)));
-            acc3 += weight * convert_float8(as_half8(
-                intel_sub_group_block_read_us8(source + 384)));
+                v + ((size_t)kv_head * n_count + key0 + local_key) * 512
+                  + subgroup * 64);
+            float8 weight = vload8(0, lbeta + local_key * 8);
+            float4 value = convert_float4(as_half4(
+                intel_sub_group_block_read_us4(source)));
+            acc0 += weight * value.s0;
+            acc1 += weight * value.s1;
+            acc2 += weight * value.s2;
+            acc3 += weight * value.s3;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         maximum = next_maximum;
     }
-    __global uint *target = (__global uint *)(
-        out + ((size_t)head * m_count + query) * 512);
-    intel_sub_group_block_write8(target,
-                                 as_uint8(acc0 / denominator));
-    intel_sub_group_block_write8(target + 128,
-                                 as_uint8(acc1 / denominator));
-    intel_sub_group_block_write8(target + 256,
-                                 as_uint8(acc2 / denominator));
-    intel_sub_group_block_write8(target + 384,
-                                 as_uint8(acc3 / denominator));
+    float8 shared_denominator = vload8(0, ldenominator);
+    acc0 /= shared_denominator;
+    acc1 /= shared_denominator;
+    acc2 /= shared_denominator;
+    acc3 /= shared_denominator;
+#define XE_PREFILL_GLOBAL_WRITE(local_head, component) do {                   \
+        __global uint *target = (__global uint *)(                            \
+            out + ((size_t)(kv_head * 8 + local_head) * m_count + query)      \
+                      * 512 + subgroup * 64);                                 \
+        intel_sub_group_block_write4(                                         \
+            target, as_uint4((float4)(acc0.component, acc1.component,         \
+                                      acc2.component, acc3.component)));      \
+    } while (0)
+    XE_PREFILL_GLOBAL_WRITE(0, s0);
+    XE_PREFILL_GLOBAL_WRITE(1, s1);
+    XE_PREFILL_GLOBAL_WRITE(2, s2);
+    XE_PREFILL_GLOBAL_WRITE(3, s3);
+    XE_PREFILL_GLOBAL_WRITE(4, s4);
+    XE_PREFILL_GLOBAL_WRITE(5, s5);
+    XE_PREFILL_GLOBAL_WRITE(6, s6);
+    XE_PREFILL_GLOBAL_WRITE(7, s7);
+#undef XE_PREFILL_GLOBAL_WRITE
 }
 
 static inline float xe_prefill_attn_swa_block_score(
