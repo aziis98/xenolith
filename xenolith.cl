@@ -701,11 +701,11 @@ __kernel void xe_prefill_attn_online_b8_global_shared(
                                         __global float *out,
                                         int m_count,
                                         int n_count,
-                                        int dimension,
+                                        int query_count,
                                         int heads,
                                         int kv_heads,
                                         int query_offset,
-                                        int window) {
+                                        int query_base) {
     __local half lk[8 * 512];
     __local float lalpha[8];
     __local float lbeta[8 * 8];
@@ -714,8 +714,8 @@ __kernel void xe_prefill_attn_online_b8_global_shared(
     int subgroup = get_sub_group_id();
     int lane = get_sub_group_local_id();
     int query_kv = get_group_id(0);
-    int query = query_kv % m_count;
-    int kv_head = query_kv / m_count;
+    int query = query_base + query_kv % query_count;
+    int kv_head = query_kv / query_count;
     if (kv_head >= kv_heads) return;
     int head = kv_head * heads / kv_heads + subgroup;
     int position = query_offset + query;

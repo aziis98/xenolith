@@ -424,7 +424,6 @@ static void xe_gpu_init(xe_engine *e) {
     xe_ze_check("zeCommandListCreateImmediate",
                 zeCommandListCreateImmediate(e->gpu.context, e->gpu.device,
                                              &queue_desc, &e->gpu.commands));
-
     size_t spv_size = (size_t)(_binary_xenolith_gpu_spv_end -
                                _binary_xenolith_gpu_spv_start);
     ze_module_desc_t module_desc = {
@@ -854,12 +853,33 @@ static void __attribute__((unused)) xe_prefill_attention_online_append(
     xe_gpu_int_arg(kernel, 8, kv_heads);
     xe_gpu_int_arg(kernel, 9, query_offset);
     xe_gpu_int_arg(kernel, 10, window);
-    ze_group_count_t groups = {
-        (uint32_t)(((size_t)XE_Q_HEADS * rows + 7) / 8), 1, 1
-    };
-    xe_ze_check("zeCommandListAppendLaunchKernel prefill attention online",
-                zeCommandListAppendLaunchKernel(e->gpu.commands, kernel,
-                                                &groups, NULL, 0, NULL));
+    if (dimension == 256) {
+        ze_group_count_t groups = {
+            (uint32_t)(((size_t)XE_Q_HEADS * rows + 7) / 8), 1, 1
+        };
+        xe_ze_check("zeCommandListAppendLaunchKernel prefill attention online",
+                    zeCommandListAppendLaunchKernel(e->gpu.commands, kernel,
+                                                    &groups, NULL, 0, NULL));
+    } else {
+        int slice_rows = query_offset >= 8192 ? 256 : rows;
+        for (int query_base = 0; query_base < rows;
+             query_base += slice_rows) {
+            int query_count = rows - query_base;
+            if (query_count > slice_rows) query_count = slice_rows;
+            xe_gpu_int_arg(kernel, 6, query_count);
+            xe_gpu_int_arg(kernel, 10, query_base);
+            ze_group_count_t groups = {
+                (uint32_t)(kv_heads * query_count), 1, 1
+            };
+            xe_ze_check("zeCommandListAppendLaunchKernel prefill attention online",
+                        zeCommandListAppendLaunchKernel(e->gpu.commands, kernel,
+                                                        &groups, NULL, 0, NULL));
+            if (slice_rows < rows)
+                xe_ze_check("zeCommandListHostSynchronize prefill attention slice",
+                            zeCommandListHostSynchronize(e->gpu.commands,
+                                                         UINT64_MAX));
+        }
+    }
 }
 
 static void __attribute__((unused)) xe_prefill_heads_q8_append(
