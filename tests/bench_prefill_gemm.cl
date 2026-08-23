@@ -3644,6 +3644,204 @@ __kernel void prefill_attn_online_b8(__global const float *q,
 }
 
 __attribute__((intel_reqd_sub_group_size(16)))
+__kernel void prefill_attn_global_shared_k(__global const float *q,
+                                           __global const half *k,
+                                           __global const half *v,
+                                           __global float *out,
+                                           int m_count,
+                                           int n_count,
+                                           int dimension,
+                                           int heads,
+                                           int kv_heads,
+                                           int query_offset,
+                                           int window) {
+    __local half lk[8 * 512];
+    int lid = get_local_id(0);
+    int subgroup = get_sub_group_id();
+    int lane = get_sub_group_local_id();
+    int query_head0 = get_group_id(0) * 8;
+    int head = query_head0 / m_count;
+    if (head >= heads) return;
+    int query0 = query_head0 - head * m_count;
+    int query = query0 + subgroup;
+    int kv_head = head * kv_heads / heads;
+    int position = query_offset + query;
+    int maximum_position = min(n_count - 1, query_offset + query0 + 7);
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    float8 acc0 = (float8)(0.0f);
+    float8 acc1 = (float8)(0.0f);
+    float8 acc2 = (float8)(0.0f);
+    float8 acc3 = (float8)(0.0f);
+    for (int key0 = 0; key0 <= maximum_position; key0 += 8) {
+        __global const uint4 *source = (__global const uint4 *)(
+            k + ((size_t)kv_head * n_count + key0) * 512);
+        __local uint4 *target = (__local uint4 *)lk;
+        for (int x = lid; x < 512; x += 128) target[x] = source[x];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        int keys = clamp(position - key0 + 1, 0, 8);
+        float score[8];
+        float block_maximum = -INFINITY;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            float value = 0.0f;
+            for (int d = lane; d < 512; d += 16)
+                value += q[((size_t)head * m_count + query) * 512 + d]
+                         * (float)lk[local_key * 512 + d];
+            score[local_key] = sub_group_reduce_add(value);
+            block_maximum = fmax(block_maximum, score[local_key]);
+        }
+        float next_maximum = fmax(maximum, block_maximum);
+        float alpha = maximum == -INFINITY ? 0.0f
+                      : exp(maximum - next_maximum);
+        float beta[8];
+        float block_denominator = 0.0f;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            beta[local_key] = exp(score[local_key] - next_maximum);
+            block_denominator += beta[local_key];
+        }
+        denominator = denominator * alpha + block_denominator;
+        acc0 *= alpha;
+        acc1 *= alpha;
+        acc2 *= alpha;
+        acc3 *= alpha;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            __global const ushort *source = (__global const ushort *)(
+                v + ((size_t)kv_head * n_count + key0 + local_key) * 512);
+            float weight = beta[local_key];
+            acc0 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source)));
+            acc1 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source + 128)));
+            acc2 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source + 256)));
+            acc3 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source + 384)));
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        maximum = next_maximum;
+    }
+    __global uint *target = (__global uint *)(
+        out + ((size_t)head * m_count + query) * 512);
+    intel_sub_group_block_write8(target, as_uint8(acc0 / denominator));
+    intel_sub_group_block_write8(target + 128, as_uint8(acc1 / denominator));
+    intel_sub_group_block_write8(target + 256, as_uint8(acc2 / denominator));
+    intel_sub_group_block_write8(target + 384, as_uint8(acc3 / denominator));
+    (void)dimension;
+    (void)window;
+}
+
+static inline float prefill_attn_float8_accumulate(float value,
+                                                   float8 a, float8 b) {
+    value += a.s0 * b.s0;
+    value += a.s1 * b.s1;
+    value += a.s2 * b.s2;
+    value += a.s3 * b.s3;
+    value += a.s4 * b.s4;
+    value += a.s5 * b.s5;
+    value += a.s6 * b.s6;
+    value += a.s7 * b.s7;
+    return value;
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void prefill_attn_global_h8q1_stream(
+        __global const float *q, __global const half *k,
+        __global const half *v, __global float *out, int m_count,
+        int n_count, int dimension, int heads, int kv_heads,
+        int query_offset, int window) {
+    __local half lk[8 * 512];
+    int lid = get_local_id(0);
+    int subgroup = get_sub_group_id();
+    int query_kv = get_group_id(0);
+    int query = query_kv % m_count;
+    int kv_head = query_kv / m_count;
+    int head = kv_head * heads / kv_heads + subgroup;
+    int position = query_offset + query;
+    __global const uint *q_source = (__global const uint *)(
+        q + ((size_t)head * m_count + query) * 512);
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    float8 acc0 = (float8)(0.0f);
+    float8 acc1 = (float8)(0.0f);
+    float8 acc2 = (float8)(0.0f);
+    float8 acc3 = (float8)(0.0f);
+    for (int key0 = 0; key0 <= position; key0 += 8) {
+        __global const uint4 *source = (__global const uint4 *)(
+            k + ((size_t)kv_head * n_count + key0) * 512);
+        __local uint4 *target = (__local uint4 *)lk;
+        for (int x = lid; x < 512; x += 128) target[x] = source[x];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        int keys = min(8, position - key0 + 1);
+        float score[8];
+        float block_maximum = -INFINITY;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            __local const ushort *source_k = (__local const ushort *)(
+                lk + local_key * 512);
+            float value = 0.0f;
+            float8 q_value = as_float8(
+                intel_sub_group_block_read8(q_source));
+            float8 k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k)));
+            value = prefill_attn_float8_accumulate(value, q_value, k_value);
+            q_value = as_float8(
+                intel_sub_group_block_read8(q_source + 128));
+            k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k + 128)));
+            value = prefill_attn_float8_accumulate(value, q_value, k_value);
+            q_value = as_float8(
+                intel_sub_group_block_read8(q_source + 256));
+            k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k + 256)));
+            value = prefill_attn_float8_accumulate(value, q_value, k_value);
+            q_value = as_float8(
+                intel_sub_group_block_read8(q_source + 384));
+            k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k + 384)));
+            value = prefill_attn_float8_accumulate(value, q_value, k_value);
+            score[local_key] = sub_group_reduce_add(value);
+            block_maximum = fmax(block_maximum, score[local_key]);
+        }
+        float next_maximum = fmax(maximum, block_maximum);
+        float alpha = maximum == -INFINITY ? 0.0f
+                      : exp(maximum - next_maximum);
+        float beta[8];
+        float block_denominator = 0.0f;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            beta[local_key] = exp(score[local_key] - next_maximum);
+            block_denominator += beta[local_key];
+        }
+        denominator = denominator * alpha + block_denominator;
+        acc0 *= alpha;
+        acc1 *= alpha;
+        acc2 *= alpha;
+        acc3 *= alpha;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            __global const ushort *source_v = (__global const ushort *)(
+                v + ((size_t)kv_head * n_count + key0 + local_key) * 512);
+            float weight = beta[local_key];
+            acc0 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_v)));
+            acc1 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_v + 128)));
+            acc2 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_v + 256)));
+            acc3 += weight * convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_v + 384)));
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        maximum = next_maximum;
+    }
+    __global uint *target = (__global uint *)(
+        out + ((size_t)head * m_count + query) * 512);
+    intel_sub_group_block_write8(target, as_uint8(acc0 / denominator));
+    intel_sub_group_block_write8(target + 128, as_uint8(acc1 / denominator));
+    intel_sub_group_block_write8(target + 256, as_uint8(acc2 / denominator));
+    intel_sub_group_block_write8(target + 384, as_uint8(acc3 / denominator));
+    (void)dimension;
+    (void)window;
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
 __kernel void prefill_attn_online_b8_stage(__global const float *q,
                                           __global const half *k,
                                           __global const half *v,

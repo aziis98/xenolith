@@ -82,6 +82,8 @@ typedef struct {
     ze_kernel_handle_t attn_online;
     ze_kernel_handle_t attn_online_b4;
     ze_kernel_handle_t attn_online_b8;
+    ze_kernel_handle_t attn_global_shared_k;
+    ze_kernel_handle_t attn_global_h8q1_stream;
     ze_kernel_handle_t attn_online_b8_ring;
     ze_kernel_handle_t swa_stage;
     ze_kernel_handle_t swa_commit;
@@ -269,6 +271,14 @@ typedef struct {
     float *online_b8_ring;
     float *gqa8;
 } bench_attention_data;
+
+typedef struct {
+    float *q;
+    _Float16 *k;
+    _Float16 *v;
+    float *shared_k;
+    float *shared_kv;
+} bench_global_attention_data;
 
 typedef struct {
     uint8_t *weight;
@@ -685,6 +695,10 @@ static void bench_gpu_init(bench_gpu *gpu, const char *spv_path) {
     gpu->attn_online = bench_kernel_create(gpu, "prefill_attn_online");
     gpu->attn_online_b4 = bench_kernel_create(gpu, "prefill_attn_online_b4");
     gpu->attn_online_b8 = bench_kernel_create(gpu, "prefill_attn_online_b8");
+    gpu->attn_global_shared_k =
+        bench_kernel_create(gpu, "prefill_attn_global_shared_k");
+    gpu->attn_global_h8q1_stream =
+        bench_kernel_create(gpu, "prefill_attn_global_h8q1_stream");
     gpu->attn_online_b8_ring =
         bench_kernel_create(gpu, "prefill_attn_online_b8_stage");
     gpu->swa_stage = bench_kernel_create_size(gpu, "prefill_swa_stage", 256);
@@ -4227,6 +4241,221 @@ static void bench_attention_shape_run(bench_gpu *gpu,
     bench_attention_data_destroy(gpu, &data);
 }
 
+static void bench_global_attention_set_args(
+        bench_gpu *gpu, const bench_global_attention_data *data,
+        const bench_attention_shape *shape) {
+    ze_kernel_handle_t kernels[2] = {
+        gpu->attn_global_shared_k, gpu->attn_global_h8q1_stream
+    };
+    for (int variant = 0; variant < 2; variant++) {
+        bench_pointer_arg(kernels[variant], 0, data->q);
+        bench_pointer_arg(kernels[variant], 1, data->k);
+        bench_pointer_arg(kernels[variant], 2, data->v);
+        bench_pointer_arg(kernels[variant], 3,
+                          variant == 0 ? data->shared_k : data->shared_kv);
+        bench_int_arg(kernels[variant], 4, shape->m);
+        bench_int_arg(kernels[variant], 5, shape->n);
+        bench_int_arg(kernels[variant], 6, shape->dimension);
+        bench_int_arg(kernels[variant], 7, shape->heads);
+        bench_int_arg(kernels[variant], 8, shape->kv_heads);
+        bench_int_arg(kernels[variant], 9, shape->query_offset);
+        bench_int_arg(kernels[variant], 10, shape->window);
+    }
+}
+
+static void bench_global_attention_data_init(
+        bench_gpu *gpu, bench_global_attention_data *data,
+        const bench_attention_shape *shape) {
+    size_t q_elements = (size_t)shape->heads * shape->m * shape->dimension;
+    size_t kv_elements = (size_t)shape->kv_heads * shape->n * shape->dimension;
+    data->q = bench_gpu_alloc(gpu, q_elements * sizeof(*data->q));
+    data->k = bench_gpu_alloc(gpu, kv_elements * sizeof(*data->k));
+    data->v = bench_gpu_alloc(gpu, kv_elements * sizeof(*data->v));
+    data->shared_k = bench_gpu_alloc(
+        gpu, q_elements * sizeof(*data->shared_k));
+    data->shared_kv = bench_gpu_alloc(
+        gpu, q_elements * sizeof(*data->shared_kv));
+    uint32_t random = UINT32_C(0x243f6a88) ^ (uint32_t)shape->m
+                      ^ ((uint32_t)shape->n << 9);
+    for (size_t i = 0; i < q_elements; i++) {
+        int value = (int)(bench_random(&random) % 2001) - 1000;
+        data->q[i] = (float)value / 20000.0f;
+    }
+    for (size_t i = 0; i < kv_elements; i++) {
+        int key = (int)(bench_random(&random) % 2001) - 1000;
+        int value = (int)(bench_random(&random) % 2001) - 1000;
+        data->k[i] = (_Float16)((float)key / 20000.0f);
+        data->v[i] = (_Float16)((float)value / 1000.0f);
+    }
+    bench_global_attention_set_args(gpu, data, shape);
+}
+
+static void bench_global_attention_data_destroy(
+        bench_gpu *gpu, bench_global_attention_data *data) {
+    bench_ze_check("zeMemFree global attention shared kv",
+                   zeMemFree(gpu->context, data->shared_kv));
+    bench_ze_check("zeMemFree global attention shared k",
+                   zeMemFree(gpu->context, data->shared_k));
+    bench_ze_check("zeMemFree global attention v",
+                   zeMemFree(gpu->context, data->v));
+    bench_ze_check("zeMemFree global attention k",
+                   zeMemFree(gpu->context, data->k));
+    bench_ze_check("zeMemFree global attention q",
+                   zeMemFree(gpu->context, data->q));
+}
+
+static double bench_global_attention_launch(
+        bench_gpu *gpu, int variant, const bench_attention_shape *shape,
+        int repetitions) {
+    ze_kernel_handle_t kernels[2] = {
+        gpu->attn_global_shared_k, gpu->attn_global_h8q1_stream
+    };
+    ze_group_count_t groups = {
+        (uint32_t)((size_t)shape->heads * shape->m / 8), 1, 1
+    };
+    double start = bench_now();
+    for (int repetition = 0; repetition < repetitions; repetition++)
+        bench_ze_check("zeCommandListAppendLaunchKernel global attention",
+                       zeCommandListAppendLaunchKernel(
+                           gpu->commands, kernels[variant], &groups,
+                           NULL, 0, NULL));
+    bench_ze_check("zeCommandListHostSynchronize global attention",
+                   zeCommandListHostSynchronize(gpu->commands, UINT64_MAX));
+    return bench_now() - start;
+}
+
+static bench_sample bench_global_attention_measure(
+        bench_gpu *gpu, int variant, const bench_attention_shape *shape,
+        int repetitions) {
+    bench_telemetry telemetry;
+    bench_telemetry_start(&telemetry);
+    double seconds = bench_global_attention_launch(
+        gpu, variant, shape, repetitions);
+    bench_telemetry_stop(&telemetry);
+    return (bench_sample) {
+        .seconds = seconds / repetitions,
+        .actual_mhz = (double)telemetry.actual_sum / telemetry.samples,
+        .requested_mhz = (double)telemetry.requested_sum / telemetry.samples,
+        .actual_min = telemetry.actual_min,
+        .actual_max = telemetry.actual_max,
+        .pl1 = telemetry.pl1,
+        .pl2 = telemetry.pl2,
+        .thermal = telemetry.thermal
+    };
+}
+
+static double bench_global_attention_verify(
+        const bench_global_attention_data *data,
+        const bench_attention_shape *shape, double *max_abs) {
+    size_t elements = (size_t)shape->heads * shape->m * shape->dimension;
+    double error = 0.0;
+    double reference = 0.0;
+    *max_abs = 0.0;
+    for (size_t i = 0; i < elements; i++) {
+        double difference = (double)data->shared_kv[i] - data->shared_k[i];
+        error += difference * difference;
+        reference += (double)data->shared_k[i] * data->shared_k[i];
+        if (fabs(difference) > *max_abs) *max_abs = fabs(difference);
+    }
+    return sqrt(error / (reference + 1e-30));
+}
+
+static void bench_global_attention_shape_run(
+        bench_gpu *gpu, const bench_attention_shape *shape,
+        int rounds, double target_seconds) {
+    static const char *names[2] = {
+        "h1q8", "h8q1-stream"
+    };
+    bench_global_attention_data data = {0};
+    bench_global_attention_data_init(gpu, &data, shape);
+    bench_global_attention_launch(gpu, 0, shape, 1);
+    double rel_rms[2] = {0.0};
+    double max_abs[2] = {0.0};
+    for (int variant = 1; variant < 2; variant++) {
+        bench_global_attention_launch(gpu, variant, shape, 1);
+        rel_rms[variant] = bench_global_attention_verify(
+            &data, shape, &max_abs[variant]);
+    }
+    double probe = bench_global_attention_launch(gpu, 0, shape, 1);
+    int repetitions = (int)ceil(target_seconds / probe);
+    if (repetitions < 1) repetitions = 1;
+    bench_sample samples[2][BENCH_ROUNDS_MAX];
+    double times[2][BENCH_ROUNDS_MAX];
+    double frequencies[2][BENCH_ROUNDS_MAX];
+    printf("prefill-global-attention: shape %s M %d N %d offset %d repetitions %d\n",
+           shape->name, shape->m, shape->n, shape->query_offset, repetitions);
+    for (int variant = 1; variant < 2; variant++)
+        printf("prefill-global-attention: correctness %s rel-rms %.9g max-abs %.9g\n",
+               names[variant], rel_rms[variant], max_abs[variant]);
+    for (int round = 0; round < rounds; round++) {
+        for (int position = 0; position < 2; position++) {
+            int variant = (round + position) % 2;
+            samples[variant][round] = bench_global_attention_measure(
+                gpu, variant, shape, repetitions);
+            times[variant][round] = samples[variant][round].seconds;
+            frequencies[variant][round] = samples[variant][round].actual_mhz;
+        }
+        printf("prefill-global-attention: round %d", round + 1);
+        for (int variant = 0; variant < 2; variant++) {
+            bench_sample *sample = &samples[variant][round];
+            printf(" %s %.6f ms@%.0fMHz[%ld,%ld] throttle=%ld/%ld/%ld",
+                   names[variant], sample->seconds * 1e3,
+                   sample->actual_mhz, sample->actual_min,
+                   sample->actual_max, sample->pl1, sample->pl2,
+                   sample->thermal);
+        }
+        printf("\n");
+    }
+    double medians[2];
+    double median_frequencies[2];
+    double frequency_min = INFINITY;
+    double frequency_max = 0.0;
+    int best = 0;
+    for (int variant = 0; variant < 2; variant++) {
+        medians[variant] = bench_median(times[variant], rounds);
+        median_frequencies[variant] = bench_median(
+            frequencies[variant], rounds);
+        frequency_min = fmin(frequency_min, median_frequencies[variant]);
+        frequency_max = fmax(frequency_max, median_frequencies[variant]);
+        if (isfinite(rel_rms[variant]) && rel_rms[variant] <= 2e-5
+            && medians[variant] < medians[best])
+            best = variant;
+    }
+    double frequency_span = frequency_max / frequency_min;
+    for (int variant = 0; variant < 2; variant++)
+        printf("prefill-global-attention: median %s %.6f ms @%.0fMHz speedup %.6fx\n",
+               names[variant], medians[variant] * 1e3,
+               median_frequencies[variant], medians[0] / medians[variant]);
+    const char *decision = best && frequency_span <= 1.05
+                           && medians[best] <= medians[0] * 0.97
+                           ? names[best] : "reject";
+    printf("prefill-global-attention: frequency-span %.6fx decision %s\n",
+           frequency_span, decision);
+    bench_global_attention_data_destroy(gpu, &data);
+}
+
+static void bench_global_attention_run(bench_gpu *gpu,
+                                       const char *selected_shape,
+                                       int rounds, double target_seconds) {
+    const bench_attention_shape shapes[] = {
+        { "global512", 512, 512, 512, 16, 2, 0, 0 },
+        { "global1024", 512, 1024, 512, 16, 2, 512, 0 },
+        { "global4096", 512, 4096, 512, 16, 2, 3584, 0 },
+        { "global8192", 512, 8192, 512, 16, 2, 7680, 0 },
+        { "global16384", 512, 16384, 512, 16, 2, 15872, 0 },
+        { "global8192-tail", 128, 8192, 512, 16, 2, 8064, 0 }
+    };
+    int matched = 0;
+    for (size_t i = 0; i < sizeof shapes / sizeof shapes[0]; i++) {
+        if (selected_shape && strcmp(selected_shape, shapes[i].name)) continue;
+        bench_global_attention_shape_run(
+            gpu, &shapes[i], rounds, target_seconds);
+        matched = 1;
+    }
+    if (!matched)
+        bench_fatal("unknown global attention shape: %s", selected_shape);
+}
+
 static void bench_attention_run(bench_gpu *gpu, const char *selected_shape,
                                 int rounds, double target_seconds) {
     const bench_attention_shape shapes[] = {
@@ -5270,6 +5499,10 @@ static void bench_gpu_destroy(bench_gpu *gpu) {
     bench_ze_check("zeKernelDestroy GeGLU Q8 pair",
                    zeKernelDestroy(gpu->geglu_q8_pair));
     bench_ze_check("zeKernelDestroy attn gqa8", zeKernelDestroy(gpu->attn_gqa8));
+    bench_ze_check("zeKernelDestroy attn global h8q1 stream",
+                   zeKernelDestroy(gpu->attn_global_h8q1_stream));
+    bench_ze_check("zeKernelDestroy attn global shared k",
+                   zeKernelDestroy(gpu->attn_global_shared_k));
     bench_ze_check("zeKernelDestroy attn online b8",
                    zeKernelDestroy(gpu->attn_online_b8));
     bench_ze_check("zeKernelDestroy attn online b8 ring",
@@ -5392,6 +5625,7 @@ int main(int argc, char **argv) {
     int run_moe_coalesced = 0;
     int run_b5 = 0;
     int run_attention = 0;
+    int run_attention_global = 0;
     int run_attention_long = 0;
     int attention_long_rows = 0;
     int attention_long_keys = 0;
@@ -5449,6 +5683,8 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--attention"))
             run_attention = 1;
+        else if (!strcmp(argv[i], "--attention-global"))
+            run_attention_global = 1;
         else if (!strcmp(argv[i], "--attention-long") && i + 2 < argc) {
             run_attention_long = 1;
             attention_long_rows = bench_parse_int("attention rows", argv[++i]);
@@ -5477,14 +5713,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rounds") && i + 1 < argc)
             rounds = bench_parse_int("rounds", argv[++i]);
         else {
-            fprintf(stderr, "usage: %s [--spv PATH] [--shape NAME | --moe [--distribution NAME] | --routing [--distribution NAME] | --reduce [--distribution NAME] | --activate [--distribution NAME] | --router | --input | --attention [--attention-shape NAME] | --layer swa|global] [--seconds N] [--rounds N]\n",
+            fprintf(stderr, "usage: %s [--spv PATH] [--shape NAME | --moe [--distribution NAME] | --routing [--distribution NAME] | --reduce [--distribution NAME] | --activate [--distribution NAME] | --router | --input | --attention [--attention-shape NAME] | --attention-global [--attention-shape NAME] | --layer swa|global] [--seconds N] [--rounds N]\n",
                     argv[0]);
             return 1;
         }
     }
     if (rounds < 3 || rounds > BENCH_ROUNDS_MAX || !(rounds & 1))
         bench_fatal("rounds must be odd and between 3 and %d", BENCH_ROUNDS_MAX);
-    if (run_moe + run_moe_signed + run_moe_kb128 + run_moe_slmacc + run_moe_direct + run_moe_coalesced + run_b5 + run_attention + run_attention_long + run_routing + run_reduce + run_activate
+    if (run_moe + run_moe_signed + run_moe_kb128 + run_moe_slmacc + run_moe_direct + run_moe_coalesced + run_b5 + run_attention + run_attention_global + run_attention_long + run_routing + run_reduce + run_activate
         + run_router + run_input + run_moe_tile + run_moe_tm16
         + run_tile_only + run_fusion
         + run_qkv_post + run_glue + run_layer > 1
@@ -5496,8 +5732,8 @@ int main(int argc, char **argv) {
     if (!run_moe && !run_moe_tile && !run_routing && !run_reduce && !run_activate
         && selected_distribution)
         bench_fatal("--distribution requires --moe, --routing, --reduce or --activate");
-    if (!run_attention && selected_attention)
-        bench_fatal("--attention-shape requires --attention");
+    if (!run_attention && !run_attention_global && selected_attention)
+        bench_fatal("--attention-shape requires --attention or --attention-global");
     if (!run_activate && selected_activation)
         bench_fatal("--activate-shape requires --activate");
     if (run_tile_only && !selected_shape)
@@ -5557,6 +5793,8 @@ int main(int argc, char **argv) {
         bench_glue_run(&gpu, selected_glue, rounds, seconds);
     } else if (run_layer) {
         bench_layer_run(&gpu, selected_layer, rounds, seconds);
+    } else if (run_attention_global) {
+        bench_global_attention_run(&gpu, selected_attention, rounds, seconds);
     } else if (run_attention) {
         bench_attention_run(&gpu, selected_attention, rounds, seconds);
     } else if (run_attention_long) {

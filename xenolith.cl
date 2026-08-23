@@ -680,6 +680,19 @@ __kernel void xe_prefill_attn_online_b8(__global const float *q,
             acc[owned++] / denominator;
 }
 
+static inline float xe_prefill_attn_float8_accumulate(float value,
+                                                      float8 a, float8 b) {
+    value += a.s0 * b.s0;
+    value += a.s1 * b.s1;
+    value += a.s2 * b.s2;
+    value += a.s3 * b.s3;
+    value += a.s4 * b.s4;
+    value += a.s5 * b.s5;
+    value += a.s6 * b.s6;
+    value += a.s7 * b.s7;
+    return value;
+}
+
 __attribute__((intel_reqd_sub_group_size(16)))
 __kernel void xe_prefill_attn_online_b8_global_shared(
                                         __global const float *q,
@@ -696,15 +709,15 @@ __kernel void xe_prefill_attn_online_b8_global_shared(
     __local half lk[8 * 512];
     int lid = get_local_id(0);
     int subgroup = get_sub_group_id();
-    int lane = get_sub_group_local_id();
-    int query_head0 = get_group_id(0) * 8;
-    int head = query_head0 / m_count;
-    if (head >= heads) return;
-    int query0 = query_head0 - head * m_count;
-    int query = query0 + subgroup;
-    int kv_head = head * kv_heads / heads;
+    int query_kv = get_group_id(0);
+    int query = query_kv % m_count;
+    int kv_head = query_kv / m_count;
+    if (kv_head >= kv_heads) return;
+    int head = kv_head * heads / kv_heads + subgroup;
     int position = query_offset + query;
-    int maximum_position = min(n_count - 1, query_offset + query0 + 7);
+    int maximum_position = min(n_count - 1, position);
+    __global const uint *q_source = (__global const uint *)(
+        q + ((size_t)head * m_count + query) * 512);
     float maximum = -INFINITY;
     float denominator = 0.0f;
     float8 acc0 = (float8)(0.0f);
@@ -721,10 +734,33 @@ __kernel void xe_prefill_attn_online_b8_global_shared(
         float score[8];
         float block_maximum = -INFINITY;
         for (int local_key = 0; local_key < keys; local_key++) {
+            __local const ushort *source_k = (__local const ushort *)(
+                lk + local_key * 512);
             float value = 0.0f;
-            for (int d = lane; d < 512; d += 16)
-                value += q[((size_t)head * m_count + query) * 512 + d]
-                         * (float)lk[local_key * 512 + d];
+            float8 q_value = as_float8(
+                intel_sub_group_block_read8(q_source));
+            float8 k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k)));
+            value = xe_prefill_attn_float8_accumulate(
+                value, q_value, k_value);
+            q_value = as_float8(
+                intel_sub_group_block_read8(q_source + 128));
+            k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k + 128)));
+            value = xe_prefill_attn_float8_accumulate(
+                value, q_value, k_value);
+            q_value = as_float8(
+                intel_sub_group_block_read8(q_source + 256));
+            k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k + 256)));
+            value = xe_prefill_attn_float8_accumulate(
+                value, q_value, k_value);
+            q_value = as_float8(
+                intel_sub_group_block_read8(q_source + 384));
+            k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k + 384)));
+            value = xe_prefill_attn_float8_accumulate(
+                value, q_value, k_value);
             score[local_key] = sub_group_reduce_add(value);
             block_maximum = fmax(block_maximum, score[local_key]);
         }
