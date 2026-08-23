@@ -842,9 +842,7 @@ static void __attribute__((unused)) xe_prefill_attention_online_append(
         int query_offset, int window) {
     ze_kernel_handle_t kernel = dimension == 256
                                 ? e->gpu.prefill_attn_online_b8_swa
-                                : (rows & 7) == 0
-                                  ? e->gpu.prefill_attn_online_b8_global_shared
-                                  : e->gpu.prefill_attn_online_b8;
+                                : e->gpu.prefill_attn_online_b8_global_shared;
     xe_gpu_pointer_arg(kernel, 0, q);
     xe_gpu_pointer_arg(kernel, 1, k);
     xe_gpu_pointer_arg(kernel, 2, v);
