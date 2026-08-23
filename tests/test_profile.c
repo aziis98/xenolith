@@ -46,6 +46,8 @@ static void seq_text(const xe_engine *e, sequence *seq, const char *text) {
 typedef struct {
     char text[4096];
     size_t text_length;
+    char reasoning[4096];
+    size_t reasoning_length;
     char call_names[8][64];
     char call_args[8][1024];
     size_t starts;
@@ -55,13 +57,20 @@ typedef struct {
     int include_token;
 } collected;
 
-static void collect(profile *p, const sequence *seq, collected *out) {
+static void collect_open(profile *p, const sequence *seq, collected *out,
+                         int reasoning_open) {
     memset(out, 0, sizeof *out);
-    profile_parser_reset(p);
+    profile_parser_reset(p, reasoning_open);
     for (int i = 0; i < seq->n && !out->stopped; i++) {
         profile_parse_event event;
         CHECK(profile_parser_feed(p, seq->v[i], &event) == PROFILE_OK);
         switch (event.kind) {
+        case PROFILE_PARSE_REASONING:
+            memcpy(out->reasoning + out->reasoning_length, event.text,
+                   event.text_length);
+            out->reasoning_length += event.text_length;
+            out->reasoning[out->reasoning_length] = '\0';
+            break;
         case PROFILE_PARSE_TEXT:
             memcpy(out->text + out->text_length, event.text,
                    event.text_length);
@@ -91,6 +100,10 @@ static void collect(profile *p, const sequence *seq, collected *out) {
     }
 }
 
+static void collect(profile *p, const sequence *seq, collected *out) {
+    collect_open(p, seq, out, 0);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2 || !argv[1][0]) {
         fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]);
@@ -103,9 +116,32 @@ int main(int argc, char **argv) {
     if (!p) return 1;
     CHECK(strcmp(profile_model(p), "gemma-4-26B-A4B-it-qat") == 0);
 
+    profile_reasoning_policy policy;
+    CHECK(profile_get_reasoning_policy(
+              p, PROFILE_REASONING_LOW, -1, 1000, 2000, &policy) ==
+          PROFILE_OK);
+    CHECK(policy.hard_tokens == 128 && policy.soft_tokens == 96 &&
+          policy.delimiter_rank == 3 && policy.delimiter_margin == 3.0f);
+    CHECK(profile_get_reasoning_policy(
+              p, PROFILE_REASONING_MEDIUM, -1, 300, 2000, &policy) ==
+          PROFILE_OK);
+    CHECK(policy.hard_tokens == 44 && policy.soft_tokens == 0);
+    CHECK(profile_get_reasoning_policy(
+              p, PROFILE_REASONING_HIGH, 17, 1000, 2000, &policy) ==
+          PROFILE_OK);
+    CHECK(policy.hard_tokens == 17 && policy.soft_tokens == 0);
+    CHECK(profile_get_reasoning_policy(
+              p, PROFILE_REASONING_MAX, -1, 0, 1000, &policy) ==
+          PROFILE_OK);
+    CHECK(policy.hard_tokens == 744 && policy.soft_tokens == 232);
+    CHECK(profile_get_reasoning_policy(
+              p, PROFILE_REASONING_LOW, -1, 24, 2000, &policy) ==
+          PROFILE_OK);
+    CHECK(policy.hard_tokens == 0 && policy.soft_tokens == 0);
+
     profile_render render;
 
-    CHECK(profile_render_system(p, NULL, NULL, 0, &render) == PROFILE_OK);
+    CHECK(profile_render_system(p, NULL, NULL, 0, 0, &render) == PROFILE_OK);
     check_render(&render, "<bos>", __LINE__);
     CHECK(render.token_count == 1 && render.tokens[0] == 2);
 
@@ -114,16 +150,28 @@ int main(int argc, char **argv) {
     check_render(&render, "<|turn>user\nhi<turn|>\n", __LINE__);
     CHECK(render.tokens[0] == 105);
 
-    CHECK(profile_render_reply_open(p, PROFILE_TURN_PADDED, &render)
+    CHECK(profile_render_reply_open(p, PROFILE_TURN_PADDED, 0, 0, &render)
           == PROFILE_OK);
     check_render(&render, "<|turn>model\n<|channel>thought\n<channel|>",
                  __LINE__);
     CHECK(render.token_count >= 5 &&
           render.tokens[render.token_count - 1] == 101);
 
-    CHECK(profile_render_reply_open(p, PROFILE_TURN_OPEN, &render)
+    CHECK(profile_render_reply_open(p, PROFILE_TURN_OPEN, 0, 0, &render)
           == PROFILE_OK);
     CHECK(render.token_count == 0 && render.render_length == 0);
+
+    CHECK(profile_render_system(p, NULL, NULL, 0, 1, &render) == PROFILE_OK);
+    check_render(&render,
+                 "<bos><|turn>system\n<|think|>\n<turn|>\n", __LINE__);
+
+    CHECK(profile_render_reply_open(p, PROFILE_TURN_PADDED, 1, 0,
+                                    &render) == PROFILE_OK);
+    check_render(&render, "<|turn>model\n", __LINE__);
+
+    CHECK(profile_render_reply_open(p, PROFILE_TURN_OPEN, 1, 1,
+                                    &render) == PROFILE_OK);
+    check_render(&render, "<|channel>thought\n", __LINE__);
 
     CHECK(profile_render_user(p, "next", PROFILE_TURN_OPEN, &render)
           == PROFILE_OK);
@@ -152,7 +200,7 @@ int main(int argc, char **argv) {
     both[0] = weather;
     both[1] = stock;
     CHECK(profile_render_system(p, "You are a helpful assistant with tools.",
-                                both, 2, &render) == PROFILE_OK);
+                                both, 2, 0, &render) == PROFILE_OK);
     check_render(&render,
         "<bos><|turn>system\nYou are a helpful assistant with tools."
         "<|tool>declaration:get_weather{description:<|\"|>Get the current "
@@ -175,7 +223,7 @@ int main(int argc, char **argv) {
         "\"enum\":[\"celsius\",\"fahrenheit\"]}},"
         "\"required\":[\"city\"]}"
     };
-    CHECK(profile_render_system(p, NULL, &rich, 1, &render) == PROFILE_OK);
+    CHECK(profile_render_system(p, NULL, &rich, 1, 0, &render) == PROFILE_OK);
     check_render(&render,
         "<bos><|turn>system\n"
         "<|tool>declaration:get_weather{description:<|\"|>Get current "
@@ -196,27 +244,34 @@ int main(int argc, char **argv) {
           render.tokens[render.token_count - 1] == 51);
 
     profile_call call = { "get_weather", "{\"city\":\"Kyoto\"}" };
-    CHECK(profile_render_assistant(p, NULL, &call, 1,
-                                   PROFILE_TURN_PADDED, &render)
+    CHECK(profile_render_assistant(p, NULL, 1, NULL, &call, 1,
+                                   PROFILE_TURN_PADDED, 1, &render)
           == PROFILE_OK);
     check_render(&render,
-        "<|turn>model\n<|channel>thought\n<channel|>"
+        "<|turn>model\n"
         "<|tool_call>call:get_weather{city:<|\"|>Kyoto<|\"|>}<tool_call|>",
         __LINE__);
     CHECK(render.tokens[render.token_count - 1] == 49);
 
-    CHECK(profile_render_assistant(p, "done", NULL, 0,
-                                   PROFILE_TURN_OPEN, &render)
+    CHECK(profile_render_assistant(p, NULL, 1, "done", NULL, 0,
+                                   PROFILE_TURN_OPEN, 1, &render)
           == PROFILE_OK);
     check_render(&render, "done<turn|>", __LINE__);
     CHECK(render.tokens[render.token_count - 1] == 106);
 
     profile_call sorted_call = { "set", "{\"b\":2,\"a\":\"x\"}" };
-    CHECK(profile_render_assistant(p, NULL, &sorted_call, 1,
-                                   PROFILE_TURN_OPEN, &render)
+    CHECK(profile_render_assistant(p, NULL, 1, NULL, &sorted_call, 1,
+                                   PROFILE_TURN_OPEN, 1, &render)
           == PROFILE_OK);
     check_render(&render,
         "<|tool_call>call:set{a:<|\"|>x<|\"|>,b:2}<tool_call|>", __LINE__);
+
+    CHECK(profile_render_assistant(p, " plan ", 1, "done", NULL, 0,
+                                   PROFILE_TURN_PADDED, 1, &render)
+          == PROFILE_OK);
+    check_render(&render,
+        "<|turn>model\n<|channel>thought\nplan\n<channel|>done<turn|>",
+        __LINE__);
 
     sequence seq;
     collected got;
@@ -340,6 +395,17 @@ int main(int argc, char **argv) {
     seq_text(e, &seq, "answer");
     seq_id(&seq, 106);
     collect(p, &seq, &got);
+    CHECK(strcmp(got.text, "answer") == 0);
+    CHECK(strcmp(got.reasoning,
+                 "I am thinking about {braces} here.") == 0);
+
+    seq.n = 0;
+    seq_text(e, &seq, "continuing");
+    seq_id(&seq, 101);
+    seq_text(e, &seq, "answer");
+    seq_id(&seq, 106);
+    collect_open(p, &seq, &got, 1);
+    CHECK(strcmp(got.reasoning, "continuing") == 0);
     CHECK(strcmp(got.text, "answer") == 0);
 
     seq.n = 0;

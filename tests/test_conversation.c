@@ -153,7 +153,9 @@ static int test_basic(const char *root) {
     ok &= conversation_append_workspace(c, "/workspace/project") ==
           CONVERSATION_OK;
     conversation_settings settings = { 0.7f, 64, 0.95f, 512,
-                                       CONVERSATION_SAMPLER_ABI, 42, 42 };
+                                       CONVERSATION_SAMPLER_ABI, 42, 42,
+                                       CONVERSATION_REASONING_OFF,
+                                       CONVERSATION_REASONING_DISCARD, -1 };
     ok &= conversation_append_settings(c, &settings) == CONVERSATION_OK;
 
     conversation_block blocks[2] = {
@@ -794,11 +796,160 @@ static int test_unknown_events(const char *root, const char *copy_root) {
     return ok;
 }
 
+static int test_reasoning_projection(const char *root) {
+    conversation_store *store = NULL;
+    int ok = conversation_store_open(&store, root) == CONVERSATION_OK;
+    conversation *c = NULL;
+    conversation_id id;
+    ok &= conversation_create(store, &c, &id) == CONVERSATION_OK;
+    conversation_block text = { CONVERSATION_BLOCK_TEXT, "", 0 };
+    int32_t system[1] = { 2 };
+    int32_t system_thinking[2] = { 2, 98 };
+    ok &= conversation_append_message_variants(
+              c, CONVERSATION_ROLE_SYSTEM, &text, 1,
+              "<bos>", 5, system, 1,
+              "<bos><think>", 12, system_thinking, 2,
+              NULL, 0, CONVERSATION_REASONING_NONE) == CONVERSATION_OK;
+    int32_t user[1] = { 10 };
+    ok &= conversation_append_message(c, CONVERSATION_ROLE_USER, &text, 1,
+                                      "user", 4, user, 1) ==
+          CONVERSATION_OK;
+    conversation_block call_blocks[2] = {
+        { CONVERSATION_BLOCK_TEXT, "", 0 },
+        { CONVERSATION_BLOCK_JSON, "[]", 2 }
+    };
+    int32_t call_plain[2] = { 20, 48 };
+    int32_t call_thinking[4] = { 100, 30, 101, 48 };
+    int32_t call_raw[4] = { 100, 31, 101, 48 };
+    ok &= conversation_append_generation_result_variants(
+              c, 1, CONVERSATION_STOP_TOOL_CALLS, 1,
+              call_blocks, 2, "call", 4, call_plain, 2,
+              "thought-call", 12, call_thinking, 4,
+              "plan", 4, CONVERSATION_REASONING_NATURAL,
+              "raw-call", 8, call_raw, 4) == CONVERSATION_OK;
+    conversation_tool_call call;
+    memset(&call, 0, sizeof call);
+    call.call_id = 1;
+    call.server = "";
+    call.tool = "read";
+    call.arguments = (const uint8_t *)"{}";
+    call.arguments_length = 2;
+    ok &= conversation_append_tool_started(c, &call) == CONVERSATION_OK;
+
+    uint64_t count = 0;
+    const int32_t *tokens;
+    ok &= conversation_project(c, 1, CONVERSATION_REASONING_DISCARD) ==
+          CONVERSATION_OK;
+    tokens = conversation_tokens(c, &count);
+    ok &= count == 7 && tokens[1] == 98 && tokens[3] == 100 &&
+          tokens[4] == 30;
+    ok &= conversation_project(c, 0, CONVERSATION_REASONING_DISCARD) ==
+          CONVERSATION_OK;
+    tokens = conversation_tokens(c, &count);
+    ok &= count == 4 && tokens[2] == 20 && tokens[3] == 48;
+
+    int32_t tool_tokens[1] = { 50 };
+    ok &= conversation_append_tool_result(
+              c, 1, CONVERSATION_TOOL_OK, &text, 1,
+              "tool", 4, tool_tokens, 1) == CONVERSATION_OK;
+    int32_t final_plain[2] = { 40, 106 };
+    int32_t final_thinking[5] = { 100, 41, 101, 40, 106 };
+    ok &= conversation_append_generation_result_variants(
+              c, 2, CONVERSATION_STOP_EOT_SAMPLED, 1,
+              &text, 1, "answer", 6, final_plain, 2,
+              "thought-answer", 14, final_thinking, 5,
+              "check", 5, CONVERSATION_REASONING_NATURAL,
+              "raw-answer", 10, final_thinking, 5) == CONVERSATION_OK;
+    ok &= conversation_project(c, 1, CONVERSATION_REASONING_DISCARD) ==
+          CONVERSATION_OK;
+    tokens = conversation_tokens(c, &count);
+    ok &= count == 8 && tokens[3] == 20 && tokens[7] == 106;
+    ok &= conversation_project(
+              c, 1, CONVERSATION_REASONING_PRESERVE_TOOL_CALLS) ==
+          CONVERSATION_OK;
+    tokens = conversation_tokens(c, &count);
+    ok &= count == 10 && tokens[3] == 100 && tokens[4] == 30 &&
+          tokens[9] == 106;
+    ok &= conversation_commit(c) == CONVERSATION_OK;
+    conversation_close(c);
+
+    c = NULL;
+    ok &= conversation_open(store, &id, &c) == CONVERSATION_OK;
+    const conversation_event *event = conversation_event_at(c, 2);
+    ok &= event && event->reasoning_length == 4 &&
+          event->alternate_token_count == 4 &&
+          event->raw_token_count == 4 &&
+          event->reasoning_close == CONVERSATION_REASONING_NATURAL;
+    conversation_settings invalid = { 0 };
+    invalid.reasoning_effort = CONVERSATION_REASONING_MAX + 1;
+    invalid.reasoning_budget = -1;
+    ok &= conversation_append_settings(c, &invalid) ==
+          CONVERSATION_INVALID_ARGUMENT;
+    conversation_close(c);
+    conversation_store_close(store);
+    printf("conversation: reasoning variants and projection %s\n",
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static int test_projection_rollback(const char *root) {
+    conversation_store *store = NULL;
+    int ok = conversation_store_open(&store, root) == CONVERSATION_OK;
+    conversation *c = NULL;
+    conversation_id id;
+    ok &= conversation_create(store, &c, &id) == CONVERSATION_OK;
+    conversation_settings settings = { 1.0f, 1, 1.0f, 64,
+                                       CONVERSATION_SAMPLER_ABI, 1, 1,
+                                       CONVERSATION_REASONING_OFF,
+                                       CONVERSATION_REASONING_DISCARD, -1 };
+    ok &= conversation_append_settings(c, &settings) == CONVERSATION_OK;
+    int32_t system[1] = { 2 };
+    conversation_block text = { CONVERSATION_BLOCK_TEXT, "answer", 6 };
+    ok &= conversation_append_message(c, CONVERSATION_ROLE_SYSTEM, &text, 1,
+                                      "system", 6, system, 1) ==
+          CONVERSATION_OK;
+    int32_t primary[2] = { 40, 106 };
+    int32_t raw[4] = { 100, 101, 40, 106 };
+    ok &= conversation_append_generation_result_variants(
+              c, 1, CONVERSATION_STOP_EOT_SAMPLED, 1,
+              &text, 1, "answer", 6, primary, 2,
+              NULL, 0, NULL, 0, NULL, 0, CONVERSATION_REASONING_NONE,
+              "raw", 3, raw, 4) == CONVERSATION_OK;
+    ok &= conversation_project(c, 0, CONVERSATION_REASONING_DISCARD) ==
+          CONVERSATION_OK;
+    uint64_t count = 0;
+    const int32_t *tokens = conversation_tokens(c, &count);
+    ok &= count == 5 && tokens[1] == 100 && tokens[4] == 106;
+    kvstore_id snapshot;
+    memset(snapshot.bytes, 0x7b, sizeof snapshot.bytes);
+    ok &= conversation_append_snapshot_ref(c, &snapshot, count) ==
+          CONVERSATION_OK;
+    ok &= conversation_commit(c) == CONVERSATION_OK;
+    ok &= conversation_append_title(c, "temporary") == CONVERSATION_OK;
+    ok &= conversation_rollback(c) == CONVERSATION_OK;
+    tokens = conversation_tokens(c, &count);
+    uint64_t boundary = 0;
+    ok &= count == 5 && tokens[1] == 100 && tokens[4] == 106;
+    ok &= conversation_snapshot_current(c, NULL, &boundary) && boundary == 5;
+    conversation_close(c);
+
+    c = NULL;
+    ok &= conversation_open(store, &id, &c) == CONVERSATION_OK;
+    tokens = conversation_tokens(c, &count);
+    ok &= count == 5 && tokens[1] == 100 && tokens[4] == 106;
+    ok &= conversation_snapshot_current(c, NULL, &boundary) && boundary == 5;
+    conversation_close(c);
+    conversation_store_close(store);
+    printf("conversation: active projection survives load and rollback %s\n",
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main(void) {
     char root[] = "/tmp/xenolith-conversation-XXXXXX";
     if (!mkdtemp(root)) return 1;
-    char sub[9][1024];
-    for (int i = 0; i < 9; i++)
+    char sub[11][1024];
+    for (int i = 0; i < 11; i++)
         snprintf(sub[i], sizeof sub[i], "%s/case%d", root, i);
     char copy_root[1024];
     snprintf(copy_root, sizeof copy_root, "%s/copies", root);
@@ -822,6 +973,8 @@ int main(void) {
     ok &= test_list_delete(sub[6]);
     ok &= test_rejections(sub[7]);
     ok &= test_rollback(sub[8]);
+    ok &= test_reasoning_projection(sub[9]);
+    ok &= test_projection_rollback(sub[10]);
     ok &= test_state_dir();
     ok &= test_autosave_policy();
     char unknown_root[1024];

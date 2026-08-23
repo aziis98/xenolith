@@ -3,6 +3,7 @@
 #define _DEFAULT_SOURCE
 
 #include "xenolith.h"
+#include "xenolith_internal.h"
 #include "format.h"
 
 #include <errno.h>
@@ -327,6 +328,11 @@ struct xe_session {
     float expert_weight_trace[XE_LAYERS][XE_EXPERTS_USED];
     int32_t *tokens;
     int n_tokens;
+    _Float16 *anchor_swa_k;
+    _Float16 *anchor_swa_v;
+    float *anchor_logits;
+    int anchor_position;
+    int anchor_valid;
 };
 
 extern const unsigned char _binary_xenolith_gpu_spv_start[];
@@ -4741,6 +4747,9 @@ void xe_session_free(xe_session *s) {
     if (!s) return;
     xe_require_owner(s->engine);
     xe_engine *e = s->engine;
+    xe_free(e, s->anchor_logits, XE_MEM_HOST);
+    xe_free(e, s->anchor_swa_v, XE_MEM_HOST);
+    xe_free(e, s->anchor_swa_k, XE_MEM_HOST);
     xe_free(e, s->prefill_workspace, XE_MEM_SHARED);
     xe_free(e, s->workspace, XE_MEM_SHARED);
     xe_free(e, s->tokens, XE_MEM_HOST);
@@ -4873,6 +4882,63 @@ const float *xe_session_logits(xe_session *s) {
 int32_t xe_session_next(xe_session *s, xe_sampler *sp) {
     const float *logits = xe_session_logits(s);
     return xe_sample_logits(logits, XE_VOCAB, s->sample_candidates, sp);
+}
+
+int xe_session_anchor_capture(xe_session *s) {
+    if (!s || s->n_tokens <= 0) return 0;
+    xe_require_owner(s->engine);
+    if (!s->anchor_swa_k) {
+        s->anchor_swa_k = xe_alloc(s->engine,
+            XE_SWA_SLAB_ELEMS * sizeof(*s->anchor_swa_k), XE_MEM_HOST);
+        s->anchor_swa_v = xe_alloc(s->engine,
+            XE_SWA_SLAB_ELEMS * sizeof(*s->anchor_swa_v), XE_MEM_HOST);
+        s->anchor_logits = xe_alloc(s->engine,
+            XE_VOCAB * sizeof(*s->anchor_logits), XE_MEM_HOST);
+    }
+    memcpy(s->anchor_swa_k, s->swa_k,
+           XE_SWA_SLAB_ELEMS * sizeof(*s->swa_k));
+    memcpy(s->anchor_swa_v, s->swa_v,
+           XE_SWA_SLAB_ELEMS * sizeof(*s->swa_v));
+    memcpy(s->anchor_logits, s->logits,
+           XE_VOCAB * sizeof(*s->logits));
+    s->anchor_position = s->n_tokens;
+    s->anchor_valid = 1;
+    return 1;
+}
+
+int xe_session_anchor_restore(xe_session *s) {
+    if (!s || !s->anchor_valid) return 0;
+    xe_require_owner(s->engine);
+    memcpy(s->swa_k, s->anchor_swa_k,
+           XE_SWA_SLAB_ELEMS * sizeof(*s->swa_k));
+    memcpy(s->swa_v, s->anchor_swa_v,
+           XE_SWA_SLAB_ELEMS * sizeof(*s->swa_v));
+    memcpy(s->logits, s->anchor_logits,
+           XE_VOCAB * sizeof(*s->logits));
+    s->n_tokens = s->anchor_position;
+    return s->anchor_position;
+}
+
+void xe_session_anchor_clear(xe_session *s) {
+    if (s) s->anchor_valid = 0;
+}
+
+int xe_session_anchor_valid(const xe_session *s) {
+    return s && s->anchor_valid;
+}
+
+int xe_session_token_near_top(xe_session *s, int32_t token,
+                              int max_rank, float max_margin) {
+    const float *logits = xe_session_logits(s);
+    if (token < 0 || token >= XE_VOCAB || max_rank < 1) return 0;
+    float value = logits[token];
+    float best = value;
+    int rank = 1;
+    for (int i = 0; i < XE_VOCAB; i++) {
+        if (logits[i] > best) best = logits[i];
+        if (logits[i] > value) rank++;
+    }
+    return rank <= max_rank && best - value <= max_margin;
 }
 
 enum {

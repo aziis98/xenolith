@@ -64,7 +64,9 @@ int main(int argc, char **argv) {
     conversation_id id;
     ok &= conversation_create(store, &c, &id) == CONVERSATION_OK;
     conversation_settings settings = { 0.8f, 64, 0.95f, 512,
-                                       CONVERSATION_SAMPLER_ABI, 1234, 1234 };
+                                       CONVERSATION_SAMPLER_ABI, 1234, 1234,
+                                       CONVERSATION_REASONING_OFF,
+                                       CONVERSATION_REASONING_DISCARD, -1 };
     ok &= conversation_append_settings(c, &settings) == CONVERSATION_OK;
     ok &= conversation_append_title(c, "model acceptance") ==
           CONVERSATION_OK;

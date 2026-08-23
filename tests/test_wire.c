@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
     CHECK(info.context_window == xe_context_size(e));
     CHECK(strcmp(info.model, "gemma-4-26B-A4B-it-qat") == 0);
     CHECK(info.kvstore == 1);
+    CHECK(info.reasoning == 1);
     CHECK(wire_kvstore_open_status(w) == KVSTORE_OK);
 
     profile_tool tool = {
@@ -115,6 +116,7 @@ int main(int argc, char **argv) {
     messages[0].text = "summary of history";
     messages[1].kind = WIRE_MESSAGE_ASSISTANT;
     messages[1].text = "Let me look.";
+    messages[1].reasoning = "I should inspect it.";
     messages[1].calls = &call;
     messages[1].call_count = 1;
     messages[2].kind = WIRE_MESSAGE_TOOL_RESULT;
@@ -122,6 +124,7 @@ int main(int argc, char **argv) {
     messages[2].text = "CC=gcc";
     messages[3].kind = WIRE_MESSAGE_ASSISTANT;
     messages[3].text = "It uses gcc.";
+    messages[3].reasoning = "The answer is clear.";
     CHECK(wire_rebuild(w, "You are a coding agent.", &tool, 1, messages, 4,
                        &marker) == WIRE_OK);
     CHECK(wire_history_count(w) == 5);
@@ -129,6 +132,9 @@ int main(int argc, char **argv) {
     CHECK(wire_pending_calls(w, NULL, 0) == 0);
     CHECK(wire_history_at(w, 2, &entry) == WIRE_OK);
     CHECK(entry.kind == WIRE_MESSAGE_ASSISTANT);
+    CHECK(entry.reasoning_length == strlen("I should inspect it.") &&
+          memcmp(entry.reasoning, "I should inspect it.",
+                 entry.reasoning_length) == 0);
     CHECK(entry.extra_json != NULL);
     CHECK(wire_history_at(w, 3, &entry) == WIRE_OK);
     CHECK(entry.kind == WIRE_MESSAGE_TOOL_RESULT);
@@ -193,6 +199,12 @@ int main(int argc, char **argv) {
     CHECK(wire_history_at(w, 1, &entry) == WIRE_OK);
     CHECK(entry.kind == WIRE_MESSAGE_USER &&
           entry.text_length == strlen("summary of history"));
+
+    wire_gen_params invalid_params;
+    memset(&invalid_params, 0, sizeof invalid_params);
+    invalid_params.reasoning_set = 1;
+    invalid_params.reasoning_effort = CONVERSATION_REASONING_MAX + 1;
+    CHECK_FAIL(wire_generate(w, &invalid_params), WIRE_INVALID_ARGUMENT);
 
     wire_message oversized;
     memset(&oversized, 0, sizeof oversized);

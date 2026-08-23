@@ -75,6 +75,29 @@ typedef enum {
     CONVERSATION_TOOL_ERROR = 2
 } conversation_tool_status;
 
+typedef enum {
+    CONVERSATION_REASONING_OFF = 0,
+    CONVERSATION_REASONING_LOW = 1,
+    CONVERSATION_REASONING_MEDIUM = 2,
+    CONVERSATION_REASONING_HIGH = 3,
+    CONVERSATION_REASONING_MAX = 4
+} conversation_reasoning_effort;
+
+typedef enum {
+    CONVERSATION_REASONING_DISCARD = 0,
+    CONVERSATION_REASONING_PRESERVE_TOOL_CALLS = 1
+} conversation_reasoning_history;
+
+typedef enum {
+    CONVERSATION_REASONING_NONE = 0,
+    CONVERSATION_REASONING_NATURAL = 1,
+    CONVERSATION_REASONING_SOFT = 2,
+    CONVERSATION_REASONING_HARD = 3,
+    CONVERSATION_REASONING_LENGTH = 4,
+    CONVERSATION_REASONING_ABORTED = 5,
+    CONVERSATION_REASONING_EOS = 6
+} conversation_reasoning_close;
+
 typedef struct {
     uint32_t format;
     const void *data;
@@ -89,6 +112,9 @@ typedef struct {
     uint32_t sampler_abi;
     uint64_t rng_seed;
     uint64_t rng_state;
+    uint32_t reasoning_effort;
+    uint32_t reasoning_history;
+    int32_t reasoning_budget;
 } conversation_settings;
 
 typedef struct {
@@ -115,6 +141,17 @@ typedef struct {
     uint64_t render_length;
     const int32_t *tokens;
     uint32_t token_count;
+    const uint8_t *alternate_render;
+    uint64_t alternate_render_length;
+    const int32_t *alternate_tokens;
+    uint32_t alternate_token_count;
+    const uint8_t *raw_render;
+    uint64_t raw_render_length;
+    const int32_t *raw_tokens;
+    uint32_t raw_token_count;
+    const uint8_t *reasoning;
+    uint64_t reasoning_length;
+    uint32_t reasoning_close;
     conversation_settings settings;
     uint64_t generation_id;
     uint32_t stop_reason;
@@ -171,6 +208,15 @@ conversation_status conversation_append_message(
     const conversation_block *blocks, uint32_t block_count,
     const void *render, uint64_t render_length,
     const int32_t *tokens, uint32_t token_count);
+conversation_status conversation_append_message_variants(
+    conversation *c, uint32_t role,
+    const conversation_block *blocks, uint32_t block_count,
+    const void *render, uint64_t render_length,
+    const int32_t *tokens, uint32_t token_count,
+    const void *alternate_render, uint64_t alternate_render_length,
+    const int32_t *alternate_tokens, uint32_t alternate_token_count,
+    const void *reasoning, uint64_t reasoning_length,
+    uint32_t reasoning_close);
 conversation_status conversation_append_generation_started(
     conversation *c, const conversation_generation *generation);
 conversation_status conversation_append_generation_result(
@@ -179,6 +225,18 @@ conversation_status conversation_append_generation_result(
     const conversation_block *blocks, uint32_t block_count,
     const void *render, uint64_t render_length,
     const int32_t *tokens, uint32_t token_count);
+conversation_status conversation_append_generation_result_variants(
+    conversation *c, uint64_t generation_id, uint32_t stop_reason,
+    uint64_t rng_after,
+    const conversation_block *blocks, uint32_t block_count,
+    const void *render, uint64_t render_length,
+    const int32_t *tokens, uint32_t token_count,
+    const void *alternate_render, uint64_t alternate_render_length,
+    const int32_t *alternate_tokens, uint32_t alternate_token_count,
+    const void *reasoning, uint64_t reasoning_length,
+    uint32_t reasoning_close,
+    const void *raw_render, uint64_t raw_render_length,
+    const int32_t *raw_tokens, uint32_t raw_token_count);
 conversation_status conversation_append_tool_started(
     conversation *c, const conversation_tool_call *call);
 conversation_status conversation_append_tool_result(
@@ -203,6 +261,8 @@ int conversation_get_settings(const conversation *c,
                               conversation_settings *out);
 uint64_t conversation_epoch_current(const conversation *c);
 const int32_t *conversation_tokens(const conversation *c, uint64_t *count);
+conversation_status conversation_project(conversation *c, int thinking,
+                                         uint32_t reasoning_history);
 int conversation_snapshot_current(const conversation *c, kvstore_id *id,
                                   uint64_t *boundary);
 uint64_t conversation_event_count(const conversation *c);

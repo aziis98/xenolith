@@ -3,6 +3,7 @@
 #include "wire.h"
 #include "format.h"
 #include "json.h"
+#include "xenolith_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -25,6 +26,13 @@ typedef struct {
     char *arguments;
     int complete;
 } wire_gen_call;
+
+typedef struct {
+    uint8_t *render;
+    uint64_t render_length;
+    int32_t *tokens;
+    uint32_t token_count;
+} wire_render_copy;
 
 struct wire {
     xe_engine *engine;
@@ -60,6 +68,15 @@ struct wire {
     conversation_settings gen_settings;
     xe_sampler sampler;
     int32_t gen_max_tokens;
+    int gen_thinking;
+    int gen_after_tool;
+    uint32_t gen_turn;
+    int capture_anchor;
+    profile_reasoning_policy reasoning_policy;
+    int reasoning_tokens;
+    uint32_t reasoning_close;
+    int utf8_pending;
+    int replay_from;
 
     int32_t *prompt;
     int prompt_length;
@@ -70,6 +87,7 @@ struct wire {
     wire_usage usage;
 
     json_writer content;
+    json_writer reasoning;
     json_writer render;
     wire_gen_call *calls;
     size_t call_count;
@@ -82,6 +100,10 @@ struct wire {
     json_writer tools_scratch;
     json_writer calls_scratch;
 };
+
+static void wire_settings_defaults(conversation_settings *settings);
+static wire_status wire_project_mutation(wire *w, conversation *c,
+                                         int thinking, uint32_t history);
 
 const char *wire_status_code(wire_status status) {
     switch (status) {
@@ -276,6 +298,7 @@ void wire_close(wire *w) {
     free(w->calls);
     free(w->prompt);
     json_writer_free(&w->content);
+    json_writer_free(&w->reasoning);
     json_writer_free(&w->render);
     json_writer_free(&w->tools_scratch);
     json_writer_free(&w->calls_scratch);
@@ -288,7 +311,37 @@ wire_status wire_describe(wire *w, wire_info *out) {
     out->context_window = w->context;
     out->max_output = w->context;
     out->kvstore = w->kv != NULL;
+    out->reasoning = 1;
     return WIRE_OK;
+}
+
+static int wire_render_copy_set(wire_render_copy *copy,
+                                const profile_render *render) {
+    memset(copy, 0, sizeof *copy);
+    copy->render = malloc(render->render_length ? render->render_length : 1);
+    copy->tokens = malloc((size_t)(render->token_count ?
+                                  render->token_count : 1) *
+                          sizeof(*copy->tokens));
+    if (!copy->render || !copy->tokens) {
+        free(copy->render);
+        free(copy->tokens);
+        memset(copy, 0, sizeof *copy);
+        return 0;
+    }
+    if (render->render_length)
+        memcpy(copy->render, render->render, render->render_length);
+    if (render->token_count)
+        memcpy(copy->tokens, render->tokens,
+               (size_t)render->token_count * sizeof(*copy->tokens));
+    copy->render_length = render->render_length;
+    copy->token_count = render->token_count;
+    return 1;
+}
+
+static void wire_render_copy_free(wire_render_copy *copy) {
+    free(copy->render);
+    free(copy->tokens);
+    memset(copy, 0, sizeof *copy);
 }
 
 static uint32_t wire_turn(const conversation *c) {
@@ -319,6 +372,26 @@ static uint32_t wire_turn(const conversation *c) {
     default:
         return PROFILE_TURN_PADDED;
     }
+}
+
+static const conversation_event *wire_last_visible(const conversation *c) {
+    uint64_t count = conversation_visible_count(c);
+    if (!count) return NULL;
+    return conversation_event_at(c,
+        conversation_visible_index(c, count - 1));
+}
+
+static int wire_after_tool(const conversation *c) {
+    const conversation_event *last = wire_last_visible(c);
+    return last && last->type == CONVERSATION_EVENT_TOOL_RESULT;
+}
+
+static int wire_reasoning_continues(const conversation *c) {
+    const conversation_event *last = wire_last_visible(c);
+    return last &&
+           last->type == CONVERSATION_EVENT_GENERATION_RESULT &&
+           (last->reasoning_close == CONVERSATION_REASONING_LENGTH ||
+            last->reasoning_close == CONVERSATION_REASONING_ABORTED);
 }
 
 static wire_status wire_tools_json(wire *w, const profile_tool *tools,
@@ -362,9 +435,19 @@ static wire_status wire_append_system_event(wire *w, conversation *c,
                                             wire_marker *marker) {
     profile_render render;
     wire_status status = wire_from_profile(
-        w, profile_render_system(w->prof, system, tools, tool_count,
+        w, profile_render_system(w->prof, system, tools, tool_count, 0,
                                  &render));
     if (status != WIRE_OK) return status;
+    wire_render_copy primary;
+    if (!wire_render_copy_set(&primary, &render))
+        return wire_fail(w, WIRE_NOMEM, "out of memory");
+    status = wire_from_profile(
+        w, profile_render_system(w->prof, system, tools, tool_count, 1,
+                                 &render));
+    if (status != WIRE_OK) {
+        wire_render_copy_free(&primary);
+        return status;
+    }
     conversation_block blocks[2];
     uint32_t block_count = 1;
     blocks[0].format = CONVERSATION_BLOCK_TEXT;
@@ -372,17 +455,24 @@ static wire_status wire_append_system_event(wire *w, conversation *c,
     blocks[0].length = system ? strlen(system) : 0;
     if (tool_count) {
         status = wire_tools_json(w, tools, tool_count);
-        if (status != WIRE_OK) return status;
+        if (status != WIRE_OK) {
+            wire_render_copy_free(&primary);
+            return status;
+        }
         blocks[1].format = CONVERSATION_BLOCK_JSON;
         blocks[1].data = w->tools_scratch.data;
         blocks[1].length = w->tools_scratch.length;
         block_count = 2;
     }
     status = wire_from_conversation(
-        w, conversation_append_message(c, CONVERSATION_ROLE_SYSTEM, blocks,
-                                       block_count, render.render,
-                                       render.render_length, render.tokens,
-                                       render.token_count));
+        w, conversation_append_message_variants(
+               c, CONVERSATION_ROLE_SYSTEM, blocks, block_count,
+               primary.render, primary.render_length,
+               primary.tokens, primary.token_count,
+               render.render, render.render_length,
+               render.tokens, render.token_count,
+               NULL, 0, CONVERSATION_REASONING_NONE));
+    wire_render_copy_free(&primary);
     if (status != WIRE_OK) return status;
     if (marker) *marker = conversation_event_count(c) - 1;
     return WIRE_OK;
@@ -472,6 +562,7 @@ static void wire_park(wire *w, wire_checkpoint_report *out) {
     conversation_close(w->current);
     w->current = NULL;
     w->has_current = 0;
+    if (w->session) xe_session_anchor_clear(w->session);
 }
 
 wire_status wire_session_create(wire *w, const char *system,
@@ -549,6 +640,17 @@ wire_status wire_session_open(wire *w, const conversation_id *id,
     wire_status status = wire_from_conversation(
         w, conversation_open(w->cstore, id, &c));
     if (status != WIRE_OK) return status;
+    conversation_settings settings;
+    if (!conversation_get_settings(c, &settings))
+        wire_settings_defaults(&settings);
+    status = wire_from_conversation(
+        w, conversation_project(
+               c, settings.reasoning_effort != CONVERSATION_REASONING_OFF,
+               settings.reasoning_history));
+    if (status != WIRE_OK) {
+        conversation_close(c);
+        return status;
+    }
     wire_park(w, NULL);
     w->current = c;
     w->current_id = *id;
@@ -599,6 +701,7 @@ wire_status wire_session_delete(wire *w, const conversation_id *id) {
         conversation_close(w->current);
         w->current = NULL;
         w->has_current = 0;
+        if (w->session) xe_session_anchor_clear(w->session);
     }
     return wire_from_conversation(w,
                                   conversation_delete(w->cstore, id));
@@ -646,6 +749,8 @@ wire_status wire_history_at(wire *w, uint64_t position,
         out->extra_json = ev->blocks[1].data;
         out->extra_length = ev->blocks[1].length;
     }
+    out->reasoning = (const char *)ev->reasoning;
+    out->reasoning_length = ev->reasoning_length;
     switch (ev->type) {
     case CONVERSATION_EVENT_MESSAGE:
         out->role = ev->role;
@@ -735,9 +840,17 @@ wire_status wire_append(wire *w, const wire_message *message,
                          "unsupported message kind for append");
     }
     if (status != WIRE_OK) return status;
+    wire_marker marker = conversation_event_count(c) - 1;
+    conversation_settings settings;
+    if (!conversation_get_settings(c, &settings))
+        wire_settings_defaults(&settings);
+    status = wire_project_mutation(
+        w, c, settings.reasoning_effort != CONVERSATION_REASONING_OFF,
+        settings.reasoning_history);
+    if (status != WIRE_OK) return status;
     status = wire_from_conversation(w, conversation_commit(c));
     if (status != WIRE_OK) return status;
-    if (out) *out = conversation_event_count(c) - 1;
+    if (out) *out = marker;
     return WIRE_OK;
 }
 
@@ -749,11 +862,29 @@ static void wire_settings_defaults(conversation_settings *settings) {
     settings->sampler_abi = CONVERSATION_SAMPLER_ABI;
     settings->rng_seed = 1;
     settings->rng_state = 1;
+    settings->reasoning_effort = CONVERSATION_REASONING_OFF;
+    settings->reasoning_history = CONVERSATION_REASONING_DISCARD;
+    settings->reasoning_budget = -1;
+}
+
+static int wire_params_valid(const wire_gen_params *params) {
+    if (!params) return 1;
+    if (params->reasoning_set &&
+        params->reasoning_effort > CONVERSATION_REASONING_MAX)
+        return 0;
+    if (params->reasoning_history_set &&
+        params->reasoning_history >
+            CONVERSATION_REASONING_PRESERVE_TOOL_CALLS)
+        return 0;
+    if (params->reasoning_budget_set && params->reasoning_budget < 0)
+        return 0;
+    return 1;
 }
 
 static int wire_settings_apply(conversation_settings *settings,
                                const wire_gen_params *params) {
     int changed = 0;
+    int effort_changed = 0;
     if (!params) return 0;
     if (params->temperature >= 0.0f &&
         params->temperature != settings->temperature) {
@@ -778,6 +909,25 @@ static int wire_settings_apply(conversation_settings *settings,
         settings->rng_state = params->rng_seed;
         changed = 1;
     }
+    if (params->reasoning_set &&
+        params->reasoning_effort != settings->reasoning_effort) {
+        settings->reasoning_effort = params->reasoning_effort;
+        changed = 1;
+        effort_changed = 1;
+    }
+    if (params->reasoning_history_set &&
+        params->reasoning_history != settings->reasoning_history) {
+        settings->reasoning_history = params->reasoning_history;
+        changed = 1;
+    }
+    if (params->reasoning_budget_set &&
+        params->reasoning_budget != settings->reasoning_budget) {
+        settings->reasoning_budget = params->reasoning_budget;
+        changed = 1;
+    } else if (effort_changed && settings->reasoning_budget != -1) {
+        settings->reasoning_budget = -1;
+        changed = 1;
+    }
     return changed;
 }
 
@@ -788,16 +938,63 @@ static wire_status wire_prompt_reserve(wire *w) {
     return WIRE_OK;
 }
 
-static void wire_gen_reset(wire *w) {
+static void wire_gen_reset(wire *w, int reasoning_open) {
     w->cancel_requested = 0;
     w->started_emitted = 0;
     w->first_sync_done = 0;
     w->sampled_length = 0;
+    w->reasoning_tokens = 0;
+    w->reasoning_close = CONVERSATION_REASONING_NONE;
+    w->utf8_pending = 0;
+    w->replay_from = 0;
     memset(&w->usage, 0, sizeof w->usage);
     json_writer_reset(&w->content);
+    json_writer_reset(&w->reasoning);
     json_writer_reset(&w->render);
     wire_calls_reset(w);
-    profile_parser_reset(w->prof);
+    profile_parser_reset(w->prof, reasoning_open);
+}
+
+static wire_status wire_reasoning_policy_load(wire *w) {
+    uint32_t effort;
+    switch (w->gen_settings.reasoning_effort) {
+    case CONVERSATION_REASONING_LOW:
+        effort = PROFILE_REASONING_LOW;
+        break;
+    case CONVERSATION_REASONING_MEDIUM:
+        effort = PROFILE_REASONING_MEDIUM;
+        break;
+    case CONVERSATION_REASONING_HIGH:
+        effort = PROFILE_REASONING_HIGH;
+        break;
+    case CONVERSATION_REASONING_MAX:
+        effort = PROFILE_REASONING_MAX;
+        break;
+    default:
+        effort = PROFILE_REASONING_OFF;
+        break;
+    }
+    return wire_from_profile(
+        w, profile_get_reasoning_policy(
+               w->prof, effort, w->gen_settings.reasoning_budget,
+               w->gen_max_tokens, w->context - w->prompt_length,
+               &w->reasoning_policy));
+}
+
+static void wire_utf8_feed(wire *w, const uint8_t *data, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        uint8_t byte = data[i];
+        if (w->utf8_pending) {
+            if ((byte & 0xc0) == 0x80) w->utf8_pending--;
+            else w->utf8_pending = 0;
+        } else if ((byte & 0xe0) == 0xc0) {
+            w->utf8_pending = 1;
+        } else if ((byte & 0xf0) == 0xe0) {
+            w->utf8_pending = 2;
+        } else if ((byte & 0xf8) == 0xf0) {
+            w->utf8_pending = 3;
+        }
+    }
 }
 
 static wire_status wire_best_snapshot(conversation *c, uint64_t limit,
@@ -876,6 +1073,9 @@ wire_status wire_generate(wire *w, const wire_gen_params *params) {
         return wire_fail(w, WIRE_BUSY, "generation in progress");
     if (!w->has_current)
         return wire_fail(w, WIRE_SESSION_NOT_FOUND, "no open session");
+    if (!wire_params_valid(params))
+        return wire_fail(w, WIRE_INVALID_ARGUMENT,
+                         "invalid reasoning settings");
     conversation *c = w->current;
 
     conversation_settings settings;
@@ -884,18 +1084,50 @@ wire_status wire_generate(wire *w, const wire_gen_params *params) {
     if (settings.sampler_abi != CONVERSATION_SAMPLER_ABI)
         return wire_fail(w, WIRE_INVALID_ARGUMENT,
                          "sampler abi mismatch");
+    conversation_settings previous = settings;
     int changed = wire_settings_apply(&settings, params);
+    int was_thinking = previous.reasoning_effort !=
+                       CONVERSATION_REASONING_OFF;
+    int is_thinking = settings.reasoning_effort !=
+                      CONVERSATION_REASONING_OFF;
+    int projection_changed = stored &&
+        (was_thinking != is_thinking ||
+         (is_thinking &&
+          previous.reasoning_history != settings.reasoning_history));
+    if (projection_changed) {
+        wire_status status = wire_from_conversation(
+            w, conversation_append_cache_epoch(c));
+        if (status != WIRE_OK) return status;
+        w->saved_tokens = 0;
+        w->saved_at = 0;
+        wire_ckpt_reset(w);
+        if (w->session) xe_session_anchor_clear(w->session);
+    }
     if (!stored || changed) {
         wire_status status = wire_from_conversation(
             w, conversation_append_settings(c, &settings));
         if (status != WIRE_OK) return status;
     }
 
+    wire_status status = wire_from_conversation(
+        w, conversation_project(
+               c, settings.reasoning_effort != CONVERSATION_REASONING_OFF,
+               settings.reasoning_history));
+    if (status != WIRE_OK) return status;
+
     uint64_t tokens;
     const int32_t *projection = conversation_tokens(c, &tokens);
     profile_render render;
-    wire_status status = wire_from_profile(
-        w, profile_render_reply_open(w->prof, wire_turn(c), &render));
+    uint32_t turn = wire_turn(c);
+    int after_tool = wire_after_tool(c);
+    int reasoning_open =
+        settings.reasoning_effort != CONVERSATION_REASONING_OFF &&
+        (wire_reasoning_continues(c) || after_tool);
+    status = wire_from_profile(
+        w, profile_render_reply_open(
+               w->prof, turn,
+               settings.reasoning_effort != CONVERSATION_REASONING_OFF,
+               after_tool, &render));
     if (status != WIRE_OK) return status;
     status = wire_budget_check(w, tokens + render.token_count);
     if (status != WIRE_OK) return status;
@@ -917,7 +1149,12 @@ wire_status wire_generate(wire *w, const wire_gen_params *params) {
         status = wire_from_conversation(w, conversation_commit(c));
     if (status != WIRE_OK) return status;
 
-    wire_gen_reset(w);
+    w->gen_thinking = settings.reasoning_effort !=
+                      CONVERSATION_REASONING_OFF;
+    w->gen_after_tool = after_tool;
+    w->gen_turn = turn;
+    w->capture_anchor = w->gen_thinking && turn == PROFILE_TURN_PADDED;
+    wire_gen_reset(w, reasoning_open);
     if (json_rawn(&w->render, render.render,
                   render.render_length) == 0)
         return wire_fail(w, WIRE_NOMEM, "out of memory");
@@ -927,8 +1164,12 @@ wire_status wire_generate(wire *w, const wire_gen_params *params) {
     w->sampler.top_p = settings.top_p;
     w->sampler.rng_state = settings.rng_state;
     w->gen_max_tokens = settings.max_tokens;
+    status = wire_reasoning_policy_load(w);
+    if (status != WIRE_OK) return status;
     if (!w->session) w->session = xe_session_new(w->engine);
     w->gen_kind = WIRE_GEN_DURABLE;
+    if (w->session && xe_session_anchor_valid(w->session))
+        w->replay_from = xe_session_anchor_restore(w->session);
     return wire_gen_prepare(w, w->session, c);
 }
 
@@ -941,12 +1182,21 @@ wire_status wire_ephemeral_generate(wire *w, const char *system,
     if (!w) return WIRE_INVALID_ARGUMENT;
     if (w->gen_kind != WIRE_GEN_NONE)
         return wire_fail(w, WIRE_BUSY, "generation in progress");
+    if (!wire_params_valid(params))
+        return wire_fail(w, WIRE_INVALID_ARGUMENT,
+                         "invalid reasoning settings");
     wire_status status = wire_prompt_reserve(w);
     if (status != WIRE_OK) return status;
 
+    conversation_settings settings;
+    wire_settings_defaults(&settings);
+    wire_settings_apply(&settings, params);
+    int thinking = settings.reasoning_effort !=
+                   CONVERSATION_REASONING_OFF;
     profile_render render;
     status = wire_from_profile(
         w, profile_render_system(w->prof, system, tools, tool_count,
+                                 thinking,
                                  &render));
     if (status != WIRE_OK) return status;
     int length = 0;
@@ -956,6 +1206,13 @@ wire_status wire_ephemeral_generate(wire *w, const char *system,
            (size_t)render.token_count * sizeof(*w->prompt));
     length = (int)render.token_count;
 
+    size_t last_user = SIZE_MAX;
+    for (size_t i = 0; i < count; i++)
+        if (messages[i].kind == WIRE_MESSAGE_USER) last_user = i;
+    int current_open = count &&
+        (messages[count - 1].kind == WIRE_MESSAGE_TOOL_RESULT ||
+         (messages[count - 1].kind == WIRE_MESSAGE_ASSISTANT &&
+          messages[count - 1].call_count));
     uint32_t turn = PROFILE_TURN_PADDED;
     for (size_t i = 0; i < count; i++) {
         const wire_message *m = &messages[i];
@@ -967,12 +1224,23 @@ wire_status wire_ephemeral_generate(wire *w, const char *system,
                 w, profile_render_user(w->prof, m->text, turn, &render));
             turn = PROFILE_TURN_PADDED;
             break;
-        case WIRE_MESSAGE_ASSISTANT:
+        case WIRE_MESSAGE_ASSISTANT: {
+            int current = current_open &&
+                          (last_user == SIZE_MAX || i > last_user);
+            int historical =
+                settings.reasoning_history ==
+                    CONVERSATION_REASONING_PRESERVE_TOOL_CALLS &&
+                m->call_count;
             status = wire_from_profile(
-                w, profile_render_assistant(w->prof, m->text, m->calls,
-                                            m->call_count, turn, &render));
+                w, profile_render_assistant(
+                       w->prof, current || historical ? m->reasoning : NULL,
+                       1,
+                                            m->text,
+                                            m->calls, m->call_count, turn,
+                                            1, &render));
             turn = m->call_count ? PROFILE_TURN_OPEN : PROFILE_TURN_BARE;
             break;
+        }
         case WIRE_MESSAGE_TOOL_RESULT:
             if (turn != PROFILE_TURN_OPEN)
                 return wire_fail(w, WIRE_INVALID_ARGUMENT,
@@ -997,7 +1265,10 @@ wire_status wire_ephemeral_generate(wire *w, const char *system,
         length += (int)render.token_count;
     }
     status = wire_from_profile(
-        w, profile_render_reply_open(w->prof, turn, &render));
+        w, profile_render_reply_open(w->prof, turn, thinking,
+                                     count && messages[count - 1].kind ==
+                                              WIRE_MESSAGE_TOOL_RESULT,
+                                     &render));
     if (status != WIRE_OK) return status;
     status = wire_budget_check(w, (uint64_t)length + render.token_count);
     if (status != WIRE_OK) return status;
@@ -1007,16 +1278,20 @@ wire_status wire_ephemeral_generate(wire *w, const char *system,
 
     w->framing_offset = length;
     w->prompt_length = length;
-    wire_gen_reset(w);
-    conversation_settings settings;
-    wire_settings_defaults(&settings);
-    wire_settings_apply(&settings, params);
+    w->gen_thinking = thinking;
+    w->gen_after_tool = count && messages[count - 1].kind ==
+                                 WIRE_MESSAGE_TOOL_RESULT;
+    w->gen_turn = turn;
+    w->capture_anchor = 0;
+    wire_gen_reset(w, w->gen_after_tool && thinking);
     w->gen_settings = settings;
     w->sampler.temperature = settings.temperature;
     w->sampler.top_k = settings.top_k;
     w->sampler.top_p = settings.top_p;
     w->sampler.rng_state = settings.rng_state;
     w->gen_max_tokens = settings.max_tokens;
+    status = wire_reasoning_policy_load(w);
+    if (status != WIRE_OK) return status;
     if (!w->ephemeral) w->ephemeral = xe_session_new(w->engine);
     w->gen_kind = WIRE_GEN_EPHEMERAL;
     return wire_gen_prepare(w, w->ephemeral, NULL);
@@ -1104,8 +1379,63 @@ static wire_status wire_gen_error(wire *w, wire_status status,
     return WIRE_OK;
 }
 
+static wire_status wire_generation_render(wire *w, const char *reasoning,
+                                          int reasoning_complete,
+                                          int turn_complete,
+                                          wire_render_copy *out) {
+    profile_call *calls = NULL;
+    if (w->call_count) {
+        calls = calloc(w->call_count, sizeof(*calls));
+        if (!calls) return wire_fail(w, WIRE_NOMEM, "out of memory");
+        for (size_t i = 0; i < w->call_count; i++) {
+            calls[i].name = w->calls[i].name;
+            calls[i].arguments_json = w->calls[i].arguments
+                                      ? w->calls[i].arguments : "{}";
+        }
+    }
+    profile_render render;
+    profile_status ps = profile_render_assistant(
+        w->prof, reasoning, reasoning_complete,
+        w->content.data ? w->content.data : NULL,
+        calls, w->call_count, w->gen_turn, turn_complete, &render);
+    free(calls);
+    wire_status status = wire_from_profile(w, ps);
+    if (status != WIRE_OK) return status;
+    if (!wire_render_copy_set(out, &render))
+        return wire_fail(w, WIRE_NOMEM, "out of memory");
+    return WIRE_OK;
+}
+
+static wire_status wire_project_mutation(wire *w, conversation *c,
+                                         int thinking, uint32_t history) {
+    int had_snapshot = conversation_snapshot_current(c, NULL, NULL);
+    wire_status status = wire_from_conversation(
+        w, conversation_project(c, thinking, history));
+    if (status != WIRE_OK) return status;
+    if (had_snapshot && !conversation_snapshot_current(c, NULL, NULL)) {
+        status = wire_from_conversation(
+            w, conversation_append_cache_epoch(c));
+        if (status == WIRE_OK) {
+            w->saved_tokens = 0;
+            w->saved_at = 0;
+            wire_ckpt_reset(w);
+        }
+        return status;
+    }
+    return WIRE_OK;
+}
+
 static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
                                  uint32_t record_stop, wire_event *out) {
+    if (w->reasoning_close == CONVERSATION_REASONING_NONE &&
+        profile_parser_reasoning(w->prof)) {
+        if (record_stop == CONVERSATION_STOP_LIMIT)
+            w->reasoning_close = CONVERSATION_REASONING_LENGTH;
+        else if (record_stop == CONVERSATION_STOP_CANCELLED)
+            w->reasoning_close = CONVERSATION_REASONING_ABORTED;
+        else if (record_stop == CONVERSATION_STOP_EOS)
+            w->reasoning_close = CONVERSATION_REASONING_EOS;
+    }
     if (w->call_open >= 0 && !w->calls[w->call_open].complete) {
         free(w->calls[w->call_count - 1].name);
         free(w->calls[w->call_count - 1].arguments);
@@ -1113,6 +1443,7 @@ static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
         w->call_open = -1;
     }
     w->usage.output = (uint64_t)w->sampled_length;
+    w->usage.reasoning = (uint64_t)w->reasoning_tokens;
     wire_marker marker = WIRE_MARKER_NONE;
 
     if (w->gen_kind == WIRE_GEN_DURABLE) {
@@ -1130,15 +1461,46 @@ static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
             blocks[1].length = w->calls_scratch.length;
             block_count = 2;
         }
-        const int32_t *event_tokens = w->prompt + w->framing_offset;
-        uint32_t event_count = (uint32_t)(w->prompt_length -
-                                          w->framing_offset +
-                                          w->sampled_length);
-        wire_status status = wire_from_conversation(
-            w, conversation_append_generation_result(
+        int turn_complete = record_stop == CONVERSATION_STOP_EOT_SAMPLED ||
+                            record_stop == CONVERSATION_STOP_EOT_SYNTHETIC ||
+                            record_stop == CONVERSATION_STOP_EOS;
+        int reasoning_complete =
+            w->reasoning_close == CONVERSATION_REASONING_NATURAL ||
+            w->reasoning_close == CONVERSATION_REASONING_SOFT ||
+            w->reasoning_close == CONVERSATION_REASONING_HARD;
+        wire_render_copy primary;
+        wire_status status = wire_generation_render(
+            w, NULL, 1, turn_complete, &primary);
+        if (status != WIRE_OK) return wire_gen_error(w, status, out);
+        wire_render_copy alternate;
+        memset(&alternate, 0, sizeof alternate);
+        if (w->gen_thinking) {
+            status = wire_generation_render(
+                w, w->reasoning.length ? w->reasoning.data : NULL,
+                reasoning_complete, turn_complete, &alternate);
+            if (status != WIRE_OK) {
+                wire_render_copy_free(&primary);
+                return wire_gen_error(w, status, out);
+            }
+        }
+        const int32_t *raw_tokens = w->prompt + w->framing_offset;
+        uint32_t raw_count = (uint32_t)(w->prompt_length -
+                                        w->framing_offset +
+                                        w->sampled_length);
+        status = wire_from_conversation(
+            w, conversation_append_generation_result_variants(
                    c, w->generation_id, record_stop, w->sampler.rng_state,
-                   blocks, block_count, w->render.data ? w->render.data : "",
-                   w->render.length, event_tokens, event_count));
+                   blocks, block_count,
+                   primary.render, primary.render_length,
+                   primary.tokens, primary.token_count,
+                   alternate.render, alternate.render_length,
+                   alternate.tokens, alternate.token_count,
+                   w->reasoning.length ? w->reasoning.data : NULL,
+                   w->reasoning.length, w->reasoning_close,
+                   w->render.data ? w->render.data : "", w->render.length,
+                   raw_tokens, raw_count));
+        wire_render_copy_free(&alternate);
+        wire_render_copy_free(&primary);
         if (status != WIRE_OK) return wire_gen_error(w, status, out);
         marker = conversation_event_count(c) - 1;
         for (size_t i = 0; i < w->call_count; i++) {
@@ -1161,12 +1523,31 @@ static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
                 w, conversation_append_tool_started(c, &call));
             if (status != WIRE_OK) return wire_gen_error(w, status, out);
         }
+        status = wire_project_mutation(
+            w, c, w->gen_thinking,
+            w->gen_settings.reasoning_history);
+        if (status != WIRE_OK) return wire_gen_error(w, status, out);
         status = wire_from_conversation(w, conversation_commit(c));
         if (status != WIRE_OK) return wire_gen_error(w, status, out);
         uint64_t total;
-        conversation_tokens(c, &total);
+        const int32_t *projected = conversation_tokens(c, &total);
         w->usage.total = total;
-        if (w->kv && !w->ckpt_autosave_off &&
+        int open = record_stop == CONVERSATION_STOP_TOOL_CALLS ||
+                   record_stop == CONVERSATION_STOP_LIMIT ||
+                   record_stop == CONVERSATION_STOP_CANCELLED;
+        if (!open && w->session) {
+            int restored = xe_session_anchor_restore(w->session);
+            if (restored) {
+                xe_tokens prefix = { (int32_t *)projected, (int)total,
+                                     (int)total };
+                xe_sync_report report;
+                xe_session_sync_report(w->session, &prefix, &report);
+                w->usage.input += (uint64_t)report.prefilled;
+                w->usage.replayed += (uint64_t)report.prefilled;
+                xe_session_anchor_clear(w->session);
+            }
+        }
+        if (!open && w->kv && !w->ckpt_autosave_off &&
             conversation_autosave_due(total, w->saved_tokens,
                                       w->saved_at, wire_now())) {
             w->autosave_attempted = 1;
@@ -1181,6 +1562,7 @@ static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
     memset(out, 0, sizeof *out);
     out->kind = WIRE_EVENT_DONE;
     out->stop = wire_stop_reason;
+    out->reasoning_close = w->reasoning_close;
     out->usage = usage;
     out->marker = marker;
     out->checkpoint_attempted = w->autosave_attempted;
@@ -1220,9 +1602,17 @@ wire_status wire_next_event(wire *w, wire_event *out) {
                     w->first_sync_done = 1;
                 }
                 w->usage.input += (uint64_t)report.prefilled;
+                if (w->replay_from)
+                    w->usage.replayed += (uint64_t)report.prefilled;
                 w->prompt_synced = target;
-                if (w->prompt_synced >= w->prompt_length)
+                if (w->prompt_synced >= w->prompt_length) {
                     w->gen_phase = WIRE_PHASE_DECODE;
+                    w->replay_from = 0;
+                    if (w->capture_anchor) {
+                        xe_session_anchor_capture(w->gen_session);
+                        w->capture_anchor = 0;
+                    }
+                }
                 if (w->usage.input > 0 &&
                     (uint64_t)w->prompt_length > w->usage.cache_read) {
                     out->kind = WIRE_EVENT_PROGRESS;
@@ -1245,12 +1635,36 @@ wire_status wire_next_event(wire *w, wire_event *out) {
             return wire_finalize(w, WIRE_STOP_LENGTH,
                                  CONVERSATION_STOP_LIMIT, out);
 
-        int32_t token = xe_session_next(w->gen_session, &w->sampler);
+        uint32_t forced_close = CONVERSATION_REASONING_NONE;
+        if (w->reasoning_policy.hard_tokens >= 0 &&
+            profile_parser_reasoning(w->prof) && !w->utf8_pending) {
+            if (w->reasoning_tokens >=
+                w->reasoning_policy.hard_tokens) {
+                forced_close = CONVERSATION_REASONING_HARD;
+            } else if (w->reasoning_tokens >=
+                           w->reasoning_policy.soft_tokens &&
+                       xe_session_token_near_top(
+                           w->gen_session,
+                           profile_reasoning_end_token(w->prof),
+                           w->reasoning_policy.delimiter_rank,
+                           w->reasoning_policy.delimiter_margin)) {
+                forced_close = CONVERSATION_REASONING_SOFT;
+            }
+        }
+        int32_t token = forced_close != CONVERSATION_REASONING_NONE
+                        ? profile_reasoning_end_token(w->prof)
+                        : xe_session_next(w->gen_session, &w->sampler);
+        int was_reasoning = profile_parser_reasoning(w->prof);
         profile_parse_event event;
         profile_status parsed = profile_parser_feed(w->prof, token, &event);
         if (parsed != PROFILE_OK)
             return wire_gen_error(
                 w, wire_fail(w, WIRE_NOMEM, "out of memory"), out);
+        if (was_reasoning && !profile_parser_reasoning(w->prof))
+            w->reasoning_close = forced_close !=
+                                 CONVERSATION_REASONING_NONE
+                                 ? forced_close
+                                 : CONVERSATION_REASONING_NATURAL;
 
         if (event.kind == PROFILE_PARSE_STOP) {
             if (event.include_token) {
@@ -1287,6 +1701,16 @@ wire_status wire_next_event(wire *w, wire_event *out) {
         xe_session_sync(w->gen_session, &prefix);
 
         switch (event.kind) {
+        case PROFILE_PARSE_REASONING:
+            if (!json_rawn(&w->reasoning, event.text, event.text_length))
+                return wire_gen_error(
+                    w, wire_fail(w, WIRE_NOMEM, "out of memory"), out);
+            wire_utf8_feed(w, event.text, event.text_length);
+            w->reasoning_tokens++;
+            out->kind = WIRE_EVENT_REASONING_DELTA;
+            out->text = event.text;
+            out->text_length = event.text_length;
+            return WIRE_OK;
         case PROFILE_PARSE_TEXT:
             if (!json_rawn(&w->content, event.text, event.text_length))
                 return wire_gen_error(
@@ -1345,6 +1769,7 @@ wire_status wire_rewind(wire *w, wire_marker marker) {
     if (status != WIRE_OK) return status;
     status = wire_from_conversation(w, conversation_commit(c));
     if (status != WIRE_OK) return status;
+    if (w->session) xe_session_anchor_clear(w->session);
     kvstore_id snapshot;
     uint64_t boundary = 0;
     w->saved_tokens = conversation_snapshot_current(c, &snapshot, &boundary)
@@ -1401,6 +1826,7 @@ wire_status wire_rebuild(wire *w, const char *system,
     if (!w->has_current)
         return wire_fail(w, WIRE_SESSION_NOT_FOUND, "no open session");
     conversation *c = w->current;
+    if (w->session) xe_session_anchor_clear(w->session);
     wire_status status = wire_from_conversation(
         w, conversation_append_rewind(c, CONVERSATION_REWIND_ALL));
     if (status != WIRE_OK) return status;
@@ -1444,20 +1870,51 @@ wire_status wire_rebuild(wire *w, const char *system,
             break;
         case WIRE_MESSAGE_ASSISTANT: {
             status = wire_from_profile(
-                w, profile_render_assistant(w->prof, m->text, m->calls,
-                                            m->call_count, turn, &render));
+                w, profile_render_assistant(w->prof, NULL, 1, m->text,
+                                            m->calls, m->call_count, turn,
+                                            1, &render));
             if (status != WIRE_OK) goto abort;
-            status = wire_budget_check(w, tokens + render.token_count);
-            if (status != WIRE_OK) goto abort;
+            wire_render_copy primary;
+            if (!wire_render_copy_set(&primary, &render)) {
+                status = wire_fail(w, WIRE_NOMEM, "out of memory");
+                goto abort;
+            }
+            wire_render_copy alternate;
+            memset(&alternate, 0, sizeof alternate);
+            if (m->reasoning && *m->reasoning) {
+                status = wire_from_profile(
+                    w, profile_render_assistant(
+                           w->prof, m->reasoning, 1, m->text,
+                           m->calls, m->call_count, turn, 1, &render));
+                if (status != WIRE_OK ||
+                    !wire_render_copy_set(&alternate, &render)) {
+                    wire_render_copy_free(&primary);
+                    if (status == WIRE_OK)
+                        status = wire_fail(w, WIRE_NOMEM, "out of memory");
+                    goto abort;
+                }
+            }
+            status = wire_budget_check(w, tokens + primary.token_count);
+            if (status != WIRE_OK) {
+                wire_render_copy_free(&alternate);
+                wire_render_copy_free(&primary);
+                goto abort;
+            }
             wire_calls_reset(w);
             for (size_t j = 0; j < m->call_count; j++) {
                 status = wire_call_register(w, m->calls[j].name);
-                if (status != WIRE_OK) goto abort;
+                if (status != WIRE_OK) {
+                    wire_render_copy_free(&alternate);
+                    wire_render_copy_free(&primary);
+                    goto abort;
+                }
                 w->calls[j].arguments = strdup(
                     m->calls[j].arguments_json
                     ? m->calls[j].arguments_json : "{}");
                 w->calls[j].complete = 1;
                 if (!w->calls[j].arguments) {
+                    wire_render_copy_free(&alternate);
+                    wire_render_copy_free(&primary);
                     status = wire_fail(w, WIRE_NOMEM, "out of memory");
                     goto abort;
                 }
@@ -1465,17 +1922,30 @@ wire_status wire_rebuild(wire *w, const char *system,
             w->call_open = -1;
             if (m->call_count) {
                 status = wire_calls_json(w);
-                if (status != WIRE_OK) goto abort;
+                if (status != WIRE_OK) {
+                    wire_render_copy_free(&alternate);
+                    wire_render_copy_free(&primary);
+                    goto abort;
+                }
                 blocks[1].format = CONVERSATION_BLOCK_JSON;
                 blocks[1].data = w->calls_scratch.data;
                 blocks[1].length = w->calls_scratch.length;
                 block_count = 2;
             }
             status = wire_from_conversation(
-                w, conversation_append_message(
+                w, conversation_append_message_variants(
                        c, CONVERSATION_ROLE_ASSISTANT, blocks, block_count,
-                       render.render, render.render_length, render.tokens,
-                       render.token_count));
+                       primary.render, primary.render_length,
+                       primary.tokens, primary.token_count,
+                       alternate.render, alternate.render_length,
+                       alternate.tokens, alternate.token_count,
+                       m->reasoning && *m->reasoning ? m->reasoning : NULL,
+                       m->reasoning ? strlen(m->reasoning) : 0,
+                       m->reasoning && *m->reasoning
+                       ? CONVERSATION_REASONING_NATURAL
+                       : CONVERSATION_REASONING_NONE));
+            wire_render_copy_free(&alternate);
+            wire_render_copy_free(&primary);
             if (status != WIRE_OK) goto abort;
             for (size_t j = 0; j < w->call_count; j++) {
                 conversation_tool_call call;
@@ -1565,6 +2035,14 @@ wire_status wire_rebuild(wire *w, const char *system,
             goto abort;
         }
     }
+    conversation_settings settings;
+    if (!conversation_get_settings(c, &settings))
+        wire_settings_defaults(&settings);
+    status = wire_from_conversation(
+        w, conversation_project(
+               c, settings.reasoning_effort != CONVERSATION_REASONING_OFF,
+               settings.reasoning_history));
+    if (status != WIRE_OK) goto abort;
     status = wire_from_conversation(w, conversation_commit(c));
     if (status != WIRE_OK) goto abort;
     w->saved_tokens = 0;

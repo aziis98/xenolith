@@ -15,13 +15,13 @@ xenolith: main.o xenolith.o format.o json.o profile.o kvstore.o conversation.o w
 	$(CC) $(CFLAGS) -o $@ main.o xenolith.o format.o json.o profile.o kvstore.o conversation.o wire.o serve.o $(GPU_OBJ) $(LDLIBS)
 
 main.o: main.c xenolith.h profile.h serve.h conversation.h
-xenolith.o: xenolith.c xenolith.h format.h
+xenolith.o: xenolith.c xenolith.h xenolith_internal.h format.h
 format.o: format.c format.h
 json.o: json.c json.h
 profile.o: profile.c profile.h xenolith.h format.h json.h
 kvstore.o: kvstore.c kvstore.h xenolith.h format.h
 conversation.o: conversation.c conversation.h kvstore.h xenolith.h format.h
-wire.o: wire.c wire.h xenolith.h kvstore.h conversation.h profile.h format.h json.h
+wire.o: wire.c wire.h xenolith.h xenolith_internal.h kvstore.h conversation.h profile.h format.h json.h
 serve.o: serve.c serve.h wire.h xenolith.h kvstore.h conversation.h profile.h json.h
 
 clean:

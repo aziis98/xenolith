@@ -18,7 +18,8 @@
 enum {
     CONVERSATION_HEADER_SIZE = 64,
     CONVERSATION_FRAME_HEADER_SIZE = 32,
-    CONVERSATION_SETTINGS_SIZE = 40,
+    CONVERSATION_SETTINGS_OLD_SIZE = 40,
+    CONVERSATION_SETTINGS_SIZE = 56,
     CONVERSATION_FRAME_CRITICAL = 1,
     CONVERSATION_MAX_EVENT_TYPE = 12,
     CONVERSATION_TOKEN_LIMIT = 262143,
@@ -44,6 +45,8 @@ typedef struct {
     uint32_t flags;
     conversation_block *blocks;
     int32_t *token_copy;
+    int32_t *alternate_token_copy;
+    int32_t *raw_token_copy;
     char *server;
     char *tool;
 } conversation_node;
@@ -292,11 +295,17 @@ static void conversation_settings_pack(const conversation_settings *settings,
     format_put_u32le(out + 20, 0);
     format_put_u64le(out + 24, settings->rng_seed);
     format_put_u64le(out + 32, settings->rng_state);
+    format_put_u32le(out + 40, settings->reasoning_effort);
+    format_put_u32le(out + 44, settings->reasoning_history);
+    format_put_u32le(out + 48, (uint32_t)settings->reasoning_budget);
+    format_put_u32le(out + 52, 0);
 }
 
 static int conversation_settings_unpack(
-        const uint8_t in[CONVERSATION_SETTINGS_SIZE],
+        const uint8_t *in, uint64_t length,
         conversation_settings *settings) {
+    if (length != CONVERSATION_SETTINGS_OLD_SIZE &&
+        length != CONVERSATION_SETTINGS_SIZE) return 0;
     uint32_t temperature = format_get_u32le(in);
     uint32_t top_p = format_get_u32le(in + 8);
     memcpy(&settings->temperature, &temperature, 4);
@@ -306,6 +315,20 @@ static int conversation_settings_unpack(
     settings->sampler_abi = format_get_u32le(in + 16);
     settings->rng_seed = format_get_u64le(in + 24);
     settings->rng_state = format_get_u64le(in + 32);
+    settings->reasoning_effort = CONVERSATION_REASONING_OFF;
+    settings->reasoning_history = CONVERSATION_REASONING_DISCARD;
+    settings->reasoning_budget = -1;
+    if (length == CONVERSATION_SETTINGS_SIZE) {
+        settings->reasoning_effort = format_get_u32le(in + 40);
+        settings->reasoning_history = format_get_u32le(in + 44);
+        settings->reasoning_budget = (int32_t)format_get_u32le(in + 48);
+        if (format_get_u32le(in + 52) != 0 ||
+            settings->reasoning_effort > CONVERSATION_REASONING_MAX ||
+            settings->reasoning_history >
+                CONVERSATION_REASONING_PRESERVE_TOOL_CALLS ||
+            settings->reasoning_budget < -1)
+            return 0;
+    }
     return format_get_u32le(in + 20) == 0;
 }
 
@@ -394,19 +417,27 @@ static int conversation_blocks_parse(const conversation_field *field,
 }
 
 static int conversation_tokens_decode(conversation_node *node,
-                                      const conversation_field *field) {
+                                      const conversation_field *field,
+                                      int variant) {
     if (!field->present || field->length % 4) return 0;
     uint32_t count = (uint32_t)(field->length / 4);
-    node->view.token_count = count;
+    if (variant == 1) node->view.alternate_token_count = count;
+    else if (variant == 2) node->view.raw_token_count = count;
+    else node->view.token_count = count;
     if (!count) return 1;
-    node->token_copy = malloc((size_t)count * sizeof(*node->token_copy));
-    if (!node->token_copy) return -1;
+    int32_t **copy = variant == 1 ? &node->alternate_token_copy
+                     : variant == 2 ? &node->raw_token_copy
+                                    : &node->token_copy;
+    *copy = malloc((size_t)count * sizeof(**copy));
+    if (!*copy) return -1;
     for (uint32_t i = 0; i < count; i++) {
         int32_t token = (int32_t)format_get_u32le(field->data + 4 * i);
         if (token < 0 || token > CONVERSATION_TOKEN_LIMIT) return 0;
-        node->token_copy[i] = token;
+        (*copy)[i] = token;
     }
-    node->view.tokens = node->token_copy;
+    if (variant == 1) node->view.alternate_tokens = *copy;
+    else if (variant == 2) node->view.raw_tokens = *copy;
+    else node->view.tokens = *copy;
     return 1;
 }
 
@@ -414,7 +445,7 @@ static int conversation_node_parse(conversation_node *node) {
     conversation_event *view = &node->view;
     const uint8_t *payload = node->payload;
     uint64_t length = node->payload_length;
-    conversation_field fields[6];
+    conversation_field fields[12];
     switch (view->type) {
     case CONVERSATION_EVENT_TITLE:
     case CONVERSATION_EVENT_WORKSPACE:
@@ -425,11 +456,12 @@ static int conversation_node_parse(conversation_node *node) {
         return 1;
     case CONVERSATION_EVENT_SETTINGS:
         if (!conversation_fields_parse(payload, length, fields, 1) ||
-            !fields[0].present ||
-            fields[0].length != CONVERSATION_SETTINGS_SIZE) return 0;
-        return conversation_settings_unpack(fields[0].data, &view->settings);
+            !fields[0].present) return 0;
+        return conversation_settings_unpack(fields[0].data,
+                                            fields[0].length,
+                                            &view->settings);
     case CONVERSATION_EVENT_MESSAGE: {
-        if (!conversation_fields_parse(payload, length, fields, 4) ||
+        if (!conversation_fields_parse(payload, length, fields, 8) ||
             !conversation_field_u32(&fields[0], &view->role) ||
             view->role < CONVERSATION_ROLE_SYSTEM ||
             view->role > CONVERSATION_ROLE_TOOL ||
@@ -440,16 +472,34 @@ static int conversation_node_parse(conversation_node *node) {
         view->blocks = node->blocks;
         view->render = fields[2].data;
         view->render_length = fields[2].length;
-        return conversation_tokens_decode(node, &fields[3]);
+        int decoded = conversation_tokens_decode(node, &fields[3], 0);
+        if (decoded <= 0) return decoded;
+        if (fields[4].present != fields[5].present) return 0;
+        if (fields[4].present) {
+            view->alternate_render = fields[4].data;
+            view->alternate_render_length = fields[4].length;
+            decoded = conversation_tokens_decode(node, &fields[5], 1);
+            if (decoded <= 0) return decoded;
+        }
+        if (fields[6].present) {
+            view->reasoning = fields[6].data;
+            view->reasoning_length = fields[6].length;
+        }
+        if (fields[7].present &&
+            (!conversation_field_u32(&fields[7], &view->reasoning_close) ||
+             view->reasoning_close > CONVERSATION_REASONING_EOS))
+            return 0;
+        return 1;
     }
     case CONVERSATION_EVENT_GENERATION_STARTED:
         if (!conversation_fields_parse(payload, length, fields, 2) ||
             !conversation_field_u64(&fields[0], &view->generation_id) ||
-            !fields[1].present ||
-            fields[1].length != CONVERSATION_SETTINGS_SIZE) return 0;
-        return conversation_settings_unpack(fields[1].data, &view->settings);
+            !fields[1].present) return 0;
+        return conversation_settings_unpack(fields[1].data,
+                                            fields[1].length,
+                                            &view->settings);
     case CONVERSATION_EVENT_GENERATION_RESULT: {
-        if (!conversation_fields_parse(payload, length, fields, 6) ||
+        if (!conversation_fields_parse(payload, length, fields, 12) ||
             !conversation_field_u64(&fields[0], &view->generation_id) ||
             !conversation_field_u32(&fields[1], &view->stop_reason) ||
             view->stop_reason < CONVERSATION_STOP_EOT_SAMPLED ||
@@ -463,7 +513,31 @@ static int conversation_node_parse(conversation_node *node) {
         view->role = CONVERSATION_ROLE_ASSISTANT;
         view->render = fields[4].data;
         view->render_length = fields[4].length;
-        return conversation_tokens_decode(node, &fields[5]);
+        int decoded = conversation_tokens_decode(node, &fields[5], 0);
+        if (decoded <= 0) return decoded;
+        if (fields[6].present != fields[7].present) return 0;
+        if (fields[6].present) {
+            view->alternate_render = fields[6].data;
+            view->alternate_render_length = fields[6].length;
+            decoded = conversation_tokens_decode(node, &fields[7], 1);
+            if (decoded <= 0) return decoded;
+        }
+        if (fields[8].present) {
+            view->reasoning = fields[8].data;
+            view->reasoning_length = fields[8].length;
+        }
+        if (fields[9].present &&
+            (!conversation_field_u32(&fields[9], &view->reasoning_close) ||
+             view->reasoning_close > CONVERSATION_REASONING_EOS))
+            return 0;
+        if (fields[10].present != fields[11].present) return 0;
+        if (fields[10].present) {
+            view->raw_render = fields[10].data;
+            view->raw_render_length = fields[10].length;
+            decoded = conversation_tokens_decode(node, &fields[11], 2);
+            if (decoded <= 0) return decoded;
+        }
+        return 1;
     }
     case CONVERSATION_EVENT_TOOL_STARTED:
         if (!conversation_fields_parse(payload, length, fields, 5) ||
@@ -502,7 +576,7 @@ static int conversation_node_parse(conversation_node *node) {
         view->role = CONVERSATION_ROLE_TOOL;
         view->render = fields[3].data;
         view->render_length = fields[3].length;
-        return conversation_tokens_decode(node, &fields[4]);
+        return conversation_tokens_decode(node, &fields[4], 0);
     }
     case CONVERSATION_EVENT_SNAPSHOT_REF:
         if (!conversation_fields_parse(payload, length, fields, 4) ||
@@ -527,6 +601,8 @@ static void conversation_node_free(conversation_node *node) {
     free(node->payload);
     free(node->blocks);
     free(node->token_copy);
+    free(node->alternate_token_copy);
+    free(node->raw_token_copy);
     free(node->server);
     free(node->tool);
 }
@@ -708,7 +784,7 @@ static conversation_status conversation_apply(conversation *c,
         break;
     case CONVERSATION_EVENT_SNAPSHOT_REF:
         if (view->epoch != c->epoch) break;
-        if (view->snapshot_boundary > c->token_count) break;
+        if (view->snapshot_boundary > CONVERSATION_CONTEXT_CAPACITY) break;
         c->snapshot = view->snapshot;
         c->snapshot_boundary = view->snapshot_boundary;
         c->has_snapshot = 1;
@@ -1046,6 +1122,20 @@ static conversation_status conversation_load(conversation *c,
     if (c->last_timestamp < c->updated) c->last_timestamp = c->updated;
     if (c->last_timestamp < c->created) c->last_timestamp = c->created;
     c->uncommitted = 0;
+    int had_snapshot = c->has_snapshot;
+    kvstore_id snapshot = c->snapshot;
+    uint64_t snapshot_boundary = c->snapshot_boundary;
+    status = conversation_project(
+        c, c->has_settings && c->settings.reasoning_effort !=
+                              CONVERSATION_REASONING_OFF,
+        c->has_settings ? c->settings.reasoning_history
+                        : CONVERSATION_REASONING_DISCARD);
+    if (status != CONVERSATION_OK) return status;
+    if (had_snapshot && snapshot_boundary <= c->token_count) {
+        c->snapshot = snapshot;
+        c->snapshot_boundary = snapshot_boundary;
+        c->has_snapshot = 1;
+    }
     *resumable = !damaged && !scan.unknown_critical;
     return damaged ? CONVERSATION_DAMAGED
                    : scan.unknown_critical ? CONVERSATION_VERSION
@@ -1511,7 +1601,12 @@ conversation_status conversation_append_workspace(conversation *c,
 
 conversation_status conversation_append_settings(
         conversation *c, const conversation_settings *settings) {
-    if (!c || !settings) return CONVERSATION_INVALID_ARGUMENT;
+    if (!c || !settings ||
+        settings->reasoning_effort > CONVERSATION_REASONING_MAX ||
+        settings->reasoning_history >
+            CONVERSATION_REASONING_PRESERVE_TOOL_CALLS ||
+        settings->reasoning_budget < -1)
+        return CONVERSATION_INVALID_ARGUMENT;
     uint8_t packed[CONVERSATION_SETTINGS_SIZE];
     conversation_settings_pack(settings, packed);
     conversation_buffer payload = {0};
@@ -1570,14 +1665,49 @@ conversation_status conversation_append_message(
         const conversation_block *blocks, uint32_t block_count,
         const void *render, uint64_t render_length,
         const int32_t *tokens, uint32_t token_count) {
+    return conversation_append_message_variants(
+        c, role, blocks, block_count, render, render_length,
+        tokens, token_count, NULL, 0, NULL, 0, NULL, 0,
+        CONVERSATION_REASONING_NONE);
+}
+
+conversation_status conversation_append_message_variants(
+        conversation *c, uint32_t role,
+        const conversation_block *blocks, uint32_t block_count,
+        const void *render, uint64_t render_length,
+        const int32_t *tokens, uint32_t token_count,
+        const void *alternate_render, uint64_t alternate_render_length,
+        const int32_t *alternate_tokens, uint32_t alternate_token_count,
+        const void *reasoning, uint64_t reasoning_length,
+        uint32_t reasoning_close) {
     if (!c || (block_count && !blocks) || (render_length && !render) ||
-        (token_count && !tokens)) return CONVERSATION_INVALID_ARGUMENT;
+        (token_count && !tokens) ||
+        (alternate_render_length && !alternate_render) ||
+        (alternate_token_count && !alternate_tokens) ||
+        (reasoning_length && !reasoning) ||
+        reasoning_close > CONVERSATION_REASONING_EOS)
+        return CONVERSATION_INVALID_ARGUMENT;
     conversation_buffer payload = {0};
     conversation_status status = CONVERSATION_NOMEM;
-    if (conversation_buffer_field_u32(&payload, 1, role) &&
+    int ok = conversation_buffer_field_u32(&payload, 1, role) &&
         conversation_buffer_blocks(&payload, 2, blocks, block_count) &&
         conversation_buffer_field(&payload, 3, render, render_length) &&
-        conversation_buffer_tokens(&payload, 4, tokens, token_count))
+        conversation_buffer_tokens(&payload, 4, tokens, token_count);
+    if (ok && (alternate_render || alternate_tokens))
+        ok = conversation_buffer_field(
+                 &payload, CONVERSATION_FIELD_OPTIONAL | 5,
+                 alternate_render, alternate_render_length) &&
+             conversation_buffer_tokens(
+                 &payload, CONVERSATION_FIELD_OPTIONAL | 6,
+                 alternate_tokens, alternate_token_count);
+    if (ok && reasoning)
+        ok = conversation_buffer_field(
+            &payload, CONVERSATION_FIELD_OPTIONAL | 7,
+            reasoning, reasoning_length);
+    if (ok && reasoning_close != CONVERSATION_REASONING_NONE)
+        ok = conversation_buffer_field_u32(
+            &payload, CONVERSATION_FIELD_OPTIONAL | 8, reasoning_close);
+    if (ok)
         status = conversation_frame_write(c, CONVERSATION_EVENT_MESSAGE,
                                           CONVERSATION_FRAME_CRITICAL,
                                           &payload);
@@ -1587,7 +1717,13 @@ conversation_status conversation_append_message(
 
 conversation_status conversation_append_generation_started(
         conversation *c, const conversation_generation *generation) {
-    if (!c || !generation) return CONVERSATION_INVALID_ARGUMENT;
+    if (!c || !generation ||
+        generation->settings.reasoning_effort >
+            CONVERSATION_REASONING_MAX ||
+        generation->settings.reasoning_history >
+            CONVERSATION_REASONING_PRESERVE_TOOL_CALLS ||
+        generation->settings.reasoning_budget < -1)
+        return CONVERSATION_INVALID_ARGUMENT;
     uint8_t packed[CONVERSATION_SETTINGS_SIZE];
     conversation_settings_pack(&generation->settings, packed);
     conversation_buffer payload = {0};
@@ -1608,16 +1744,63 @@ conversation_status conversation_append_generation_result(
         const conversation_block *blocks, uint32_t block_count,
         const void *render, uint64_t render_length,
         const int32_t *tokens, uint32_t token_count) {
+    return conversation_append_generation_result_variants(
+        c, generation_id, stop_reason, rng_after, blocks, block_count,
+        render, render_length, tokens, token_count, NULL, 0, NULL, 0,
+        NULL, 0, CONVERSATION_REASONING_NONE, NULL, 0, NULL, 0);
+}
+
+conversation_status conversation_append_generation_result_variants(
+        conversation *c, uint64_t generation_id, uint32_t stop_reason,
+        uint64_t rng_after,
+        const conversation_block *blocks, uint32_t block_count,
+        const void *render, uint64_t render_length,
+        const int32_t *tokens, uint32_t token_count,
+        const void *alternate_render, uint64_t alternate_render_length,
+        const int32_t *alternate_tokens, uint32_t alternate_token_count,
+        const void *reasoning, uint64_t reasoning_length,
+        uint32_t reasoning_close,
+        const void *raw_render, uint64_t raw_render_length,
+        const int32_t *raw_tokens, uint32_t raw_token_count) {
     if (!c || (block_count && !blocks) || (render_length && !render) ||
-        (token_count && !tokens)) return CONVERSATION_INVALID_ARGUMENT;
+        (token_count && !tokens) ||
+        (alternate_render_length && !alternate_render) ||
+        (alternate_token_count && !alternate_tokens) ||
+        (reasoning_length && !reasoning) ||
+        (raw_render_length && !raw_render) ||
+        (raw_token_count && !raw_tokens) ||
+        reasoning_close > CONVERSATION_REASONING_EOS)
+        return CONVERSATION_INVALID_ARGUMENT;
     conversation_buffer payload = {0};
     conversation_status status = CONVERSATION_NOMEM;
-    if (conversation_buffer_field_u64(&payload, 1, generation_id) &&
+    int ok = conversation_buffer_field_u64(&payload, 1, generation_id) &&
         conversation_buffer_field_u32(&payload, 2, stop_reason) &&
         conversation_buffer_field_u64(&payload, 3, rng_after) &&
         conversation_buffer_blocks(&payload, 4, blocks, block_count) &&
         conversation_buffer_field(&payload, 5, render, render_length) &&
-        conversation_buffer_tokens(&payload, 6, tokens, token_count))
+        conversation_buffer_tokens(&payload, 6, tokens, token_count);
+    if (ok && (alternate_render || alternate_tokens))
+        ok = conversation_buffer_field(
+                 &payload, CONVERSATION_FIELD_OPTIONAL | 7,
+                 alternate_render, alternate_render_length) &&
+             conversation_buffer_tokens(
+                 &payload, CONVERSATION_FIELD_OPTIONAL | 8,
+                 alternate_tokens, alternate_token_count);
+    if (ok && reasoning)
+        ok = conversation_buffer_field(
+            &payload, CONVERSATION_FIELD_OPTIONAL | 9,
+            reasoning, reasoning_length);
+    if (ok && reasoning_close != CONVERSATION_REASONING_NONE)
+        ok = conversation_buffer_field_u32(
+            &payload, CONVERSATION_FIELD_OPTIONAL | 10, reasoning_close);
+    if (ok && (raw_render || raw_tokens))
+        ok = conversation_buffer_field(
+                 &payload, CONVERSATION_FIELD_OPTIONAL | 11,
+                 raw_render, raw_render_length) &&
+             conversation_buffer_tokens(
+                 &payload, CONVERSATION_FIELD_OPTIONAL | 12,
+                 raw_tokens, raw_token_count);
+    if (ok)
         status = conversation_frame_write(
             c, CONVERSATION_EVENT_GENERATION_RESULT,
             CONVERSATION_FRAME_CRITICAL, &payload);
@@ -1671,6 +1854,7 @@ conversation_status conversation_append_tool_result(
 conversation_status conversation_append_snapshot_ref(
         conversation *c, const kvstore_id *snapshot, uint64_t token_boundary) {
     if (!c || !snapshot) return CONVERSATION_INVALID_ARGUMENT;
+    if (token_boundary > c->token_count) return CONVERSATION_FORMAT;
     conversation_buffer payload = {0};
     conversation_status status = CONVERSATION_NOMEM;
     if (conversation_buffer_field(&payload, 1, snapshot->bytes, 16) &&
@@ -1743,6 +1927,106 @@ uint64_t conversation_epoch_current(const conversation *c) {
 const int32_t *conversation_tokens(const conversation *c, uint64_t *count) {
     if (count) *count = c->token_count;
     return c->tokens;
+}
+
+static int conversation_event_has_calls(const conversation_event *event) {
+    return event->role == CONVERSATION_ROLE_ASSISTANT &&
+           event->block_count > 1 &&
+           event->blocks[1].format == CONVERSATION_BLOCK_JSON;
+}
+
+conversation_status conversation_project(conversation *c, int thinking,
+                                         uint32_t reasoning_history) {
+    if (!c || reasoning_history >
+              CONVERSATION_REASONING_PRESERVE_TOOL_CALLS)
+        return CONVERSATION_INVALID_ARGUMENT;
+    uint64_t last_user = UINT64_MAX;
+    for (uint64_t i = 0; i < c->visible_count; i++) {
+        const conversation_event *event = &c->events[c->visible[i].index].view;
+        if (event->role == CONVERSATION_ROLE_USER) last_user = i;
+    }
+    int current_open = 0;
+    if (c->visible_count) {
+        const conversation_event *last =
+            &c->events[c->visible[c->visible_count - 1].index].view;
+        if (last->type == CONVERSATION_EVENT_TOOL_RESULT ||
+            conversation_event_has_calls(last) ||
+            (last->type == CONVERSATION_EVENT_GENERATION_RESULT &&
+             (last->stop_reason == CONVERSATION_STOP_LIMIT ||
+              last->stop_reason == CONVERSATION_STOP_CANCELLED)))
+            current_open = 1;
+    }
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < c->visible_count; i++) {
+        const conversation_event *event = &c->events[c->visible[i].index].view;
+        int variant = 0;
+        if (!thinking && event->raw_tokens && !event->alternate_tokens)
+            variant = 2;
+        if (thinking && event->role == CONVERSATION_ROLE_SYSTEM)
+            variant = event->alternate_tokens != NULL;
+        if (thinking && event->role == CONVERSATION_ROLE_ASSISTANT) {
+            int current = current_open &&
+                          (last_user == UINT64_MAX || i > last_user);
+            int historical =
+                reasoning_history ==
+                    CONVERSATION_REASONING_PRESERVE_TOOL_CALLS &&
+                conversation_event_has_calls(event);
+            variant = (current || historical) &&
+                      event->alternate_tokens != NULL;
+        }
+        uint32_t count = variant == 1 ? event->alternate_token_count
+                         : variant == 2 ? event->raw_token_count
+                                        : event->token_count;
+        if (total > CONVERSATION_TOKEN_LIMIT - count)
+            return CONVERSATION_LIMIT;
+        total += count;
+    }
+    int32_t *projected = malloc((size_t)(total ? total : 1) *
+                                sizeof(*projected));
+    if (!projected) return CONVERSATION_NOMEM;
+    uint64_t offset = 0;
+    for (uint64_t i = 0; i < c->visible_count; i++) {
+        const conversation_event *event = &c->events[c->visible[i].index].view;
+        int variant = 0;
+        if (!thinking && event->raw_tokens && !event->alternate_tokens)
+            variant = 2;
+        if (thinking && event->role == CONVERSATION_ROLE_SYSTEM)
+            variant = event->alternate_tokens != NULL;
+        if (thinking && event->role == CONVERSATION_ROLE_ASSISTANT) {
+            int current = current_open &&
+                          (last_user == UINT64_MAX || i > last_user);
+            int historical =
+                reasoning_history ==
+                    CONVERSATION_REASONING_PRESERVE_TOOL_CALLS &&
+                conversation_event_has_calls(event);
+            variant = (current || historical) &&
+                      event->alternate_tokens != NULL;
+        }
+        const int32_t *tokens = variant == 1 ? event->alternate_tokens
+                                : variant == 2 ? event->raw_tokens
+                                               : event->tokens;
+        uint32_t count = variant == 1 ? event->alternate_token_count
+                         : variant == 2 ? event->raw_token_count
+                                        : event->token_count;
+        if (count) memcpy(projected + offset, tokens,
+                          (size_t)count * sizeof(*tokens));
+        offset += count;
+        c->visible[i].boundary = offset;
+    }
+    int snapshot_changed = c->has_snapshot &&
+        (c->snapshot_boundary > total ||
+         (c->snapshot_boundary &&
+          memcmp(c->tokens, projected,
+                 (size_t)c->snapshot_boundary * sizeof(*projected)) != 0));
+    free(c->tokens);
+    c->tokens = projected;
+    c->token_count = total;
+    c->token_capacity = total;
+    if (snapshot_changed) {
+        c->has_snapshot = 0;
+        c->snapshot_boundary = 0;
+    }
+    return CONVERSATION_OK;
 }
 
 int conversation_snapshot_current(const conversation *c, kvstore_id *id,

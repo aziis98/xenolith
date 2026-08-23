@@ -378,6 +378,18 @@ static const char *serve_record_stop_name(uint32_t stop) {
     return "unknown";
 }
 
+static const char *serve_reasoning_close_name(uint32_t close) {
+    switch (close) {
+    case CONVERSATION_REASONING_NATURAL: return "natural";
+    case CONVERSATION_REASONING_SOFT: return "soft";
+    case CONVERSATION_REASONING_HARD: return "hard";
+    case CONVERSATION_REASONING_LENGTH: return "length";
+    case CONVERSATION_REASONING_ABORTED: return "aborted";
+    case CONVERSATION_REASONING_EOS: return "eos";
+    }
+    return "none";
+}
+
 typedef struct {
     profile_tool *tools;
     size_t count;
@@ -484,6 +496,7 @@ static int serve_messages_parse(const json_value *request,
             m->kind = WIRE_MESSAGE_USER;
         } else if (!strcmp(role, "assistant")) {
             m->kind = WIRE_MESSAGE_ASSISTANT;
+            m->reasoning = serve_str(v, "reasoning");
             const json_value *calls = json_member(v, "calls");
             if (calls && calls->type == JSON_ARRAY && calls->child) {
                 m->calls = &out->calls[call_at];
@@ -521,8 +534,9 @@ static int serve_messages_parse(const json_value *request,
     return 1;
 }
 
-static void serve_params_parse(const json_value *request,
-                               wire_gen_params *params) {
+static int serve_params_parse(const json_value *request,
+                              wire_gen_params *params) {
+    memset(params, 0, sizeof *params);
     params->temperature = -1.0f;
     params->top_k = -1;
     params->top_p = -1.0f;
@@ -543,6 +557,48 @@ static void serve_params_parse(const json_value *request,
         params->max_tokens = (int32_t)v->number;
     uint64_t seed;
     if (serve_u64(request, "seed", &seed)) params->rng_seed = seed;
+    v = json_member(request, "reasoning");
+    if (!v) return 1;
+    params->reasoning_set = 1;
+    if (v->type == JSON_BOOL) {
+        if (v->boolean) return 0;
+        params->reasoning_effort = CONVERSATION_REASONING_OFF;
+        return 1;
+    }
+    if (v->type != JSON_OBJECT) return 0;
+    const char *effort = serve_str(v, "effort");
+    if (!effort) return 0;
+    if (!strcmp(effort, "low"))
+        params->reasoning_effort = CONVERSATION_REASONING_LOW;
+    else if (!strcmp(effort, "medium"))
+        params->reasoning_effort = CONVERSATION_REASONING_MEDIUM;
+    else if (!strcmp(effort, "high"))
+        params->reasoning_effort = CONVERSATION_REASONING_HIGH;
+    else if (!strcmp(effort, "max"))
+        params->reasoning_effort = CONVERSATION_REASONING_MAX;
+    else
+        return 0;
+    const json_value *budget = json_member(v, "budget_tokens");
+    if (budget) {
+        if (budget->type != JSON_NUMBER || budget->number < 0 ||
+            budget->number > INT32_MAX ||
+            (double)(int32_t)budget->number != budget->number)
+            return 0;
+        params->reasoning_budget_set = 1;
+        params->reasoning_budget = (int32_t)budget->number;
+    }
+    const char *history = serve_str(v, "history");
+    if (history) {
+        params->reasoning_history_set = 1;
+        if (!strcmp(history, "discard"))
+            params->reasoning_history = CONVERSATION_REASONING_DISCARD;
+        else if (!strcmp(history, "preserve_tool_calls"))
+            params->reasoning_history =
+                CONVERSATION_REASONING_PRESERVE_TOOL_CALLS;
+        else
+            return 0;
+    }
+    return 1;
 }
 
 static int serve_ckpt_noteworthy(const wire_checkpoint_report *r) {
@@ -593,6 +649,11 @@ static void serve_emit_event(serve *s, serve_conn *c,
         json_string(out, (const char *)event->text, event->text_length);
         json_raw(out, "}");
         break;
+    case WIRE_EVENT_REASONING_DELTA:
+        json_raw(out, "{\"event\":\"reasoning_delta\",\"text\":");
+        json_string(out, (const char *)event->text, event->text_length);
+        json_raw(out, "}");
+        break;
     case WIRE_EVENT_TOOLCALL_START:
         json_raw(out, "{\"event\":\"toolcall_start\",\"id\":");
         json_u64(out, event->call_id);
@@ -618,11 +679,21 @@ static void serve_emit_event(serve *s, serve_conn *c,
         json_u64(out, event->usage.cache_read);
         json_raw(out, ",\"output\":");
         json_u64(out, event->usage.output);
+        json_raw(out, ",\"reasoning\":");
+        json_u64(out, event->usage.reasoning);
+        json_raw(out, ",\"replayed\":");
+        json_u64(out, event->usage.replayed);
         json_raw(out, ",\"total\":");
         json_u64(out, event->usage.total);
         json_raw(out, "},\"marker\":");
         if (event->marker == WIRE_MARKER_NONE) json_raw(out, "null");
         else json_u64(out, event->marker);
+        if (event->reasoning_close != CONVERSATION_REASONING_NONE) {
+            const char *close = serve_reasoning_close_name(
+                event->reasoning_close);
+            json_raw(out, ",\"reasoning_close\":");
+            json_string(out, close, strlen(close));
+        }
         if (event->checkpoint_attempted) {
             const char *reason = wire_ckpt_reason_name(event->checkpoint.reason);
             serve_log_checkpoint("autosave", &event->checkpoint);
@@ -695,6 +766,10 @@ static int serve_dispatch(serve *s, serve_conn *c,
         json_u64(out, (uint64_t)s->max_frame);
         json_raw(out, ",\"kvstore\":");
         json_raw(out, info.kvstore ? "true" : "false");
+        json_raw(out, ",\"reasoning\":{\"efforts\":[\"low\","
+                      "\"medium\",\"high\",\"max\"],\"history\":["
+                      "\"discard\",\"preserve_tool_calls\"],"
+                      "\"budget_tokens\":true}");
         json_raw(out, "}");
         serve_emit(s, c);
         return 0;
@@ -877,7 +952,11 @@ static int serve_dispatch(serve *s, serve_conn *c,
     }
     if (!strcmp(op, "generate")) {
         wire_gen_params params;
-        serve_params_parse(request, &params);
+        if (!serve_params_parse(request, &params)) {
+            serve_error(s, c, WIRE_INVALID_ARGUMENT,
+                        "invalid reasoning settings");
+            return 0;
+        }
         status = wire_generate(s->w, &params);
         if (status != WIRE_OK) {
             serve_wire_error(s, c, status);
@@ -900,7 +979,13 @@ static int serve_dispatch(serve *s, serve_conn *c,
             return 0;
         }
         wire_gen_params params;
-        serve_params_parse(request, &params);
+        if (!serve_params_parse(request, &params)) {
+            serve_tools_free(&tools);
+            serve_messages_free(&messages);
+            serve_error(s, c, WIRE_INVALID_ARGUMENT,
+                        "invalid reasoning settings");
+            return 0;
+        }
         status = wire_ephemeral_generate(s->w, serve_str(request, "system"),
                                          tools.tools, tools.count,
                                          messages.items, messages.count,
@@ -1028,6 +1113,11 @@ static int serve_dispatch(serve *s, serve_conn *c,
             json_raw(out, ",\"text\":");
             json_string(out, entry.text ? entry.text : "",
                         entry.text_length);
+            if (entry.reasoning) {
+                json_raw(out, ",\"reasoning\":");
+                json_string(out, entry.reasoning,
+                            entry.reasoning_length);
+            }
             if (entry.extra_json) {
                 json_raw(out, ",\"extra\":");
                 json_rawn(out, entry.extra_json, entry.extra_length);

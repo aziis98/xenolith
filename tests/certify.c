@@ -371,7 +371,7 @@ static int stage_chat_prompt(xe_engine *e) {
 
     xe_tokens transcript = {0};
     profile_render render;
-    ok = ok && profile_render_system(p, NULL, NULL, 0, &render)
+    ok = ok && profile_render_system(p, NULL, NULL, 0, 0, &render)
                == PROFILE_OK;
     for (uint32_t i = 0; ok && i < render.token_count; i++)
         xe_tokens_push(&transcript, render.tokens[i]);
@@ -380,7 +380,8 @@ static int stage_chat_prompt(xe_engine *e) {
                == PROFILE_OK;
     for (uint32_t i = 0; ok && i < render.token_count; i++)
         xe_tokens_push(&transcript, render.tokens[i]);
-    ok = ok && profile_render_reply_open(p, PROFILE_TURN_PADDED, &render)
+    ok = ok && profile_render_reply_open(p, PROFILE_TURN_PADDED, 0, 0,
+                                         &render)
                == PROFILE_OK;
     for (uint32_t i = 0; ok && i < render.token_count; i++)
         xe_tokens_push(&transcript, render.tokens[i]);
@@ -397,7 +398,8 @@ static int stage_chat_prompt(xe_engine *e) {
                == PROFILE_OK;
     for (uint32_t i = 0; ok && i < render.token_count; i++)
         xe_tokens_push(&transcript, render.tokens[i]);
-    ok = ok && profile_render_reply_open(p, PROFILE_TURN_PADDED, &render)
+    ok = ok && profile_render_reply_open(p, PROFILE_TURN_PADDED, 0, 0,
+                                         &render)
                == PROFILE_OK;
     for (uint32_t i = 0; ok && i < render.token_count; i++)
         xe_tokens_push(&transcript, render.tokens[i]);

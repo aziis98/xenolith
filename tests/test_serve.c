@@ -381,6 +381,10 @@ int main(int argc, char **argv) {
     CHECK(strstr(line, "\"ok\":true") != NULL);
     CHECK(strstr(line, "\"protocol\":1") != NULL);
     CHECK(strstr(line, "\"kvstore\":true") != NULL);
+    CHECK(strstr(line, "\"reasoning\":{\"efforts\":[\"low\","
+                       "\"medium\",\"high\",\"max\"]") != NULL);
+    CHECK(strstr(line, "minimal") == NULL);
+    CHECK(strstr(line, "xhigh") == NULL);
 
     CHECK(client_call(&b, "{\"op\":\"append\",\"role\":\"user\","
                           "\"text\":\"no session\"}\n", line, sizeof line));
@@ -430,6 +434,30 @@ int main(int argc, char **argv) {
     CHECK(client_call(&a, "{\"op\":\"create\",\"system\":\"A2\"}\n", line,
                       sizeof line));
     CHECK(session_of(line, session_a));
+    CHECK(client_call(&a, "{\"op\":\"generate\",\"reasoning\":true}\n",
+                      line, sizeof line));
+    CHECK(strstr(line, "\"code\":\"invalid_request\"") != NULL);
+    CHECK(client_call(&a, "{\"op\":\"generate\",\"reasoning\":"
+                          "{\"effort\":\"minimal\"}}\n",
+                      line, sizeof line));
+    CHECK(strstr(line, "\"code\":\"invalid_request\"") != NULL);
+    CHECK(client_call(&a, "{\"op\":\"generate\",\"reasoning\":"
+                          "{\"effort\":\"xhigh\"}}\n",
+                      line, sizeof line));
+    CHECK(strstr(line, "\"code\":\"invalid_request\"") != NULL);
+    CHECK(client_call(&a, "{\"op\":\"generate\",\"reasoning\":"
+                          "{\"effort\":\"low\","
+                          "\"budget_tokens\":3.5}}\n",
+                      line, sizeof line));
+    CHECK(strstr(line, "\"code\":\"invalid_request\"") != NULL);
+    CHECK(client_call(&a, "{\"op\":\"rebuild\",\"system\":\"A2\","
+                          "\"messages\":[{\"role\":\"user\","
+                          "\"text\":\"q\"},{\"role\":\"assistant\","
+                          "\"text\":\"a\",\"reasoning\":\"r\"}]}\n",
+                      line, sizeof line));
+    CHECK(strstr(line, "\"ok\":true") != NULL);
+    CHECK(client_call(&a, "{\"op\":\"history\"}\n", line, sizeof line));
+    CHECK(strstr(line, "\"reasoning\":\"r\"") != NULL);
 
     for (int i = 0; i < 8; i++) {
         snprintf(request, sizeof request,

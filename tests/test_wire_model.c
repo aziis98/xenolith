@@ -26,11 +26,14 @@ int kvstore_fault(const char *point) {
 typedef struct {
     char text[16384];
     size_t text_length;
+    char reasoning[16384];
+    size_t reasoning_length;
     uint64_t call_ids[8];
     char call_names[8][64];
     char call_args[8][4096];
     size_t calls;
     uint32_t stop;
+    uint32_t reasoning_close;
     wire_usage usage;
     wire_marker marker;
     int error;
@@ -69,6 +72,15 @@ static void run_generation(wire *w, run_result *out, int cancel_after_text) {
                 cancel_after_text = 0;
             }
             break;
+        case WIRE_EVENT_REASONING_DELTA:
+            if (out->reasoning_length + event.text_length <
+                sizeof out->reasoning - 1) {
+                memcpy(out->reasoning + out->reasoning_length, event.text,
+                       event.text_length);
+                out->reasoning_length += event.text_length;
+                out->reasoning[out->reasoning_length] = '\0';
+            }
+            break;
         case WIRE_EVENT_TOOLCALL_END:
             if (out->calls < 8) {
                 out->call_ids[out->calls] = event.call_id;
@@ -81,6 +93,7 @@ static void run_generation(wire *w, run_result *out, int cancel_after_text) {
             break;
         case WIRE_EVENT_DONE:
             out->stop = event.stop;
+            out->reasoning_close = event.reasoning_close;
             out->usage = event.usage;
             out->marker = event.marker;
             out->checkpoint_attempted = event.checkpoint_attempted;
@@ -152,7 +165,13 @@ int main(int argc, char **argv) {
     CHECK(wire_session_create(w, "You are a helpful assistant with tools.",
                               &weather, 1, &id, &marker) == WIRE_OK);
 
-    wire_gen_params params = { 1.0f, 1, 1.0f, 300, 42 };
+    wire_gen_params params = {
+        .temperature = 1.0f,
+        .top_k = 1,
+        .top_p = 1.0f,
+        .max_tokens = 300,
+        .rng_seed = 42
+    };
     wire_message user;
     memset(&user, 0, sizeof user);
     user.kind = WIRE_MESSAGE_USER;
@@ -181,7 +200,12 @@ int main(int argc, char **argv) {
     CHECK(wire_append(w, &result, &result_marker) == WIRE_OK);
     CHECK(wire_pending_calls(w, NULL, 0) == 0);
 
-    wire_gen_params greedy = { 1.0f, 1, 1.0f, 300, 0 };
+    wire_gen_params greedy = {
+        .temperature = 1.0f,
+        .top_k = 1,
+        .top_p = 1.0f,
+        .max_tokens = 300
+    };
     CHECK(wire_generate(w, &greedy) == WIRE_OK);
     run_result turn2;
     run_generation(w, &turn2, 0);
@@ -287,7 +311,12 @@ int main(int argc, char **argv) {
     CHECK(wire_session_open(w, &id, &after_cancel) == WIRE_OK);
     CHECK(after_cancel.turn_open == 1);
 
-    wire_gen_params tiny = { 1.0f, 1, 1.0f, 30, 0 };
+    wire_gen_params tiny = {
+        .temperature = 1.0f,
+        .top_k = 1,
+        .top_p = 1.0f,
+        .max_tokens = 30
+    };
     user.text = "Never mind, just say bye.";
     CHECK(wire_append(w, &user, &marker) == WIRE_OK);
     CHECK(wire_generate(w, &tiny) == WIRE_OK);
@@ -301,7 +330,12 @@ int main(int argc, char **argv) {
     memset(&hello, 0, sizeof hello);
     hello.kind = WIRE_MESSAGE_USER;
     hello.text = "Say hello.";
-    wire_gen_params eph_params = { 1.0f, 1, 1.0f, 16, 0 };
+    wire_gen_params eph_params = {
+        .temperature = 1.0f,
+        .top_k = 1,
+        .top_p = 1.0f,
+        .max_tokens = 16
+    };
     CHECK(wire_ephemeral_generate(w, "You answer with one short word.",
                                   NULL, 0, &hello, 1, &eph_params)
           == WIRE_OK);
@@ -312,6 +346,61 @@ int main(int argc, char **argv) {
     CHECK(ephemeral.usage.total > 0);
     CHECK(wire_session_open(w, &id, &report) == WIRE_OK);
     CHECK(report.token_count > tokens_before);
+
+    conversation_id thinking_id;
+    CHECK(wire_session_create(w, "Solve carefully and answer clearly.",
+                              NULL, 0, &thinking_id, &marker) == WIRE_OK);
+    user.text = "Calculate 137 times 29. Think step by step, then give the "
+                "number in the final answer.";
+    CHECK(wire_append(w, &user, &marker) == WIRE_OK);
+    wire_gen_params thinking = {
+        .temperature = 1.0f,
+        .top_k = 1,
+        .top_p = 1.0f,
+        .max_tokens = 300,
+        .reasoning_set = 1,
+        .reasoning_effort = CONVERSATION_REASONING_LOW,
+        .reasoning_budget_set = 1,
+        .reasoning_budget = 12
+    };
+    CHECK(wire_generate(w, &thinking) == WIRE_OK);
+    run_result thought;
+    run_generation(w, &thought, 0);
+    CHECK(!thought.error);
+    CHECK(thought.stop == WIRE_STOP_STOP ||
+          thought.stop == WIRE_STOP_LENGTH);
+    CHECK(thought.reasoning_length > 0);
+    CHECK(thought.text_length > 0);
+    CHECK(thought.usage.reasoning > 0 && thought.usage.reasoning <= 12);
+    CHECK(thought.usage.output > thought.usage.reasoning);
+    CHECK(thought.reasoning_close == CONVERSATION_REASONING_NATURAL ||
+          thought.reasoning_close == CONVERSATION_REASONING_SOFT ||
+          thought.reasoning_close == CONVERSATION_REASONING_HARD);
+    uint64_t history_count = wire_history_count(w);
+    wire_history_entry entry;
+    CHECK(wire_history_at(w, history_count - 1, &entry) == WIRE_OK);
+    CHECK(entry.reasoning_length == thought.reasoning_length &&
+          memcmp(entry.reasoning, thought.reasoning,
+                 thought.reasoning_length) == 0);
+
+    user.text = "What is 2 plus 2? Answer with just the number.";
+    CHECK(wire_append(w, &user, &marker) == WIRE_OK);
+    wire_gen_params constrained = {
+        .temperature = 1.0f,
+        .top_k = 1,
+        .top_p = 1.0f,
+        .max_tokens = 24,
+        .reasoning_set = 1,
+        .reasoning_effort = CONVERSATION_REASONING_MEDIUM
+    };
+    CHECK(wire_generate(w, &constrained) == WIRE_OK);
+    run_result short_answer;
+    run_generation(w, &short_answer, 0);
+    CHECK(!short_answer.error);
+    CHECK(short_answer.text_length > 0);
+    CHECK(short_answer.usage.reasoning == 0);
+    CHECK(short_answer.reasoning_close == CONVERSATION_REASONING_HARD);
+    CHECK(thought.usage.replayed + short_answer.usage.replayed > 0);
 
     wire_close(w);
     xe_engine_close(e);
@@ -351,6 +440,7 @@ int main(int argc, char **argv) {
              output_path, ndjson_dir);
     CHECK(system(command) == 0);
     CHECK(file_contains(output_path, "\"ok\":true"));
+    CHECK(file_contains(output_path, "\"reasoning\":{\"efforts\""));
     CHECK(file_contains(output_path, "\"event\":\"start\""));
     CHECK(file_contains(output_path, "\"event\":\"toolcall_end\""));
     CHECK(file_contains(output_path, "\"name\":\"get_weather\""));

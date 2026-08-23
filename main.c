@@ -383,7 +383,7 @@ static int cmd_chat(const char *model, int argc, char **argv) {
     uint32_t turn = PROFILE_TURN_PADDED;
     profile_render render;
 
-    if (profile_render_system(pf, NULL, NULL, 0, &render) != PROFILE_OK) {
+    if (profile_render_system(pf, NULL, NULL, 0, 0, &render) != PROFILE_OK) {
         fprintf(stderr, "xenolith: chat: render failed\n");
         exit(1);
     }
@@ -408,7 +408,8 @@ static int cmd_chat(const char *model, int argc, char **argv) {
         }
         for (uint32_t i = 0; i < render.token_count; i++)
             xe_tokens_push(&transcript, render.tokens[i]);
-        if (profile_render_reply_open(pf, PROFILE_TURN_PADDED, &render)
+        if (profile_render_reply_open(pf, PROFILE_TURN_PADDED, 0, 0,
+                                      &render)
                 != PROFILE_OK ||
             transcript.len + (int)render.token_count >= ctx - 1) {
             fprintf(stderr, "xenolith: chat: conversation exceeds context capacity\n");

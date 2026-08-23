@@ -30,6 +30,7 @@ typedef struct {
     int context_window;
     int max_output;
     int kvstore;            /* 1 when the snapshot store opened */
+    int reasoning;
 } wire_info;
 
 /* Why a checkpoint did not save. Checkpoints are never fatal (the
@@ -82,6 +83,7 @@ typedef enum {
 typedef struct {
     uint32_t kind;
     const char *text;
+    const char *reasoning;
     uint64_t call_id;
     uint32_t tool_status;
     const char *tool_name;
@@ -95,6 +97,12 @@ typedef struct {
     float top_p;
     int32_t max_tokens;
     uint64_t rng_seed;
+    int reasoning_set;
+    uint32_t reasoning_effort;
+    int reasoning_history_set;
+    uint32_t reasoning_history;
+    int reasoning_budget_set;
+    int32_t reasoning_budget;
 } wire_gen_params;
 
 typedef struct {
@@ -102,6 +110,8 @@ typedef struct {
     uint64_t cache_read;
     uint64_t output;
     uint64_t total;
+    uint64_t reasoning;
+    uint64_t replayed;
 } wire_usage;
 
 typedef enum {
@@ -111,7 +121,8 @@ typedef enum {
     WIRE_EVENT_TOOLCALL_START = 4,
     WIRE_EVENT_TOOLCALL_END = 5,
     WIRE_EVENT_DONE = 6,
-    WIRE_EVENT_ERROR = 7
+    WIRE_EVENT_ERROR = 7,
+    WIRE_EVENT_REASONING_DELTA = 8
 } wire_event_kind;
 
 typedef enum {
@@ -131,6 +142,7 @@ typedef struct {
     uint64_t prefilled;
     uint64_t prefill_total;
     uint32_t stop;
+    uint32_t reasoning_close;
     wire_usage usage;
     wire_marker marker;
     uint32_t error;
@@ -157,6 +169,8 @@ typedef struct {
     uint32_t role;
     const char *text;
     uint64_t text_length;
+    const char *reasoning;
+    uint64_t reasoning_length;
     const char *extra_json;
     uint64_t extra_length;
     uint64_t call_id;

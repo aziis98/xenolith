@@ -612,6 +612,7 @@ static profile_status prof_declaration(profile *p,
 profile_status profile_render_system(profile *p, const char *text,
                                      const profile_tool *tools,
                                      size_t tool_count,
+                                     int thinking,
                                      profile_render *out) {
     if (!p || !out || (tool_count && !tools))
         return PROFILE_INVALID_ARGUMENT;
@@ -620,11 +621,15 @@ profile_status profile_render_system(profile *p, const char *text,
     const char *begin = "";
     size_t length = 0;
     if (text) prof_trim(text, &begin, &length);
-    if (length || tool_count) {
+    if (thinking || length || tool_count) {
         if (!prof_marker(p, PROFILE_ID_TURN_BEGIN) ||
-            !prof_run_text(p, "system\n") ||
-            !prof_run_put(p, begin, length))
+            !prof_run_text(p, "system\n"))
             return PROFILE_NOMEM;
+        if (thinking &&
+            (!prof_marker(p, PROFILE_ID_THINK) ||
+             !prof_run_text(p, "\n")))
+            return PROFILE_NOMEM;
+        if (!prof_run_put(p, begin, length)) return PROFILE_NOMEM;
         for (size_t i = 0; i < tool_count; i++) {
             profile_status status = prof_declaration(p, &tools[i]);
             if (status != PROFILE_OK) return status;
@@ -690,17 +695,17 @@ static profile_status prof_model_open(profile *p, uint32_t turn) {
     profile_status status = prof_prefix(p, turn);
     if (status != PROFILE_OK) return status;
     if (!prof_marker(p, PROFILE_ID_TURN_BEGIN) ||
-        !prof_run_text(p, "model\n") ||
-        !prof_marker(p, PROFILE_ID_CHANNEL_BEGIN) ||
-        !prof_run_text(p, "thought\n") ||
-        !prof_marker(p, PROFILE_ID_CHANNEL_END))
+        !prof_run_text(p, "model\n"))
         return PROFILE_NOMEM;
     return PROFILE_OK;
 }
 
-profile_status profile_render_assistant(profile *p, const char *text,
+profile_status profile_render_assistant(profile *p, const char *reasoning,
+                                        int reasoning_complete,
+                                        const char *text,
                                         const profile_call *calls,
                                         size_t call_count, uint32_t turn,
+                                        int turn_complete,
                                         profile_render *out) {
     if (!p || !out || (call_count && !calls))
         return PROFILE_INVALID_ARGUMENT;
@@ -708,6 +713,19 @@ profile_status profile_render_assistant(profile *p, const char *text,
     if (turn != PROFILE_TURN_OPEN) {
         profile_status status = prof_model_open(p, turn);
         if (status != PROFILE_OK) return status;
+    }
+    if (reasoning) {
+        const char *begin;
+        size_t length;
+        prof_trim(reasoning, &begin, &length);
+        if (!prof_marker(p, PROFILE_ID_CHANNEL_BEGIN) ||
+            !prof_run_text(p, "thought\n") ||
+            !prof_run_put(p, begin, length))
+            return PROFILE_NOMEM;
+        if (reasoning_complete &&
+            (!prof_run_text(p, "\n") ||
+             !prof_marker(p, PROFILE_ID_CHANNEL_END)))
+            return PROFILE_NOMEM;
     }
     if (text) {
         const char *begin;
@@ -736,12 +754,14 @@ profile_status profile_render_assistant(profile *p, const char *text,
         }
         if (!prof_marker(p, PROFILE_ID_CALL_END)) return PROFILE_NOMEM;
     }
-    if (!call_count && !prof_marker(p, PROFILE_ID_TURN_END))
+    if (turn_complete && !call_count &&
+        !prof_marker(p, PROFILE_ID_TURN_END))
         return PROFILE_NOMEM;
     return prof_finish(p, out);
 }
 
 profile_status profile_render_reply_open(profile *p, uint32_t turn,
+                                         int thinking, int after_tool,
                                          profile_render *out) {
     if (!p || !out) return PROFILE_INVALID_ARGUMENT;
     prof_begin(p);
@@ -749,11 +769,19 @@ profile_status profile_render_reply_open(profile *p, uint32_t turn,
         profile_status status = prof_model_open(p, turn);
         if (status != PROFILE_OK) return status;
     }
+    if ((!thinking && turn != PROFILE_TURN_OPEN) ||
+        (thinking && after_tool)) {
+        if (!prof_marker(p, PROFILE_ID_CHANNEL_BEGIN) ||
+            !prof_run_text(p, "thought\n"))
+            return PROFILE_NOMEM;
+        if (!thinking && !prof_marker(p, PROFILE_ID_CHANNEL_END))
+            return PROFILE_NOMEM;
+    }
     return prof_finish(p, out);
 }
 
-void profile_parser_reset(profile *p) {
-    p->state = PROFILE_PS_CONTENT;
+void profile_parser_reset(profile *p, int reasoning_open) {
+    p->state = reasoning_open ? PROFILE_PS_THOUGHT : PROFILE_PS_CONTENT;
     p->in_string = 0;
     p->calls_done = 0;
     p->scan_length = 0;
@@ -764,6 +792,58 @@ void profile_parser_reset(profile *p) {
 
 size_t profile_parser_calls(const profile *p) {
     return p->calls_done;
+}
+
+int profile_parser_reasoning(const profile *p) {
+    return p && p->state == PROFILE_PS_THOUGHT;
+}
+
+int32_t profile_reasoning_end_token(const profile *p) {
+    (void)p;
+    return PROFILE_ID_CHANNEL_END;
+}
+
+profile_status profile_get_reasoning_policy(
+        const profile *p, uint32_t effort, int32_t budget_override,
+        int32_t max_tokens, int32_t context_remaining,
+        profile_reasoning_policy *out) {
+    if (!p || !out || effort > PROFILE_REASONING_MAX ||
+        budget_override < -1 || max_tokens < 0 || context_remaining < 0)
+        return PROFILE_INVALID_ARGUMENT;
+    int hard = -1;
+    int window = 0;
+    switch (effort) {
+    case PROFILE_REASONING_LOW:
+        hard = 128;
+        window = 32;
+        break;
+    case PROFILE_REASONING_MEDIUM:
+        hard = 512;
+        window = 128;
+        break;
+    case PROFILE_REASONING_HIGH:
+        hard = 2048;
+        window = 512;
+        break;
+    case PROFILE_REASONING_MAX:
+        hard = context_remaining;
+        window = 512;
+        break;
+    default:
+        break;
+    }
+    if (hard >= 0 && budget_override >= 0) hard = budget_override;
+    if (hard >= 0) {
+        int available = context_remaining;
+        if (max_tokens > 0 && max_tokens < available) available = max_tokens;
+        available = available > 256 ? available - 256 : 0;
+        if (hard > available) hard = available;
+    }
+    out->hard_tokens = hard;
+    out->soft_tokens = hard >= 0 && hard > window ? hard - window : 0;
+    out->delimiter_rank = 3;
+    out->delimiter_margin = 3.0f;
+    return PROFILE_OK;
 }
 
 static int prof_scan_put(profile *p, const char *data, size_t length) {
@@ -1000,12 +1080,27 @@ profile_status profile_parser_feed(profile *p, int32_t token,
         }
         if (p->scan_length >= header_length) {
             p->state = PROFILE_PS_THOUGHT;
-            p->scan_length = 0;
+            size_t remaining = p->scan_length - header_length;
+            if (remaining) {
+                memmove(p->scan, p->scan + header_length, remaining);
+                p->scan_length = remaining;
+                out->kind = PROFILE_PARSE_REASONING;
+                out->text = (const uint8_t *)p->scan;
+                out->text_length = remaining;
+            } else {
+                p->scan_length = 0;
+            }
         }
         return PROFILE_OK;
     }
     case PROFILE_PS_THOUGHT:
-        if (token == PROFILE_ID_CHANNEL_END) p->state = PROFILE_PS_CONTENT;
+        if (token == PROFILE_ID_CHANNEL_END) {
+            p->state = PROFILE_PS_CONTENT;
+        } else if (detok > 0) {
+            out->kind = PROFILE_PARSE_REASONING;
+            out->text = (const uint8_t *)p->detok;
+            out->text_length = (size_t)detok;
+        }
         return PROFILE_OK;
     case PROFILE_PS_NAME: {
         static const char keyword[] = "call:";
