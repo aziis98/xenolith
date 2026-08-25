@@ -23,7 +23,7 @@ static void usage(void) {
 "  run      -p \"prompt\" [-n max] [--temp F] [--top-k N] [--top-p F] [--seed S]\n"
 "  chat     [-n max] [--temp F] [--top-k N] [--top-p F] [--seed S]\n"
 "  oracle   -t \"id,id,id\" [-o logits.bin] [--layers dir] [--q8]\n"
-"  bench    [-p N] [-n N] [-r N] [--delay S] [--no-warmup] [--progress] [-o md|jsonl]\n"
+"  bench    [-p N] [-n N] [-d N] [-r N] [--delay S] [--no-warmup] [--progress] [-o md|jsonl]\n"
 "  wire     [--state DIR] [--cache DIR]\n"
 "  serve    [--state DIR] [--cache DIR] [--socket PATH] [--idle-shutdown MIN]\n");
     exit(1);
@@ -516,6 +516,7 @@ static int cmd_oracle(const char *model, int argc, char **argv) {
 typedef struct {
     int n_prompt;
     int n_gen;
+    int n_depth;
     int reps;
     int delay;
     int warmup;
@@ -526,6 +527,7 @@ typedef struct {
 typedef struct {
     int n_prompt;
     int n_gen;
+    int n_depth;
     const char *backend;
     char test_time[32];
     uint64_t *samples_ns;
@@ -553,19 +555,25 @@ static void bench_time(char out[32]) {
     strftime(out, 32, "%FT%TZ", &tm);
 }
 
-static void bench_prompt(xe_engine *e, xe_session *s, int32_t *tokens, int n) {
-    tokens[0] = xe_bos_id(e);
-    for (int i = 1; i < n; i++) tokens[i] = rand() % 262144;
-    xe_tokens prefix = { tokens, n, n };
+static void bench_prompt(xe_engine *e, xe_session *s, int32_t *tokens,
+                         int offset, int n) {
+    int first = 0;
+    if (!offset) {
+        tokens[0] = xe_bos_id(e);
+        first = 1;
+    }
+    for (int i = first; i < n; i++) tokens[offset + i] = rand() % 262144;
+    xe_tokens prefix = { tokens, offset + n, offset + n };
     xe_session_sync(s, &prefix);
 }
 
-static void bench_gen(xe_engine *e, xe_session *s, int32_t *tokens, int n) {
-    xe_tokens prefix = { tokens, 0, n };
-    int32_t token = xe_bos_id(e);
+static void bench_gen(xe_engine *e, xe_session *s, int32_t *tokens,
+                      int offset, int n) {
+    xe_tokens prefix = { tokens, offset, offset + n };
+    int32_t token = offset ? rand() % 262144 : xe_bos_id(e);
     for (int i = 0; i < n; i++) {
-        tokens[i] = token;
-        prefix.len = i + 1;
+        tokens[offset + i] = token;
+        prefix.len = offset + i + 1;
         xe_session_sync(s, &prefix);
         token = rand() % 262144;
     }
@@ -573,9 +581,11 @@ static void bench_gen(xe_engine *e, xe_session *s, int32_t *tokens, int n) {
 
 static bench_result bench_run(xe_engine *e, const bench_params *params,
                               int n_prompt, int n_gen, const char *backend) {
-    bench_result result = { n_prompt, n_gen, backend, {0}, NULL, params->reps };
-    int n = n_prompt ? n_prompt : n_gen;
-    int32_t *tokens = malloc((size_t)n * sizeof(*tokens));
+    bench_result result = { n_prompt, n_gen, params->n_depth, backend,
+                            {0}, NULL, params->reps };
+    int measured = n_prompt ? n_prompt : n_gen;
+    int total = params->n_depth + measured;
+    int32_t *tokens = malloc((size_t)total * sizeof(*tokens));
     result.samples_ns = malloc((size_t)params->reps * sizeof(*result.samples_ns));
     if (!tokens || !result.samples_ns) {
         fprintf(stderr, "xenolith: bench: out of memory\n");
@@ -586,25 +596,29 @@ static bench_result bench_run(xe_engine *e, const bench_params *params,
     if (params->delay) sleep((unsigned)params->delay);
     if (params->warmup) {
         if (params->progress)
-            fprintf(stderr, "xenolith: bench: %s%d warmup\n", n_prompt ? "pp" : "tg", n);
+            fprintf(stderr, "xenolith: bench: %s%d warmup\n",
+                    n_prompt ? "pp" : "tg", measured);
         xe_session_reset(s);
         if (n_prompt)
-            bench_prompt(e, s, tokens, n);
+            bench_prompt(e, s, tokens, 0, measured);
         else
-            bench_gen(e, s, tokens, 1);
+            bench_gen(e, s, tokens, 0, 1);
     }
 
     bench_time(result.test_time);
     for (int rep = 0; rep < params->reps; rep++) {
         if (params->progress)
-            fprintf(stderr, "xenolith: bench: %s%d run %d/%d\n",
-                    n_prompt ? "pp" : "tg", n, rep + 1, params->reps);
+            fprintf(stderr, "xenolith: bench: %s%d depth %d run %d/%d\n",
+                    n_prompt ? "pp" : "tg", measured, params->n_depth,
+                    rep + 1, params->reps);
         xe_session_reset(s);
+        if (params->n_depth)
+            bench_prompt(e, s, tokens, 0, params->n_depth);
         uint64_t start = bench_now_ns();
         if (n_prompt)
-            bench_prompt(e, s, tokens, n);
+            bench_prompt(e, s, tokens, params->n_depth, measured);
         else
-            bench_gen(e, s, tokens, n);
+            bench_gen(e, s, tokens, params->n_depth, measured);
         result.samples_ns[rep] = bench_now_ns() - start;
     }
 
@@ -699,8 +713,8 @@ static void bench_print_jsonl(const char *model, const xe_engine *e,
     bench_json_string(result->backend);
     printf(",\"n_threads\":%d,\"cpu_mask\":", xe_engine_worker_count(e));
     bench_json_string(mask);
-    printf(",\"n_prompt\":%d,\"n_gen\":%d,\"n_depth\":0,\"test_time\":",
-           result->n_prompt, result->n_gen);
+    printf(",\"n_prompt\":%d,\"n_gen\":%d,\"n_depth\":%d,\"test_time\":",
+           result->n_prompt, result->n_gen, result->n_depth);
     bench_json_string(result->test_time);
     printf(",\"avg_ns\":%.0f,\"stddev_ns\":%.0f,\"avg_ts\":%.6f,\"stddev_ts\":%.6f,\"samples_ns\":[",
            bench_avg_ns(result), bench_stddev_ns(result),
@@ -719,8 +733,14 @@ static void bench_print_md(const char *model, const xe_engine *e,
     const char *base = strrchr(model, '/');
     base = base ? base + 1 : model;
     char test[64];
-    snprintf(test, sizeof test, "%s%d", result->n_prompt ? "pp" : "tg",
-             result->n_prompt + result->n_gen);
+    if (result->n_depth)
+        snprintf(test, sizeof test, "%s%d@d%d",
+                 result->n_prompt ? "pp" : "tg",
+                 result->n_prompt + result->n_gen, result->n_depth);
+    else
+        snprintf(test, sizeof test, "%s%d",
+                 result->n_prompt ? "pp" : "tg",
+                 result->n_prompt + result->n_gen);
     printf("| %-42s | %-10s | %7d | %8s | %9.2f ± %-9.2f |\n",
            base, result->backend, xe_engine_worker_count(e), test,
            bench_avg_ts(result), bench_stddev_ts(result));
@@ -728,7 +748,7 @@ static void bench_print_md(const char *model, const xe_engine *e,
 }
 
 static int cmd_bench(const char *model, int argc, char **argv) {
-    bench_params params = { 512, 128, 5, 0, 1, 0, 0 };
+    bench_params params = { 512, 128, 0, 5, 0, 1, 0, 0 };
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--n-prompt")) {
             if (++i >= argc) usage();
@@ -736,6 +756,9 @@ static int cmd_bench(const char *model, int argc, char **argv) {
         } else if (!strcmp(argv[i], "-n") || !strcmp(argv[i], "--n-gen")) {
             if (++i >= argc) usage();
             params.n_gen = bench_int(argv[i], 0, INT_MAX);
+        } else if (!strcmp(argv[i], "-d") || !strcmp(argv[i], "--n-depth")) {
+            if (++i >= argc) usage();
+            params.n_depth = bench_int(argv[i], 0, INT_MAX);
         } else if (!strcmp(argv[i], "-r") || !strcmp(argv[i], "--repetitions")) {
             if (++i >= argc) usage();
             params.reps = bench_int(argv[i], 1, 1000);
@@ -764,7 +787,8 @@ static int cmd_bench(const char *model, int argc, char **argv) {
 
     xe_engine *e = xe_engine_open(model);
     int ctx = xe_context_size(e);
-    if (params.n_prompt > ctx || params.n_gen > ctx) {
+    if (params.n_depth > ctx || params.n_prompt > ctx - params.n_depth ||
+        params.n_gen > ctx - params.n_depth) {
         fprintf(stderr, "xenolith: bench: token count exceeds context capacity %d\n", ctx);
         exit(1);
     }

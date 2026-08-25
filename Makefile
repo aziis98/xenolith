@@ -37,6 +37,7 @@ clean:
 		tests/test_json tests/test_profile tests/test_wire \
 		tests/test_wire_model tests/test_serve tests/test_serve_model \
 		tests/bench_attention tests/bench_tg tests/bench_b3b tests/bench_b3b_8e \
+		tests/bench_guard \
 		tests/bench_b3b.spv tests/bench_b3b_adlp.spv \
 		tests/bench_prefill_gemm tests/bench_prefill_gemm_down \
 		tests/bench_prefill_gemm.spv $(GPU_SPV)
@@ -146,6 +147,9 @@ tests/bench_attention: tests/bench_attention.c xenolith.c xenolith.h format.o $(
 
 tests/bench_tg: tests/bench_tg.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/bench_tg.c format.o $(GPU_OBJ) $(LDLIBS)
+
+tests/bench_guard: tests/bench_guard.c
+	$(CC) $(TEST_CFLAGS) -o $@ $<
 
 tests/bench_b3b: tests/bench_b3b.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/bench_b3b.c format.o $(GPU_OBJ) $(LDLIBS)
