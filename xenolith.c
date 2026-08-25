@@ -61,7 +61,10 @@ size_t xe_test_output_calls;
 #define XE_LAYERS 30
 #define XE_EMBD 2816
 #define XE_VOCAB 262144
-#define XE_CTX 262144
+#define XE_MODEL_CTX 262144
+#ifndef XE_CTX
+#define XE_CTX XE_MODEL_CTX
+#endif
 #define XE_Q_HEADS 16
 #define XE_DENSE_FFN 2112
 #define XE_EXPERTS 128
@@ -102,6 +105,7 @@ size_t xe_test_output_calls;
 #define XE_GLOBAL_LAYER_ELEMS ((size_t)XE_GLOBAL_KV_HEADS * XE_CTX * XE_GLOBAL_HEAD_DIM)
 #define XE_SWA_SLAB_ELEMS ((size_t)25 * XE_SWA_LAYER_ELEMS)
 #define XE_GLOBAL_SLAB_ELEMS ((size_t)5 * XE_GLOBAL_LAYER_ELEMS)
+#define XE_GLOBAL_LAYERS 5
 
 #define XE_IS_GLOBAL(i) ((i) % 6 == 5)
 
@@ -192,6 +196,7 @@ typedef struct {
     ze_kernel_handle_t prefill_qkv_post;
     ze_kernel_handle_t prefill_attn_online_b8;
     ze_kernel_handle_t prefill_attn_online_b8_global_shared;
+    ze_kernel_handle_t prefill_attn_online_b8_global_cow;
     ze_kernel_handle_t prefill_attn_online_b8_swa;
     ze_kernel_handle_t prefill_heads_q8;
     ze_kernel_handle_t prefill_rms_residual;
@@ -291,8 +296,13 @@ struct xe_session {
     xe_engine *engine;
     _Float16 *swa_k;
     _Float16 *swa_v;
+    _Float16 *swa_spare_k;
+    _Float16 *swa_spare_v;
+    uint8_t swa_dirty[XE_SWA_WINDOW];
     _Float16 *global_k;
     _Float16 *global_v;
+    _Float16 *cow_global_k[XE_GLOBAL_LAYERS];
+    _Float16 *cow_global_v[XE_GLOBAL_LAYERS];
     void *workspace;
     size_t workspace_size;
     void *prefill_workspace;
@@ -333,6 +343,14 @@ struct xe_session {
     float *anchor_logits;
     int anchor_position;
     int anchor_valid;
+    xe_session *cow_source;
+    int cow;
+    int cow_split;
+    int cow_capacity;
+    int prefill_pending;
+    int prefill_pending_start;
+    int prefill_pending_rows;
+    float *prefill_pending_hidden;
 };
 
 extern const unsigned char _binary_xenolith_gpu_spv_start[];
@@ -450,7 +468,7 @@ static void xe_gpu_init(xe_engine *e) {
     }
     if (log) xe_ze_check("zeModuleBuildLogDestroy", zeModuleBuildLogDestroy(log));
 
-    const char *prefill_names[39] = {
+    const char *prefill_names[40] = {
         "xe_prefill_rms_scale",
         "xe_prefill_norm_q8",
         "xe_prefill_q4q8_n32",
@@ -467,6 +485,7 @@ static void xe_gpu_init(xe_engine *e) {
         "xe_prefill_qkv_post",
         "xe_prefill_attn_online_b8",
         "xe_prefill_attn_online_b8_global_shared",
+        "xe_prefill_attn_online_b8_global_cow",
         "xe_prefill_attn_online_b8_swa",
         "xe_prefill_heads_q8",
         "xe_prefill_rms_residual",
@@ -491,7 +510,7 @@ static void xe_gpu_init(xe_engine *e) {
         "xe_prefill_route_reduce",
         "xe_prefill_ffn_finish"
     };
-    ze_kernel_handle_t *prefill_handles[39] = {
+    ze_kernel_handle_t *prefill_handles[40] = {
         &e->gpu.prefill_rms_scale,
         &e->gpu.prefill_norm_q8,
         &e->gpu.prefill_q4q8_n32,
@@ -508,6 +527,7 @@ static void xe_gpu_init(xe_engine *e) {
         &e->gpu.prefill_qkv_post,
         &e->gpu.prefill_attn_online_b8,
         &e->gpu.prefill_attn_online_b8_global_shared,
+        &e->gpu.prefill_attn_online_b8_global_cow,
         &e->gpu.prefill_attn_online_b8_swa,
         &e->gpu.prefill_heads_q8,
         &e->gpu.prefill_rms_residual,
@@ -532,12 +552,12 @@ static void xe_gpu_init(xe_engine *e) {
         &e->gpu.prefill_route_reduce,
         &e->gpu.prefill_ffn_finish
     };
-    uint32_t prefill_group_sizes[39] = {
-        128, 128, 128, 128, 256, 256, 256, 256, 256, 256, 256, 256, 256, 128, 128, 128, 128, 128, 128, 256, 256, 128, 128,
+    uint32_t prefill_group_sizes[40] = {
+        128, 128, 128, 128, 256, 256, 256, 256, 256, 256, 256, 256, 256, 128, 128, 128, 128, 128, 128, 128, 256, 256, 128, 128,
         128, 128, 128, 128, 128, 128, 128, 256, 256, 256, 128, 128, 128, 128, 128,
         128
     };
-    for (int i = 0; i < 39; i++) {
+    for (int i = 0; i < 40; i++) {
         ze_kernel_desc_t desc = {
             .stype = ZE_STRUCTURE_TYPE_KERNEL_DESC,
             .pKernelName = prefill_names[i]
@@ -648,6 +668,9 @@ static void xe_gpu_destroy(xe_engine *e) {
     if (e->gpu.prefill_attn_online_b8_global_shared)
         xe_ze_check("zeKernelDestroy prefill attention online b8 global shared",
                     zeKernelDestroy(e->gpu.prefill_attn_online_b8_global_shared));
+    if (e->gpu.prefill_attn_online_b8_global_cow)
+        xe_ze_check("zeKernelDestroy prefill attention online b8 global cow",
+                    zeKernelDestroy(e->gpu.prefill_attn_online_b8_global_cow));
     if (e->gpu.prefill_attn_online_b8_swa)
         xe_ze_check("zeKernelDestroy prefill attention online b8 swa",
                     zeKernelDestroy(e->gpu.prefill_attn_online_b8_swa));
@@ -882,6 +905,45 @@ static void __attribute__((unused)) xe_prefill_attention_online_append(
     }
 }
 
+static void xe_prefill_attention_cow_append(
+        xe_engine *e, const float *q, const _Float16 *prefix_k,
+        const _Float16 *prefix_v, const _Float16 *tail_k,
+        const _Float16 *tail_v, float *output, int rows,
+        int tail_capacity, int query_offset, int split) {
+    ze_kernel_handle_t kernel = e->gpu.prefill_attn_online_b8_global_cow;
+    xe_gpu_pointer_arg(kernel, 0, q);
+    xe_gpu_pointer_arg(kernel, 1, prefix_k);
+    xe_gpu_pointer_arg(kernel, 2, prefix_v);
+    xe_gpu_pointer_arg(kernel, 3, tail_k);
+    xe_gpu_pointer_arg(kernel, 4, tail_v);
+    xe_gpu_pointer_arg(kernel, 5, output);
+    xe_gpu_int_arg(kernel, 6, rows);
+    xe_gpu_int_arg(kernel, 7, XE_CTX);
+    xe_gpu_int_arg(kernel, 8, tail_capacity);
+    xe_gpu_int_arg(kernel, 10, XE_Q_HEADS);
+    xe_gpu_int_arg(kernel, 11, XE_GLOBAL_KV_HEADS);
+    xe_gpu_int_arg(kernel, 12, query_offset);
+    xe_gpu_int_arg(kernel, 14, split);
+    int slice_rows = query_offset >= 8192 ? 256 : rows;
+    for (int query_base = 0; query_base < rows;
+         query_base += slice_rows) {
+        int query_count = rows - query_base;
+        if (query_count > slice_rows) query_count = slice_rows;
+        xe_gpu_int_arg(kernel, 9, query_count);
+        xe_gpu_int_arg(kernel, 13, query_base);
+        ze_group_count_t groups = {
+            (uint32_t)(XE_GLOBAL_KV_HEADS * query_count), 1, 1
+        };
+        xe_ze_check("zeCommandListAppendLaunchKernel prefill attention cow",
+                    zeCommandListAppendLaunchKernel(e->gpu.commands, kernel,
+                                                    &groups, NULL, 0, NULL));
+        if (slice_rows < rows)
+            xe_ze_check("zeCommandListHostSynchronize prefill attention cow slice",
+                        zeCommandListHostSynchronize(e->gpu.commands,
+                                                     UINT64_MAX));
+    }
+}
+
 static void __attribute__((unused)) xe_prefill_heads_q8_append(
         xe_engine *e, const float *heads, xe_q8 *output, int rows,
         int dimension) {
@@ -966,6 +1028,32 @@ static void __attribute__((unused)) xe_prefill_swa_commit_append(
     xe_ze_check("zeCommandListAppendLaunchKernel prefill swa commit",
                 zeCommandListAppendLaunchKernel(e->gpu.commands, kernel,
                                                 &groups, NULL, 0, NULL));
+}
+
+static void xe_prefill_linear_commit_append(
+        xe_engine *e, _Float16 *cache_k, _Float16 *cache_v,
+        const _Float16 *batch_k, const _Float16 *batch_v,
+        int rows, int batch_start, int dimension, int kv_heads,
+        int capacity) {
+    size_t bytes = (size_t)rows * dimension * sizeof(*cache_k);
+    for (int head = 0; head < kv_heads; head++) {
+        _Float16 *target_k = cache_k +
+            ((size_t)head * capacity + batch_start) * dimension;
+        _Float16 *target_v = cache_v +
+            ((size_t)head * capacity + batch_start) * dimension;
+        const _Float16 *source_k = batch_k +
+            (size_t)head * rows * dimension;
+        const _Float16 *source_v = batch_v +
+            (size_t)head * rows * dimension;
+        xe_ze_check("zeCommandListAppendMemoryCopy prefill linear K",
+                    zeCommandListAppendMemoryCopy(e->gpu.commands, target_k,
+                                                  source_k, bytes, NULL,
+                                                  0, NULL));
+        xe_ze_check("zeCommandListAppendMemoryCopy prefill linear V",
+                    zeCommandListAppendMemoryCopy(e->gpu.commands, target_v,
+                                                  source_v, bytes, NULL,
+                                                  0, NULL));
+    }
 }
 
 static void __attribute__((unused)) xe_prefill_ffn_input_append(
@@ -1676,19 +1764,12 @@ static void xe_prefill_attention_qkv_append(
                           !global);
 }
 
-static void xe_prefill_attention_output_append(
-        xe_engine *e, int layer_index, xe_prefill_workspace *w, int rows,
-        const _Float16 *k, const _Float16 *v, int keys, int query_offset,
-        int window) {
-    int global = XE_IS_GLOBAL(layer_index);
-    int dimension = global ? XE_GLOBAL_HEAD_DIM : XE_SWA_HEAD_DIM;
-    int kv_heads = global ? XE_GLOBAL_KV_HEADS : XE_SWA_KV_HEADS;
+static void xe_prefill_attention_project_append(
+        xe_engine *e, int layer_index, xe_prefill_workspace *w, int rows) {
+    int dimension = XE_IS_GLOBAL(layer_index) ? XE_GLOBAL_HEAD_DIM
+                                               : XE_SWA_HEAD_DIM;
     int wide = rows == 512;
     const xe_layer *layer = &e->layers[layer_index];
-    xe_prefill_attention_online_append(e, w->q_heads, k, v,
-                                        w->attention_heads, rows, keys,
-                                        dimension, kv_heads, query_offset,
-                                        window);
     xe_prefill_heads_q8_append(e, w->attention_heads, &w->heads_q8,
                                rows, dimension);
     xe_prefill_projection_append(e, &layer->attn_o, &w->heads_q8,
@@ -1697,6 +1778,20 @@ static void xe_prefill_attention_output_append(
     xe_prefill_rms_residual_append(e, w->attention_projection,
                                     layer->post_attn_norm, w->hidden[0],
                                     w->attention_output, rows, XE_EMBD);
+}
+
+static void xe_prefill_attention_output_append(
+        xe_engine *e, int layer_index, xe_prefill_workspace *w, int rows,
+        const _Float16 *k, const _Float16 *v, int keys, int query_offset,
+        int window) {
+    int global = XE_IS_GLOBAL(layer_index);
+    int dimension = global ? XE_GLOBAL_HEAD_DIM : XE_SWA_HEAD_DIM;
+    int kv_heads = global ? XE_GLOBAL_KV_HEADS : XE_SWA_KV_HEADS;
+    xe_prefill_attention_online_append(e, w->q_heads, k, v,
+                                        w->attention_heads, rows, keys,
+                                        dimension, kv_heads, query_offset,
+                                        window);
+    xe_prefill_attention_project_append(e, layer_index, w, rows);
 }
 
 static void xe_prefill_attention_prepared_append(
@@ -1718,7 +1813,22 @@ static void xe_prefill_attention_batch_append(
     _Float16 *cache_k = xe_kv_layer_ptr(s, layer_index, 0);
     _Float16 *cache_v = xe_kv_layer_ptr(s, layer_index, 1);
     xe_prefill_attention_qkv_append(e, layer_index, w, rows);
-    if (batch_start == 0) {
+    if (global && s->cow) {
+        int slot = layer_index / 6;
+        int local_start = batch_start - s->cow_split;
+        const _Float16 *prefix_k = s->global_k +
+            (size_t)slot * XE_GLOBAL_LAYER_ELEMS;
+        const _Float16 *prefix_v = s->global_v +
+            (size_t)slot * XE_GLOBAL_LAYER_ELEMS;
+        xe_prefill_linear_commit_append(
+            e, cache_k, cache_v, w->k_batch, w->v_batch, rows,
+            local_start, dimension, kv_heads, s->cow_capacity);
+        xe_prefill_attention_cow_append(
+            e, w->q_heads, prefix_k, prefix_v, cache_k, cache_v,
+            w->attention_heads, rows, s->cow_capacity, batch_start,
+            s->cow_split);
+        xe_prefill_attention_project_append(e, layer_index, w, rows);
+    } else if (batch_start == 0) {
         xe_prefill_attention_output_append(
             e, layer_index, w, rows, w->k_batch, w->v_batch, rows, 0,
             global ? 0 : XE_SWA_WINDOW);
@@ -2996,7 +3106,7 @@ static void xe_parse_metadata(xe_engine *e, xe_cur *c, const char *gguf_path) {
 
         XE_REQ_STR("general.architecture", K_ARCH, "gemma4")
         XE_REQ_U32("gemma4.block_count", K_BLOCK_COUNT, XE_LAYERS)
-        XE_REQ_U32("gemma4.context_length", K_CTX_LEN, XE_CTX)
+        XE_REQ_U32("gemma4.context_length", K_CTX_LEN, XE_MODEL_CTX)
         XE_REQ_U32("gemma4.embedding_length", K_EMBD_LEN, XE_EMBD)
         XE_REQ_U32("gemma4.feed_forward_length", K_FFN_LEN, XE_DENSE_FFN)
         XE_REQ_U32("gemma4.attention.head_count", K_HEAD_COUNT, XE_Q_HEADS)
@@ -3958,6 +4068,12 @@ static inline float xe_sum_f32x8(__m256 x) {
 static _Float16 *xe_kv_layer_ptr(xe_session *s, int layer, int value) {
     if (layer < 0 || layer >= XE_LAYERS) xe_fatal("kv: layer %d out of range", layer);
     if (XE_IS_GLOBAL(layer)) {
+        if (s->cow) {
+            _Float16 *base = value ? s->cow_global_v[layer / 6]
+                                   : s->cow_global_k[layer / 6];
+            if (!base) xe_fatal("kv: unallocated COW layer %d", layer);
+            return base;
+        }
         _Float16 *base = value ? s->global_v : s->global_k;
         return base + (size_t)(layer / 6) * XE_GLOBAL_LAYER_ELEMS;
     }
@@ -4528,11 +4644,13 @@ static void xe_output_decode(xe_session *s, int softcap_mode) {
 #endif
 }
 
-static void xe_prefill_batch_run(xe_session *s, const int32_t *tokens,
-                                 int rows, int batch_start,
-                                 int output_logits) {
+static void xe_prefill_batch_append_run(xe_session *s,
+                                        const int32_t *tokens,
+                                        int rows, int batch_start) {
     if (rows < 1 || rows > 512)
         xe_fatal("prefill batch supports M1 through M512");
+    if (s->prefill_pending)
+        xe_fatal("prefill batch already pending");
     if (batch_start != s->n_tokens)
         xe_fatal("prefill batch expected position %d, received %d",
                  s->n_tokens, batch_start);
@@ -4555,17 +4673,36 @@ static void xe_prefill_batch_run(xe_session *s, const int32_t *tokens,
         w.hidden[0] = w.hidden[1];
         w.hidden[1] = hidden;
     }
-    xe_ze_check("zeCommandListHostSynchronize prefill batch",
-                zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
-    memcpy(s->hidden, w.hidden[0] + (size_t)(rows - 1) * XE_EMBD,
-           XE_EMBD * sizeof(*s->hidden));
     memcpy(s->tokens + batch_start, tokens, (size_t)rows * sizeof(*tokens));
-    s->n_tokens = batch_start + rows;
+    s->prefill_pending = 1;
+    s->prefill_pending_start = batch_start;
+    s->prefill_pending_rows = rows;
+    s->prefill_pending_hidden = w.hidden[0] +
+                                (size_t)(rows - 1) * XE_EMBD;
+}
+
+static void xe_prefill_batch_complete(xe_session *s, int output_logits) {
+    if (!s->prefill_pending) xe_fatal("prefill batch is not pending");
+    memcpy(s->hidden, s->prefill_pending_hidden,
+           XE_EMBD * sizeof(*s->hidden));
+    s->n_tokens = s->prefill_pending_start + s->prefill_pending_rows;
+    s->prefill_pending = 0;
+    s->prefill_pending_hidden = NULL;
     if (output_logits) {
-        xe_workers_begin(e);
+        xe_workers_begin(s->engine);
         xe_output_decode(s, XE_SOFTCAP_SECOND_LOOP);
-        xe_workers_end(e);
+        xe_workers_end(s->engine);
     }
+}
+
+static void xe_prefill_batch_run(xe_session *s, const int32_t *tokens,
+                                 int rows, int batch_start,
+                                 int output_logits) {
+    xe_prefill_batch_append_run(s, tokens, rows, batch_start);
+    xe_ze_check("zeCommandListHostSynchronize prefill batch",
+                zeCommandListHostSynchronize(s->engine->gpu.commands,
+                                             UINT64_MAX));
+    xe_prefill_batch_complete(s, output_logits);
 }
 
 static void __attribute__((unused)) xe_prefill_initial_run(
@@ -4740,6 +4877,47 @@ static int32_t xe_sample_logits(const float *logits, int n_vocab,
     return candidates[filtered - 1].id;
 }
 
+static void xe_session_swa_copy_slot(xe_session *s, int slot) {
+    size_t bytes = XE_SWA_HEAD_DIM * sizeof(*s->swa_k);
+    for (int layer = 0; layer < XE_LAYERS - XE_GLOBAL_LAYERS; layer++) {
+        size_t layer_offset = (size_t)layer * XE_SWA_LAYER_ELEMS;
+        for (int head = 0; head < XE_SWA_KV_HEADS; head++) {
+            size_t offset = layer_offset +
+                ((size_t)head * XE_SWA_WINDOW + slot) * XE_SWA_HEAD_DIM;
+            memcpy(s->swa_spare_k + offset, s->swa_k + offset, bytes);
+            memcpy(s->swa_spare_v + offset, s->swa_v + offset, bytes);
+        }
+    }
+    s->swa_dirty[slot] = 0;
+}
+
+static void xe_session_swa_mark(xe_session *s, int first, int end) {
+    int rows = end - first;
+    if (rows <= 0) return;
+    if (rows >= XE_SWA_WINDOW) {
+        memset(s->swa_dirty, 1, sizeof s->swa_dirty);
+        return;
+    }
+    for (int pos = first; pos < end; pos++)
+        s->swa_dirty[pos & (XE_SWA_WINDOW - 1)] = 1;
+}
+
+static void xe_session_swa_mirror(xe_session *s, int first, int end) {
+    if (!s->swa_spare_k || !s->swa_spare_v) return;
+    if (end - first > XE_SWA_WINDOW) first = end - XE_SWA_WINDOW;
+    for (int pos = first; pos < end; pos++)
+        xe_session_swa_copy_slot(s, pos & (XE_SWA_WINDOW - 1));
+}
+
+static void xe_session_swa_repair(xe_session *s) {
+    int first = s->n_tokens > XE_SWA_WINDOW
+                ? s->n_tokens - XE_SWA_WINDOW : 0;
+    for (int pos = first; pos < s->n_tokens; pos++) {
+        int slot = pos & (XE_SWA_WINDOW - 1);
+        if (s->swa_dirty[slot]) xe_session_swa_copy_slot(s, slot);
+    }
+}
+
 xe_session *xe_session_new(xe_engine *e) {
     if (e->vocab_only) xe_fatal("session: engine opened vocab-only, no weights available");
     xe_worker_pool_init(e);
@@ -4748,6 +4926,11 @@ xe_session *xe_session_new(xe_engine *e) {
     s->engine = e;
     s->swa_k = xe_alloc(e, XE_SWA_SLAB_ELEMS * sizeof(*s->swa_k), XE_MEM_SHARED);
     s->swa_v = xe_alloc(e, XE_SWA_SLAB_ELEMS * sizeof(*s->swa_v), XE_MEM_SHARED);
+    s->swa_spare_k = xe_alloc(e, XE_SWA_SLAB_ELEMS * sizeof(*s->swa_spare_k),
+                              XE_MEM_SHARED);
+    s->swa_spare_v = xe_alloc(e, XE_SWA_SLAB_ELEMS * sizeof(*s->swa_spare_v),
+                              XE_MEM_SHARED);
+    memset(s->swa_dirty, 1, sizeof s->swa_dirty);
     s->global_k = xe_alloc(e, XE_GLOBAL_SLAB_ELEMS * sizeof(*s->global_k), XE_MEM_SHARED);
     s->global_v = xe_alloc(e, XE_GLOBAL_SLAB_ELEMS * sizeof(*s->global_v), XE_MEM_SHARED);
     s->tokens = xe_alloc(e, XE_CTX * sizeof(*s->tokens), XE_MEM_HOST);
@@ -4761,21 +4944,134 @@ xe_session *xe_session_new(xe_engine *e) {
     return s;
 }
 
+xe_session *xe_session_shadow_new(xe_session *source) {
+    if (!source || source->cow || source->n_tokens <= 0 ||
+        !source->swa_spare_k || !source->swa_spare_v)
+        return NULL;
+    xe_require_owner(source->engine);
+    xe_session_swa_repair(source);
+    xe_engine *e = source->engine;
+    xe_session *s = xe_alloc(e, sizeof *s, XE_MEM_HOST);
+    memset(s, 0, sizeof *s);
+    s->engine = e;
+    s->cow = 1;
+    s->cow_source = source;
+    s->cow_split = source->n_tokens;
+    s->global_k = source->global_k;
+    s->global_v = source->global_v;
+    s->swa_k = source->swa_spare_k;
+    s->swa_v = source->swa_spare_v;
+    source->swa_spare_k = NULL;
+    source->swa_spare_v = NULL;
+    s->tokens = xe_alloc(e, XE_CTX * sizeof(*s->tokens), XE_MEM_HOST);
+    s->workspace_size = xe_workspace_layout(s, NULL);
+    s->workspace = xe_alloc(e, s->workspace_size, XE_MEM_SHARED);
+    xe_workspace_layout(s, s->workspace);
+    s->prefill_workspace = source->prefill_workspace;
+    s->prefill_workspace_size = source->prefill_workspace_size;
+    memcpy(s->tokens, source->tokens,
+           (size_t)source->n_tokens * sizeof(*s->tokens));
+    memcpy(s->hidden, source->hidden, XE_EMBD * sizeof(*s->hidden));
+    memcpy(s->logits, source->logits, XE_VOCAB * sizeof(*s->logits));
+    s->n_tokens = source->n_tokens;
+    return s;
+}
+
 void xe_session_free(xe_session *s) {
     if (!s) return;
     xe_require_owner(s->engine);
     xe_engine *e = s->engine;
+    if (s->prefill_pending)
+        xe_ze_check("zeCommandListHostSynchronize free pending prefill",
+                    zeCommandListHostSynchronize(e->gpu.commands,
+                                                 UINT64_MAX));
+    if (s->cow && s->cow_source && !s->cow_source->swa_spare_k &&
+        !s->cow_source->swa_spare_v) {
+        xe_session *source = s->cow_source;
+        source->swa_spare_k = s->swa_k;
+        source->swa_spare_v = s->swa_v;
+        s->swa_k = NULL;
+        s->swa_v = NULL;
+        int end = source->n_tokens > s->n_tokens
+                  ? source->n_tokens : s->n_tokens;
+        xe_session_swa_mark(source, s->cow_split, end);
+    }
     xe_free(e, s->anchor_logits, XE_MEM_HOST);
     xe_free(e, s->anchor_swa_v, XE_MEM_HOST);
     xe_free(e, s->anchor_swa_k, XE_MEM_HOST);
-    xe_free(e, s->prefill_workspace, XE_MEM_SHARED);
+    if (!s->cow)
+        xe_free(e, s->prefill_workspace, XE_MEM_SHARED);
     xe_free(e, s->workspace, XE_MEM_SHARED);
     xe_free(e, s->tokens, XE_MEM_HOST);
-    xe_free(e, s->global_v, XE_MEM_SHARED);
-    xe_free(e, s->global_k, XE_MEM_SHARED);
+    if (s->cow) {
+        for (int i = 0; i < XE_GLOBAL_LAYERS; i++) {
+            xe_free(e, s->cow_global_v[i], XE_MEM_SHARED);
+            xe_free(e, s->cow_global_k[i], XE_MEM_SHARED);
+        }
+    } else {
+        xe_free(e, s->global_v, XE_MEM_SHARED);
+        xe_free(e, s->global_k, XE_MEM_SHARED);
+    }
     xe_free(e, s->swa_v, XE_MEM_SHARED);
     xe_free(e, s->swa_k, XE_MEM_SHARED);
+    xe_free(e, s->swa_spare_v, XE_MEM_SHARED);
+    xe_free(e, s->swa_spare_k, XE_MEM_SHARED);
     xe_free(e, s, XE_MEM_HOST);
+}
+
+static void xe_session_shadow_reserve(xe_session *s, int end) {
+    if (!s->cow || end < s->cow_split || end > XE_CTX)
+        xe_fatal("shadow reserve: invalid end %d", end);
+    int needed = end - s->cow_split;
+    if (needed <= s->cow_capacity) return;
+    int capacity = (needed + 511) & ~511;
+    int rows = s->n_tokens - s->cow_split;
+    for (int layer = 0; layer < XE_GLOBAL_LAYERS; layer++) {
+        size_t elements = (size_t)XE_GLOBAL_KV_HEADS * capacity *
+                          XE_GLOBAL_HEAD_DIM;
+        _Float16 *next_k = xe_alloc(s->engine,
+                                    elements * sizeof(*next_k),
+                                    XE_MEM_SHARED);
+        _Float16 *next_v = xe_alloc(s->engine,
+                                    elements * sizeof(*next_v),
+                                    XE_MEM_SHARED);
+        if (s->cow_capacity) {
+            size_t bytes = (size_t)rows * XE_GLOBAL_HEAD_DIM *
+                           sizeof(*next_k);
+            for (int head = 0; head < XE_GLOBAL_KV_HEADS; head++) {
+                memcpy(next_k + (size_t)head * capacity *
+                                XE_GLOBAL_HEAD_DIM,
+                       s->cow_global_k[layer] +
+                           (size_t)head * s->cow_capacity *
+                           XE_GLOBAL_HEAD_DIM,
+                       bytes);
+                memcpy(next_v + (size_t)head * capacity *
+                                XE_GLOBAL_HEAD_DIM,
+                       s->cow_global_v[layer] +
+                           (size_t)head * s->cow_capacity *
+                           XE_GLOBAL_HEAD_DIM,
+                       bytes);
+            }
+        }
+        xe_free(s->engine, s->cow_global_k[layer], XE_MEM_SHARED);
+        xe_free(s->engine, s->cow_global_v[layer], XE_MEM_SHARED);
+        s->cow_global_k[layer] = next_k;
+        s->cow_global_v[layer] = next_v;
+    }
+    s->cow_capacity = capacity;
+}
+
+uint64_t xe_session_shadow_kv_bytes(const xe_session *s) {
+    if (!s || !s->cow) return 0;
+    uint64_t swa = UINT64_C(2) * XE_SWA_SLAB_ELEMS * sizeof(_Float16);
+    uint64_t global = UINT64_C(2) * XE_GLOBAL_LAYERS *
+                      XE_GLOBAL_KV_HEADS * (uint64_t)s->cow_capacity *
+                      XE_GLOBAL_HEAD_DIM * sizeof(_Float16);
+    return swa + global;
+}
+
+int xe_session_shadow_split(const xe_session *s) {
+    return s && s->cow ? s->cow_split : 0;
 }
 
 void xe_session_reset(xe_session *s) {
@@ -4800,6 +5096,7 @@ static int xe_session_swa_can_resume(int current, int resume) {
 
 static void xe_session_extend(xe_session *s, const int32_t *tokens, int end,
                               int cpu_single) {
+    int mirror_start = s->n_tokens;
     while (s->n_tokens < end) {
         int start = s->n_tokens;
         int rows = end - start;
@@ -4815,6 +5112,7 @@ static void xe_session_extend(xe_session *s, const int32_t *tokens, int end,
         xe_prefill_batch_run(s, tokens + start, rows, start,
                              start + rows == end);
     }
+    if (!s->cow) xe_session_swa_mirror(s, mirror_start, s->n_tokens);
 }
 
 void xe_session_rewind(xe_session *s, int position) {
@@ -4880,6 +5178,146 @@ void xe_session_sync(xe_session *s, const xe_tokens *prefix) {
     xe_session_sync_report(s, prefix, NULL);
 }
 
+int xe_session_shadow_start(xe_session *s, const xe_tokens *prefix,
+                            int max_rows) {
+    if (!s || !s->cow || !prefix || !xe_tokens_valid(prefix) ||
+        max_rows < 1 || max_rows > 512 || s->prefill_pending)
+        return -1;
+    xe_require_owner(s->engine);
+    if (prefix->len < s->cow_split || prefix->len > XE_CTX)
+        return -1;
+    int limit = prefix->len < s->n_tokens ? prefix->len : s->n_tokens;
+    int common = 0;
+    while (common < limit && prefix->v[common] == s->tokens[common])
+        common++;
+    if (common < s->cow_split) return -1;
+    if (common < s->n_tokens) {
+        if (!xe_session_swa_can_resume(s->n_tokens, common)) return -1;
+        s->n_tokens = common;
+    }
+    if (s->n_tokens >= prefix->len) return 0;
+    xe_session_shadow_reserve(s, prefix->len);
+    int rows = prefix->len - s->n_tokens;
+    if (rows > max_rows) rows = max_rows;
+    xe_prefill_batch_append_run(s, prefix->v + s->n_tokens,
+                                rows, s->n_tokens);
+    return rows;
+}
+
+int xe_session_shadow_poll(xe_session *s) {
+    if (!s || !s->cow || !s->prefill_pending) return 0;
+    xe_require_owner(s->engine);
+    ze_result_t result = zeCommandListHostSynchronize(s->engine->gpu.commands,
+                                                      0);
+    if (result == ZE_RESULT_NOT_READY) return 0;
+    xe_ze_check("zeCommandListHostSynchronize shadow poll", result);
+    int rows = s->prefill_pending_rows;
+    xe_prefill_batch_complete(s, 0);
+    return rows;
+}
+
+int xe_session_shadow_wait(xe_session *s) {
+    if (!s || !s->cow || !s->prefill_pending) return 0;
+    xe_require_owner(s->engine);
+    xe_ze_check("zeCommandListHostSynchronize shadow wait",
+                zeCommandListHostSynchronize(s->engine->gpu.commands,
+                                             UINT64_MAX));
+    int rows = s->prefill_pending_rows;
+    xe_prefill_batch_complete(s, 0);
+    return rows;
+}
+
+int xe_session_shadow_sync(xe_session *s, const xe_tokens *prefix) {
+    if (!s || !s->cow || !prefix) return -1;
+    int prefilled = 0;
+    int completed = xe_session_shadow_wait(s);
+    if (completed > 0) prefilled += completed;
+    for (;;) {
+        int rows = xe_session_shadow_start(s, prefix, 512);
+        if (rows < 0) return -1;
+        if (rows == 0) return prefilled;
+        completed = xe_session_shadow_wait(s);
+        if (completed != rows) return -1;
+        prefilled += completed;
+    }
+}
+
+void xe_session_shadow_refresh_logits(xe_session *s) {
+    if (!s || !s->cow || s->prefill_pending || s->n_tokens <= 0)
+        xe_fatal("shadow logits: invalid session");
+    xe_require_owner(s->engine);
+    xe_workers_begin(s->engine);
+    xe_output_decode(s, XE_SOFTCAP_SECOND_LOOP);
+    xe_workers_end(s->engine);
+}
+
+int xe_session_shadow_promote(xe_session *source, xe_session *shadow) {
+    if (!source || !shadow || source->cow || !shadow->cow ||
+        source->engine != shadow->engine || shadow->prefill_pending ||
+        shadow->cow_source != source || source->swa_spare_k ||
+        source->swa_spare_v ||
+        shadow->n_tokens < shadow->cow_split ||
+        source->global_k != shadow->global_k ||
+        source->global_v != shadow->global_v)
+        return 0;
+    xe_require_owner(source->engine);
+    xe_engine *e = source->engine;
+    int source_position = source->n_tokens;
+    int rows = shadow->n_tokens - shadow->cow_split;
+    size_t row_bytes = (size_t)rows * XE_GLOBAL_HEAD_DIM *
+                       sizeof(_Float16);
+    if (rows > 0) {
+        for (int layer = 0; layer < XE_GLOBAL_LAYERS; layer++) {
+            _Float16 *target_k = source->global_k +
+                (size_t)layer * XE_GLOBAL_LAYER_ELEMS;
+            _Float16 *target_v = source->global_v +
+                (size_t)layer * XE_GLOBAL_LAYER_ELEMS;
+            for (int head = 0; head < XE_GLOBAL_KV_HEADS; head++) {
+                size_t target_offset =
+                    ((size_t)head * XE_CTX + shadow->cow_split) *
+                    XE_GLOBAL_HEAD_DIM;
+                size_t source_offset =
+                    (size_t)head * shadow->cow_capacity * XE_GLOBAL_HEAD_DIM;
+                xe_ze_check("zeCommandListAppendMemoryCopy promote K",
+                            zeCommandListAppendMemoryCopy(
+                                e->gpu.commands, target_k + target_offset,
+                                shadow->cow_global_k[layer] + source_offset,
+                                row_bytes, NULL, 0, NULL));
+                xe_ze_check("zeCommandListAppendMemoryCopy promote V",
+                            zeCommandListAppendMemoryCopy(
+                                e->gpu.commands, target_v + target_offset,
+                                shadow->cow_global_v[layer] + source_offset,
+                                row_bytes, NULL, 0, NULL));
+            }
+        }
+    }
+    xe_ze_check("zeCommandListAppendMemoryCopy promote hidden",
+                zeCommandListAppendMemoryCopy(
+                    e->gpu.commands, source->hidden, shadow->hidden,
+                    XE_EMBD * sizeof(*source->hidden), NULL, 0, NULL));
+    xe_ze_check("zeCommandListAppendMemoryCopy promote logits",
+                zeCommandListAppendMemoryCopy(
+                    e->gpu.commands, source->logits, shadow->logits,
+                    XE_VOCAB * sizeof(*source->logits), NULL, 0, NULL));
+    xe_ze_check("zeCommandListHostSynchronize promote",
+                zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
+    source->swa_spare_k = source->swa_k;
+    source->swa_spare_v = source->swa_v;
+    source->swa_k = shadow->swa_k;
+    source->swa_v = shadow->swa_v;
+    shadow->swa_k = NULL;
+    shadow->swa_v = NULL;
+    shadow->cow_source = NULL;
+    int end = source_position > shadow->n_tokens
+              ? source_position : shadow->n_tokens;
+    xe_session_swa_mark(source, shadow->cow_split, end);
+    memcpy(source->tokens, shadow->tokens,
+           (size_t)shadow->n_tokens * sizeof(*source->tokens));
+    source->n_tokens = shadow->n_tokens;
+    source->anchor_valid = 0;
+    return 1;
+}
+
 int xe_session_common(const xe_session *s, const xe_tokens *prefix) {
     if (!s || !prefix) xe_fatal("session_common: missing session or prefix");
     if (!xe_tokens_valid(prefix)) xe_fatal("session_common: invalid prefix");
@@ -4934,6 +5372,8 @@ int xe_session_anchor_restore(xe_session *s) {
     memcpy(s->logits, s->anchor_logits,
            XE_VOCAB * sizeof(*s->logits));
     s->n_tokens = s->anchor_position;
+    if (s->swa_spare_k && s->swa_spare_v)
+        memset(s->swa_dirty, 1, sizeof s->swa_dirty);
     return s->anchor_position;
 }
 
@@ -5701,6 +6141,8 @@ xe_snapshot_status xe_session_snapshot_load(xe_session *s, FILE *in,
     memcpy(s->tokens, expected->v,
            (size_t)expected->len * sizeof(*s->tokens));
     s->n_tokens = expected->len;
+    if (s->swa_spare_k && s->swa_spare_v)
+        memset(s->swa_dirty, 1, sizeof s->swa_dirty);
     return XE_SNAPSHOT_OK;
 }
 

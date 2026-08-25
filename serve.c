@@ -145,11 +145,35 @@ int serve_lock_path(char *out, size_t cap) {
     return n > 0 && (size_t)n < cap;
 }
 
+static int serve_lock_inherited(const char *path) {
+    const char *text = getenv("XENOLITH_ENGINE_LOCK_FD");
+    if (!text || !*text) return -1;
+    char *end;
+    errno = 0;
+    long value = strtol(text, &end, 10);
+    if (errno || *end || value < 0 || value > INT_MAX) return -1;
+    struct stat inherited_stat;
+    struct stat path_stat;
+    if (fstat((int)value, &inherited_stat) != 0 ||
+        stat(path, &path_stat) != 0 ||
+        inherited_stat.st_dev != path_stat.st_dev ||
+        inherited_stat.st_ino != path_stat.st_ino) return -1;
+    int fd = fcntl((int)value, F_DUPFD_CLOEXEC, 3);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return -1;
+    }
+    unsetenv("XENOLITH_ENGINE_LOCK_FD");
+    return fd;
+}
+
 int serve_lock(const char *socket_path, char *holder, size_t holder_cap) {
     if (holder && holder_cap) holder[0] = '\0';
     char path[4096];
     if (!serve_lock_path(path, sizeof path)) return -1;
-    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    int fd = serve_lock_inherited(path);
+    if (fd < 0) fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (holder && holder_cap > 1) {
@@ -683,6 +707,16 @@ static void serve_emit_event(serve *s, serve_conn *c,
         json_u64(out, event->usage.reasoning);
         json_raw(out, ",\"replayed\":");
         json_u64(out, event->usage.replayed);
+        json_raw(out, ",\"shadow_prefilled\":");
+        json_u64(out, event->usage.shadow_prefilled);
+        json_raw(out, ",\"shadow_background\":");
+        json_u64(out, event->usage.shadow_background);
+        json_raw(out, ",\"shadow_remaining\":");
+        json_u64(out, event->usage.shadow_remaining);
+        json_raw(out, ",\"shadow_kv_bytes\":");
+        json_u64(out, event->usage.shadow_kv_bytes);
+        json_raw(out, ",\"shadow_wait_us\":");
+        json_u64(out, event->usage.shadow_wait_us);
         json_raw(out, ",\"total\":");
         json_u64(out, event->usage.total);
         json_raw(out, "},\"marker\":");

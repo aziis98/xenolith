@@ -829,6 +829,165 @@ __kernel void xe_prefill_attn_online_b8_global_shared(
 #undef XE_PREFILL_GLOBAL_WRITE
 }
 
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void xe_prefill_attn_online_b8_global_cow(
+                                        __global const float *q,
+                                        __global const half *prefix_k,
+                                        __global const half *prefix_v,
+                                        __global const half *tail_k,
+                                        __global const half *tail_v,
+                                        __global float *out,
+                                        int m_count,
+                                        int prefix_capacity,
+                                        int tail_capacity,
+                                        int query_count,
+                                        int heads,
+                                        int kv_heads,
+                                        int query_offset,
+                                        int query_base,
+                                        int split) {
+    __local half lk[8 * 512];
+    __local float lalpha[8];
+    __local float lbeta[8 * 8];
+    __local float ldenominator[8];
+    int lid = get_local_id(0);
+    int subgroup = get_sub_group_id();
+    int lane = get_sub_group_local_id();
+    int query_kv = get_group_id(0);
+    int query = query_base + query_kv % query_count;
+    int kv_head = query_kv / query_count;
+    if (kv_head >= kv_heads) return;
+    int head = kv_head * heads / kv_heads + subgroup;
+    int position = query_offset + query;
+    __global const uint *q_source = (__global const uint *)(
+        q + ((size_t)head * m_count + query) * 512);
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    float8 acc0 = (float8)(0.0f);
+    float8 acc1 = (float8)(0.0f);
+    float8 acc2 = (float8)(0.0f);
+    float8 acc3 = (float8)(0.0f);
+    for (int key0 = 0; key0 <= position; key0 += 8) {
+        __local uint4 *target = (__local uint4 *)lk;
+        if (key0 + 7 < split || key0 >= split) {
+            int capacity = key0 < split ? prefix_capacity : tail_capacity;
+            int source_key = key0 < split ? key0 : key0 - split;
+            __global const half *base = key0 < split ? prefix_k : tail_k;
+            __global const uint4 *source = (__global const uint4 *)(
+                base + ((size_t)kv_head * capacity + source_key) * 512);
+            for (int x = lid; x < 512; x += 128) target[x] = source[x];
+        } else {
+            for (int local_key = 0; local_key < 8; local_key++) {
+                int key = key0 + local_key;
+                int capacity = key < split ? prefix_capacity : tail_capacity;
+                int source_key = key < split ? key : key - split;
+                __global const half *base = key < split ? prefix_k : tail_k;
+                __global const uint4 *source = (__global const uint4 *)(
+                    base + ((size_t)kv_head * capacity + source_key) * 512);
+                for (int x = lid; x < 64; x += 128)
+                    target[local_key * 64 + x] = source[x];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        int keys = min(8, position - key0 + 1);
+        float score[8];
+        float block_maximum = -INFINITY;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            __local const ushort *source_k = (__local const ushort *)(
+                lk + local_key * 512);
+            float value = 0.0f;
+            float8 q_value = as_float8(
+                intel_sub_group_block_read8(q_source));
+            float8 k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k)));
+            value = xe_prefill_attn_float8_accumulate(
+                value, q_value, k_value);
+            q_value = as_float8(
+                intel_sub_group_block_read8(q_source + 128));
+            k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k + 128)));
+            value = xe_prefill_attn_float8_accumulate(
+                value, q_value, k_value);
+            q_value = as_float8(
+                intel_sub_group_block_read8(q_source + 256));
+            k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k + 256)));
+            value = xe_prefill_attn_float8_accumulate(
+                value, q_value, k_value);
+            q_value = as_float8(
+                intel_sub_group_block_read8(q_source + 384));
+            k_value = convert_float8(as_half8(
+                intel_sub_group_block_read_us8(source_k + 384)));
+            value = xe_prefill_attn_float8_accumulate(
+                value, q_value, k_value);
+            score[local_key] = sub_group_reduce_add(value);
+            block_maximum = fmax(block_maximum, score[local_key]);
+        }
+        float next_maximum = fmax(maximum, block_maximum);
+        float alpha = maximum == -INFINITY ? 0.0f
+                      : exp(maximum - next_maximum);
+        float beta[8];
+        float block_denominator = 0.0f;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            beta[local_key] = exp(score[local_key] - next_maximum);
+            block_denominator += beta[local_key];
+        }
+        denominator = denominator * alpha + block_denominator;
+        if (lane == 0) {
+            lalpha[subgroup] = alpha;
+            ldenominator[subgroup] = denominator;
+            for (int local_key = 0; local_key < keys; local_key++)
+                lbeta[local_key * 8 + subgroup] = beta[local_key];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float8 shared_alpha = vload8(0, lalpha);
+        acc0 *= shared_alpha;
+        acc1 *= shared_alpha;
+        acc2 *= shared_alpha;
+        acc3 *= shared_alpha;
+        for (int local_key = 0; local_key < keys; local_key++) {
+            int key = key0 + local_key;
+            int capacity = key < split ? prefix_capacity : tail_capacity;
+            int source_key = key < split ? key : key - split;
+            __global const half *base = key < split ? prefix_v : tail_v;
+            __global const ushort *source = (__global const ushort *)(
+                base + ((size_t)kv_head * capacity + source_key) * 512
+                  + subgroup * 64);
+            float8 weight = vload8(0, lbeta + local_key * 8);
+            float4 value = convert_float4(as_half4(
+                intel_sub_group_block_read_us4(source)));
+            acc0 += weight * value.s0;
+            acc1 += weight * value.s1;
+            acc2 += weight * value.s2;
+            acc3 += weight * value.s3;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        maximum = next_maximum;
+    }
+    float8 shared_denominator = vload8(0, ldenominator);
+    acc0 /= shared_denominator;
+    acc1 /= shared_denominator;
+    acc2 /= shared_denominator;
+    acc3 /= shared_denominator;
+#define XE_PREFILL_GLOBAL_COW_WRITE(local_head, component) do {               \
+        __global uint *target = (__global uint *)(                            \
+            out + ((size_t)(kv_head * 8 + local_head) * m_count + query)      \
+                      * 512 + subgroup * 64);                                 \
+        intel_sub_group_block_write4(                                         \
+            target, as_uint4((float4)(acc0.component, acc1.component,         \
+                                      acc2.component, acc3.component)));      \
+    } while (0)
+    XE_PREFILL_GLOBAL_COW_WRITE(0, s0);
+    XE_PREFILL_GLOBAL_COW_WRITE(1, s1);
+    XE_PREFILL_GLOBAL_COW_WRITE(2, s2);
+    XE_PREFILL_GLOBAL_COW_WRITE(3, s3);
+    XE_PREFILL_GLOBAL_COW_WRITE(4, s4);
+    XE_PREFILL_GLOBAL_COW_WRITE(5, s5);
+    XE_PREFILL_GLOBAL_COW_WRITE(6, s6);
+    XE_PREFILL_GLOBAL_COW_WRITE(7, s7);
+#undef XE_PREFILL_GLOBAL_COW_WRITE
+}
+
 static inline float xe_prefill_attn_swa_block_score(
         float8 q0, float8 q1, __global const half *k) {
     __global const ushort *k_source = (__global const ushort *)k;

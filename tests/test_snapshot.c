@@ -472,6 +472,59 @@ static int snapshot_large(xe_session *session) {
     return ok;
 }
 
+static void snapshot_swa_slot(_Float16 *k, _Float16 *v, int slot,
+                              unsigned char value) {
+    size_t bytes = XE_SWA_HEAD_DIM * sizeof(*k);
+    for (int layer = 0; layer < XE_LAYERS - XE_GLOBAL_LAYERS; layer++) {
+        size_t layer_offset = (size_t)layer * XE_SWA_LAYER_ELEMS;
+        for (int head = 0; head < XE_SWA_KV_HEADS; head++) {
+            size_t offset = layer_offset +
+                ((size_t)head * XE_SWA_WINDOW + slot) * XE_SWA_HEAD_DIM;
+            memset(k + offset, value, bytes);
+            memset(v + offset, value, bytes);
+        }
+    }
+}
+
+static int snapshot_twin_wrap(xe_session *source) {
+    size_t bytes = XE_SWA_SLAB_ELEMS * sizeof(*source->swa_k);
+    memset(source->swa_k, 0x11, bytes);
+    memset(source->swa_v, 0x11, bytes);
+    memset(source->swa_spare_k, 0x11, bytes);
+    memset(source->swa_spare_v, 0x11, bytes);
+    memset(source->swa_dirty, 0, sizeof source->swa_dirty);
+    source->n_tokens = 1031;
+    for (int pos = 0; pos < source->n_tokens; pos++)
+        source->tokens[pos] = snapshot_token(pos, 11);
+    xe_session *shadow = xe_session_shadow_new(source);
+    if (!shadow) return 0;
+    xe_session_shadow_reserve(shadow, 1057);
+    for (int pos = 1031; pos < 1049; pos++) {
+        snapshot_swa_slot(source->swa_k, source->swa_v,
+                          pos & (XE_SWA_WINDOW - 1), 0x33);
+        source->tokens[pos] = snapshot_token(pos, 13);
+    }
+    source->n_tokens = 1049;
+    for (int pos = 1031; pos < 1057; pos++) {
+        snapshot_swa_slot(shadow->swa_k, shadow->swa_v,
+                          pos & (XE_SWA_WINDOW - 1), 0x55);
+        shadow->tokens[pos] = snapshot_token(pos, 17);
+    }
+    shadow->n_tokens = 1057;
+    memset(shadow->hidden, 0x66, XE_EMBD * sizeof(*shadow->hidden));
+    memset(shadow->logits, 0x77, XE_VOCAB * sizeof(*shadow->logits));
+    int promoted = xe_session_shadow_promote(source, shadow);
+    xe_session_free(shadow);
+    xe_session *next = xe_session_shadow_new(source);
+    int equal = next && memcmp(source->swa_k, next->swa_k, bytes) == 0 &&
+                memcmp(source->swa_v, next->swa_v, bytes) == 0;
+    xe_session_free(next);
+    int ok = promoted && source->n_tokens == 1057 && equal;
+    printf("snapshot: twin SWA wrap promote/repair %s\n",
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main(int argc, char **argv) {
     xe_engine engine;
     memset(&engine, 0, sizeof engine);
@@ -484,6 +537,7 @@ int main(int argc, char **argv) {
     int ok = snapshot_round_trip(session, 17);
     ok &= snapshot_round_trip(session, 1057);
     ok &= snapshot_rejections(session);
+    ok &= snapshot_twin_wrap(session);
     session->n_tokens = XE_CTX;
     uint64_t maximum_size = 0;
     int large = xe_session_snapshot_size(session, &maximum_size) ==

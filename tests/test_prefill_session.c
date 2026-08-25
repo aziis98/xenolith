@@ -270,6 +270,180 @@ static int session_gpu_split(xe_engine *e, int32_t *tokens, int rows,
     return ok ? 0 : 1;
 }
 
+static int session_cow(xe_engine *e, int32_t *tokens, int rows,
+                       int split, int raw_rows, int selected_batch,
+                       int selected_gap, int cycles) {
+    if (split < 1 || split >= rows || raw_rows < 1 ||
+        split + raw_rows > rows)
+        xe_fatal("COW shape is invalid");
+    int32_t *raw = xe_alloc(NULL, (size_t)rows * sizeof(*raw), XE_MEM_HOST);
+    memcpy(raw, tokens, (size_t)rows * sizeof(*raw));
+    for (int i = split; i < rows; i++) raw[i] = tokens[i] + 1024;
+    xe_tokens prefix = { tokens, split, rows };
+    xe_tokens clean = { tokens, rows, rows };
+    xe_tokens divergent = { raw, split + raw_rows, rows };
+
+    float *reference_logits = xe_alloc(
+        NULL, XE_VOCAB * sizeof(*reference_logits), XE_MEM_HOST);
+    xe_session *reference = xe_session_new(e);
+    xe_session_sync(reference, &prefix);
+    xe_session_sync(reference, &clean);
+    memcpy(reference_logits, reference->logits,
+           XE_VOCAB * sizeof(*reference_logits));
+    xe_session_free(reference);
+
+    xe_session *source = xe_session_new(e);
+    xe_session_sync(source, &prefix);
+    double mirror_start = session_now();
+    for (int i = 0; i < 800; i++)
+        xe_session_swa_copy_slot(source, i % split);
+    double mirror_us = (session_now() - mirror_start) * 1e6 / 800.0;
+    size_t open_allocations = xe_test_allocations;
+    double open_start = session_now();
+    xe_session *shadow = xe_session_shadow_new(source);
+    double open_seconds = session_now() - open_start;
+    open_allocations = xe_test_allocations - open_allocations;
+    xe_session_sync(source, &divergent);
+    double shadow_start = session_now();
+    int shadow_rows = xe_session_shadow_sync(shadow, &clean);
+    xe_session_shadow_refresh_logits(shadow);
+    double shadow_seconds = session_now() - shadow_start;
+    double shadow_error = session_rel(shadow->logits, reference_logits,
+                                      XE_VOCAB);
+    int shadow_top = session_argmax(shadow->logits, XE_VOCAB) ==
+                     session_argmax(reference_logits, XE_VOCAB);
+    double promote_start = session_now();
+    int promoted = xe_session_shadow_promote(source, shadow);
+    double promote_seconds = session_now() - promote_start;
+    double promote_error = session_rel(source->logits, reference_logits,
+                                       XE_VOCAB);
+    int promote_top = session_argmax(source->logits, XE_VOCAB) ==
+                      session_argmax(reference_logits, XE_VOCAB);
+    uint64_t kv_bytes = xe_session_shadow_kv_bytes(shadow);
+    xe_session_free(shadow);
+    int cycles_ok = 1;
+    for (int cycle = 0; cycle < cycles; cycle++) {
+        xe_session_sync(source, &prefix);
+        shadow = xe_session_shadow_new(source);
+        if (!shadow) {
+            cycles_ok = 0;
+            break;
+        }
+        xe_session_sync(source, &divergent);
+        if (cycle == 0) {
+            if (!xe_session_shadow_promote(source, shadow)) cycles_ok = 0;
+            xe_session_free(shadow);
+            if (xe_session_position(source) != split) cycles_ok = 0;
+            xe_session_sync(source, &clean);
+            double cycle_source_error = session_rel(
+                source->logits, reference_logits, XE_VOCAB);
+            if (cycle_source_error >= 1e-5) cycles_ok = 0;
+            continue;
+        }
+        int cycle_rows = xe_session_shadow_sync(shadow, &clean);
+        xe_session_shadow_refresh_logits(shadow);
+        double cycle_shadow_error = session_rel(
+            shadow->logits, reference_logits, XE_VOCAB);
+        if (cycle_rows != rows - split || cycle_shadow_error >= 1e-5)
+            cycles_ok = 0;
+        if (cycle & 1) {
+            xe_session_free(shadow);
+            xe_session_sync(source, &clean);
+        } else {
+            if (!xe_session_shadow_promote(source, shadow)) cycles_ok = 0;
+            xe_session_free(shadow);
+        }
+        double cycle_source_error = session_rel(
+            source->logits, reference_logits, XE_VOCAB);
+        if (cycle_source_error >= 1e-5) cycles_ok = 0;
+    }
+    xe_session_free(source);
+    int ok = shadow_rows == rows - split && shadow_error < 1e-5 &&
+             shadow_top && promoted && promote_error < 1e-5 &&
+             promote_top && cycles_ok;
+    xe_free(NULL, reference_logits, XE_MEM_HOST);
+
+    source = xe_session_new(e);
+    xe_session_sync(source, &prefix);
+    double raw_start = session_now();
+    for (int i = split; i < split + raw_rows; i++) {
+        xe_tokens next = { raw, i + 1, rows };
+        xe_session_sync(source, &next);
+    }
+    double raw_seconds = session_now() - raw_start;
+    xe_session_free(source);
+
+    printf("prefill-cow: M%d split %d clean %.6f s raw M%d %.6f s serial %.6f s KV %.2f MiB logits %.3e/%.3e top %s/%s %s\n",
+           rows, split, shadow_seconds, raw_rows, raw_seconds,
+           shadow_seconds + raw_seconds,
+           (double)kv_bytes / (1024.0 * 1024.0),
+           shadow_error, promote_error,
+           shadow_top ? "same" : "different",
+           promote_top ? "same" : "different", ok ? "PASS" : "FAIL");
+    printf("prefill-cow-bank: open %.3f ms allocations %zu promote %.3f ms\n",
+           open_seconds * 1000.0, open_allocations,
+           promote_seconds * 1000.0);
+    printf("prefill-cow-mirror: %.3f us/token %.2f GiB/s\n",
+           mirror_us, 190.73486328125 / mirror_us);
+    if (cycles)
+        printf("prefill-cow-cycles: %d %s\n", cycles,
+               cycles_ok ? "PASS" : "FAIL");
+    const int batches[] = { 256, 128, 64, 64 };
+    const int gaps[] = { 0, 16, 16, 32 };
+    int variants = selected_batch > 0 ? 1 : 4;
+    for (int variant = 0; variant < variants; variant++) {
+        int batch = selected_batch > 0 ? selected_batch : batches[variant];
+        int gap = selected_batch > 0 ? selected_gap : gaps[variant];
+        source = xe_session_new(e);
+        xe_session_sync(source, &prefix);
+        shadow = xe_session_shadow_new(source);
+        double overlap_start = session_now();
+        int launched = xe_session_shadow_start(
+            shadow, &clean, batch);
+        int background = 0;
+        int cooldown = 0;
+        for (int i = split; i < split + raw_rows; i++) {
+            xe_tokens next = { raw, i + 1, rows };
+            xe_session_sync(source, &next);
+            int completed = xe_session_shadow_poll(shadow);
+            if (completed > 0) {
+                background += completed;
+                cooldown = gap;
+            }
+            if (!shadow->prefill_pending &&
+                xe_session_position(shadow) < rows) {
+                if (cooldown > 0) {
+                    cooldown--;
+                } else {
+                    launched = xe_session_shadow_start(
+                        shadow, &clean, batch);
+                }
+            }
+        }
+        double response_seconds = session_now() - overlap_start;
+        int remaining = rows - xe_session_position(shadow);
+        double post_start = session_now();
+        int tail = xe_session_shadow_sync(shadow, &clean);
+        xe_session_shadow_refresh_logits(shadow);
+        double post_seconds = session_now() - post_start;
+        int overlap_rows = background + (tail > 0 ? tail : 0);
+        int variant_ok = launched >= 0 && overlap_rows == rows - split;
+        ok &= variant_ok;
+        printf("prefill-cow-overlap: batch %d gap %d response %.6f s penalty %.3fx post %.6f s total %.6f s speedup %.3fx background %d remaining %d %s\n",
+               batch, gap, response_seconds,
+               response_seconds / raw_seconds, post_seconds,
+               response_seconds + post_seconds,
+               (shadow_seconds + raw_seconds) /
+                   (response_seconds + post_seconds),
+               background, remaining,
+               variant_ok ? "PASS" : "FAIL");
+        xe_session_free(shadow);
+        xe_session_free(source);
+    }
+    xe_free(NULL, raw, XE_MEM_HOST);
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2 || !argv[1][0]) {
         fprintf(stderr, "usage: %s <model.gguf> [rows [batch_start [mode-or-ids [args...]]]]\n", argv[0]);
@@ -281,20 +455,24 @@ int main(int argc, char **argv) {
     int split_mode = argc > 4
                      && (!strcmp(argv[4], "split")
                          || !strcmp(argv[4], "hybrid"));
+    int cow_mode = argc > 4 &&
+                   (!strcmp(argv[4], "cow") || !strcmp(argv[4], "cow-cycle"));
+    int cow_cycle_mode = argc > 4 && !strcmp(argv[4], "cow-cycle");
     int hybrid_mode = argc > 4 && !strcmp(argv[4], "hybrid");
-    int cpu_tail = argc > 5 && !split_mode
+    int cpu_tail = argc > 5 && !split_mode && !cow_mode
                    ? (int)strtol(argv[5], NULL, 10) : 0;
-    if (rows < 1 || rows > 512)
-        xe_fatal("prefill session test supports M1 through M512");
+    if (rows < 1 || rows > (cow_mode ? XE_CTX : 512))
+        xe_fatal("prefill session test row count out of range");
     if (batch_start < 0 || cpu_tail < 0
-        || batch_start + rows + cpu_tail > 1024)
+        || batch_start + rows + cpu_tail > (cow_mode ? XE_CTX : 1024))
         xe_fatal("prefill session batch start out of range");
     int total = batch_start + rows + cpu_tail;
-    int32_t tokens[1033];
+    int32_t *tokens = xe_alloc(
+        NULL, (size_t)(total + 9) * sizeof(*tokens), XE_MEM_HOST);
     if (split_mode && argc > 6)
         session_tokens_read(argv[6], tokens, total);
     else if (argc > 4 && strcmp(argv[4], "bench")
-             && strcmp(argv[4], "crossover") && !split_mode)
+             && strcmp(argv[4], "crossover") && !split_mode && !cow_mode)
         session_tokens_read(argv[4], tokens, total);
     else for (int row = 0; row < total; row++) tokens[row] = 2 + row;
     xe_engine *e = xe_engine_open(model);
@@ -302,18 +480,34 @@ int main(int argc, char **argv) {
         int rounds = argc > 5 ? (int)strtol(argv[5], NULL, 10) : 5;
         int result = session_tile_bench(e, tokens, rows, rounds);
         xe_engine_close(e);
+        xe_free(NULL, tokens, XE_MEM_HOST);
         return result;
     }
     if (argc > 4 && !strcmp(argv[4], "crossover")) {
         int rounds = argc > 5 ? (int)strtol(argv[5], NULL, 10) : 5;
         int result = session_crossover_bench(e, tokens, rows, rounds);
         xe_engine_close(e);
+        xe_free(NULL, tokens, XE_MEM_HOST);
+        return result;
+    }
+    if (cow_mode) {
+        int split = argc > 5 ? (int)strtol(argv[5], NULL, 10) : 123;
+        int raw_rows = argc > 6 ? (int)strtol(argv[6], NULL, 10) : 64;
+        int batch = argc > 7 ? (int)strtol(argv[7], NULL, 10) : 0;
+        int gap = argc > 8 ? (int)strtol(argv[8], NULL, 10) : 0;
+        if (batch < 0 || batch > 512 || gap < 0)
+            xe_fatal("COW schedule is invalid");
+        int result = session_cow(e, tokens, total, split, raw_rows,
+                                 batch, gap, cow_cycle_mode ? 4 : 0);
+        xe_engine_close(e);
+        xe_free(NULL, tokens, XE_MEM_HOST);
         return result;
     }
     if (split_mode) {
         int split = argc > 5 ? (int)strtol(argv[5], NULL, 10) : rows - 1;
         int result = session_gpu_split(e, tokens, rows, split, hybrid_mode);
         xe_engine_close(e);
+        xe_free(NULL, tokens, XE_MEM_HOST);
         return result;
     }
     size_t kv_elements = session_kv_elements(total);
@@ -431,5 +625,6 @@ int main(int argc, char **argv) {
     xe_free(NULL, reference_v, XE_MEM_HOST);
     xe_free(NULL, reference_k, XE_MEM_HOST);
     xe_engine_close(e);
+    xe_free(NULL, tokens, XE_MEM_HOST);
     return ok ? 0 : 1;
 }

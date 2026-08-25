@@ -58,6 +58,12 @@ struct wire {
     xe_session *session;
     xe_session *ephemeral;
     xe_session *gen_session;
+    xe_session *shadow;
+    int shadow_inflight;
+    int shadow_cooldown;
+    uint64_t shadow_prefilled;
+    uint64_t shadow_background;
+    uint64_t shadow_peak_kv;
 
     int gen_kind;
     int gen_phase;
@@ -190,6 +196,12 @@ static int64_t wire_now(void) {
     return (int64_t)now.tv_sec * INT64_C(1000000000) + now.tv_nsec;
 }
 
+static int64_t wire_monotonic(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (int64_t)now.tv_sec * INT64_C(1000000000) + now.tv_nsec;
+}
+
 static int wire_default_cache_dir(char *out, size_t cap) {
     const char *cache = getenv("XDG_CACHE_HOME");
     int n;
@@ -286,8 +298,118 @@ static void wire_calls_reset(wire *w) {
     w->call_open = -1;
 }
 
+static void wire_shadow_record(wire *w, int rows, int background) {
+    if (rows <= 0) return;
+    w->shadow_prefilled += (uint64_t)rows;
+    if (background) w->shadow_background += (uint64_t)rows;
+    if (w->gen_kind != WIRE_GEN_NONE) {
+        w->usage.input += (uint64_t)rows;
+        w->usage.replayed += (uint64_t)rows;
+    }
+}
+
+static int wire_shadow_poll(wire *w, int background) {
+    if (!w->shadow || !w->shadow_inflight) return 1;
+    int rows = xe_session_shadow_poll(w->shadow);
+    if (!rows) return 0;
+    w->shadow_inflight = 0;
+    wire_shadow_record(w, rows, background);
+    if (background) w->shadow_cooldown = 32;
+    return 1;
+}
+
+static void wire_shadow_wait(wire *w, int background) {
+    if (!w->shadow || !w->shadow_inflight) return;
+    int rows = xe_session_shadow_wait(w->shadow);
+    w->shadow_inflight = 0;
+    wire_shadow_record(w, rows, background);
+    if (background) w->shadow_cooldown = 32;
+}
+
+static void wire_shadow_drop(wire *w) {
+    if (!w->shadow) return;
+    wire_shadow_wait(w, 1);
+    xe_session_free(w->shadow);
+    w->shadow = NULL;
+    w->shadow_inflight = 0;
+    w->shadow_cooldown = 0;
+    w->shadow_prefilled = 0;
+    w->shadow_background = 0;
+    w->shadow_peak_kv = 0;
+}
+
+static wire_status wire_shadow_target(wire *w, int32_t **tokens,
+                                      uint64_t *count) {
+    conversation_settings settings;
+    if (!conversation_get_settings(w->current, &settings))
+        wire_settings_defaults(&settings);
+    return wire_from_conversation(
+        w, conversation_project_copy(
+               w->current,
+               settings.reasoning_effort != CONVERSATION_REASONING_OFF,
+               settings.reasoning_history, 1, tokens, count));
+}
+
+static wire_status wire_shadow_tick(wire *w) {
+    if (!w->shadow || !w->has_current) return WIRE_OK;
+    if (!wire_shadow_poll(w, 1)) return WIRE_OK;
+    if (w->shadow_cooldown > 0) {
+        w->shadow_cooldown--;
+        return WIRE_OK;
+    }
+    int32_t *tokens;
+    uint64_t count;
+    wire_status status = wire_shadow_target(w, &tokens, &count);
+    if (status != WIRE_OK) return status;
+    if (count < (uint64_t)xe_session_shadow_split(w->shadow)) {
+        free(tokens);
+        return WIRE_OK;
+    }
+    xe_tokens target = { tokens, (int)count, (int)count };
+    int rows = xe_session_shadow_start(w->shadow, &target, 64);
+    free(tokens);
+    if (rows < 0) {
+        wire_shadow_drop(w);
+        return WIRE_OK;
+    }
+    if (rows > 0) w->shadow_inflight = rows;
+    uint64_t bytes = xe_session_shadow_kv_bytes(w->shadow);
+    if (bytes > w->shadow_peak_kv) w->shadow_peak_kv = bytes;
+    return WIRE_OK;
+}
+
+static void wire_shadow_begin(wire *w) {
+    wire_shadow_drop(w);
+    w->shadow = xe_session_shadow_new(w->session);
+    if (!w->shadow) return;
+    w->shadow_cooldown = 0;
+    w->shadow_peak_kv = xe_session_shadow_kv_bytes(w->shadow);
+}
+
+static int wire_shadow_promote_resume(wire *w) {
+    if (!w->shadow || !w->session || !w->has_current) return 0;
+    wire_shadow_wait(w, 1);
+    uint64_t count;
+    const int32_t *tokens = conversation_tokens(w->current, &count);
+    xe_tokens prefix = { (int32_t *)tokens, (int)count, (int)count };
+    int position = xe_session_position(w->shadow);
+    int split = xe_session_shadow_split(w->shadow);
+    if (position < split || xe_session_common(w->shadow, &prefix) != position)
+        return 0;
+    if (!xe_session_shadow_promote(w->session, w->shadow)) return 0;
+    xe_session_free(w->shadow);
+    w->shadow = NULL;
+    w->shadow_inflight = 0;
+    w->shadow_cooldown = 0;
+    w->shadow_prefilled = 0;
+    w->shadow_background = 0;
+    w->shadow_peak_kv = 0;
+    return 1;
+}
+
 void wire_close(wire *w) {
     if (!w) return;
+    wire_shadow_drop(w);
     if (w->current) conversation_close(w->current);
     if (w->session) xe_session_free(w->session);
     if (w->ephemeral) xe_session_free(w->ephemeral);
@@ -558,6 +680,7 @@ static void wire_checkpoint_now(wire *w, wire_checkpoint_report *out) {
 static void wire_park(wire *w, wire_checkpoint_report *out) {
     if (out) memset(out, 0, sizeof *out);
     if (!w->has_current) return;
+    wire_shadow_drop(w);
     wire_checkpoint_now(w, out);
     conversation_close(w->current);
     w->current = NULL;
@@ -698,6 +821,7 @@ wire_status wire_session_delete(wire *w, const conversation_id *id) {
         return wire_fail(w, WIRE_BUSY, "generation in progress");
     if (w->has_current &&
         memcmp(w->current_id.bytes, id->bytes, 16) == 0) {
+        wire_shadow_drop(w);
         conversation_close(w->current);
         w->current = NULL;
         w->has_current = 0;
@@ -810,6 +934,7 @@ wire_status wire_append(wire *w, const wire_message *message,
                                            render.tokens,
                                            render.token_count));
     } else if (message->kind == WIRE_MESSAGE_TOOL_RESULT) {
+        wire_shadow_poll(w, 1);
         if (!message->text)
             return wire_fail(w, WIRE_INVALID_ARGUMENT, "missing text");
         if (wire_turn(c) != PROFILE_TURN_OPEN)
@@ -850,6 +975,8 @@ wire_status wire_append(wire *w, const wire_message *message,
     if (status != WIRE_OK) return status;
     status = wire_from_conversation(w, conversation_commit(c));
     if (status != WIRE_OK) return status;
+    if (message->kind == WIRE_MESSAGE_TOOL_RESULT)
+        wire_shadow_promote_resume(w);
     if (out) *out = marker;
     return WIRE_OK;
 }
@@ -1095,6 +1222,7 @@ wire_status wire_generate(wire *w, const wire_gen_params *params) {
          (is_thinking &&
           previous.reasoning_history != settings.reasoning_history));
     if (projection_changed) {
+        wire_shadow_drop(w);
         wire_status status = wire_from_conversation(
             w, conversation_append_cache_epoch(c));
         if (status != WIRE_OK) return status;
@@ -1445,6 +1573,8 @@ static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
     w->usage.output = (uint64_t)w->sampled_length;
     w->usage.reasoning = (uint64_t)w->reasoning_tokens;
     wire_marker marker = WIRE_MARKER_NONE;
+    int shadow_promoted = 0;
+    int main_reconciled = 0;
 
     if (w->gen_kind == WIRE_GEN_DURABLE) {
         conversation *c = w->current;
@@ -1535,7 +1665,66 @@ static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
         int open = record_stop == CONVERSATION_STOP_TOOL_CALLS ||
                    record_stop == CONVERSATION_STOP_LIMIT ||
                    record_stop == CONVERSATION_STOP_CANCELLED;
-        if (!open && w->session) {
+        if (!open && w->session && w->gen_after_tool) {
+            xe_tokens prefix = { (int32_t *)projected, (int)total,
+                                 (int)total };
+            int common = xe_session_common(w->session, &prefix);
+            int shadow_position = w->shadow
+                                  ? xe_session_position(w->shadow) : 0;
+            if (common > shadow_position) {
+                xe_sync_report report;
+                xe_session_sync_report(w->session, &prefix, &report);
+                w->usage.input += (uint64_t)report.prefilled;
+                w->usage.replayed += (uint64_t)report.prefilled;
+                wire_shadow_drop(w);
+                xe_session_anchor_clear(w->session);
+                main_reconciled = 1;
+            }
+        }
+        if (open && record_stop == CONVERSATION_STOP_TOOL_CALLS &&
+            w->shadow) {
+            wire_shadow_poll(w, 1);
+            w->shadow_cooldown = 0;
+            if (wire_shadow_tick(w) != WIRE_OK)
+                wire_shadow_drop(w);
+        }
+        if (open && record_stop != CONVERSATION_STOP_TOOL_CALLS)
+            wire_shadow_drop(w);
+        if (!open && w->session && w->shadow) {
+            int64_t started = wire_monotonic();
+            wire_shadow_poll(w, 1);
+            int position = xe_session_position(w->shadow);
+            if (position <= (int)total)
+                w->usage.shadow_remaining = total - (uint64_t)position;
+            wire_shadow_wait(w, 0);
+            xe_tokens prefix = { (int32_t *)projected, (int)total,
+                                 (int)total };
+            int prefilled = xe_session_shadow_sync(w->shadow, &prefix);
+            if (prefilled >= 0) {
+                wire_shadow_record(w, prefilled, 0);
+                xe_session_shadow_refresh_logits(w->shadow);
+                uint64_t bytes = xe_session_shadow_kv_bytes(w->shadow);
+                if (bytes > w->shadow_peak_kv)
+                    w->shadow_peak_kv = bytes;
+                shadow_promoted = xe_session_shadow_promote(
+                    w->session, w->shadow);
+            }
+            int64_t finished = wire_monotonic();
+            if (shadow_promoted) {
+                if (finished > started)
+                    w->usage.shadow_wait_us =
+                        (uint64_t)(finished - started) / 1000;
+                w->usage.shadow_prefilled = w->shadow_prefilled;
+                w->usage.shadow_background = w->shadow_background;
+                w->usage.shadow_kv_bytes = w->shadow_peak_kv;
+                xe_session_free(w->shadow);
+                w->shadow = NULL;
+                w->shadow_inflight = 0;
+            } else {
+                wire_shadow_drop(w);
+            }
+        }
+        if (!open && w->session && !shadow_promoted && !main_reconciled) {
             int restored = xe_session_anchor_restore(w->session);
             if (restored) {
                 xe_tokens prefix = { (int32_t *)projected, (int)total,
@@ -1553,11 +1742,21 @@ static wire_status wire_finalize(wire *w, uint32_t wire_stop_reason,
             w->autosave_attempted = 1;
             wire_checkpoint_now(w, &w->autosave);
         }
+        if (open) {
+            w->usage.shadow_prefilled = w->shadow_prefilled;
+            w->usage.shadow_background = w->shadow_background;
+            w->usage.shadow_kv_bytes = w->shadow_peak_kv;
+        }
     } else {
         w->usage.total = (uint64_t)(w->prompt_length + w->sampled_length);
     }
 
     wire_usage usage = w->usage;
+    if (shadow_promoted) {
+        w->shadow_prefilled = 0;
+        w->shadow_background = 0;
+        w->shadow_peak_kv = 0;
+    }
     wire_gen_teardown(w);
     memset(out, 0, sizeof *out);
     out->kind = WIRE_EVENT_DONE;
@@ -1594,6 +1793,7 @@ wire_status wire_next_event(wire *w, wire_event *out) {
             int target = w->prompt_synced + WIRE_PREFILL_CHUNK;
             if (target > w->prompt_length) target = w->prompt_length;
             if (!w->first_sync_done || w->prompt_synced < w->prompt_length) {
+                wire_shadow_wait(w, 1);
                 xe_tokens prefix = { w->prompt, target, w->context };
                 xe_sync_report report;
                 xe_session_sync_report(w->gen_session, &prefix, &report);
@@ -1611,7 +1811,11 @@ wire_status wire_next_event(wire *w, wire_event *out) {
                     if (w->capture_anchor) {
                         xe_session_anchor_capture(w->gen_session);
                         w->capture_anchor = 0;
+                        wire_shadow_begin(w);
                     }
+                    wire_status shadow_status = wire_shadow_tick(w);
+                    if (shadow_status != WIRE_OK)
+                        return wire_gen_error(w, shadow_status, out);
                 }
                 if (w->usage.input > 0 &&
                     (uint64_t)w->prompt_length > w->usage.cache_read) {
@@ -1626,6 +1830,10 @@ wire_status wire_next_event(wire *w, wire_event *out) {
             w->gen_phase = WIRE_PHASE_DECODE;
             continue;
         }
+
+        wire_status shadow_status = wire_shadow_tick(w);
+        if (shadow_status != WIRE_OK)
+            return wire_gen_error(w, shadow_status, out);
 
         if (w->gen_max_tokens > 0 &&
             w->sampled_length >= w->gen_max_tokens)
@@ -1764,6 +1972,7 @@ wire_status wire_rewind(wire *w, wire_marker marker) {
         return wire_fail(w, WIRE_MARKER_UNAVAILABLE,
                          "marker is not addressable");
     if (position + 1 == conversation_visible_count(c)) return WIRE_OK;
+    wire_shadow_drop(w);
     wire_status status = wire_from_conversation(
         w, conversation_append_rewind(c, marker));
     if (status != WIRE_OK) return status;
@@ -1826,6 +2035,7 @@ wire_status wire_rebuild(wire *w, const char *system,
     if (!w->has_current)
         return wire_fail(w, WIRE_SESSION_NOT_FOUND, "no open session");
     conversation *c = w->current;
+    wire_shadow_drop(w);
     if (w->session) xe_session_anchor_clear(w->session);
     wire_status status = wire_from_conversation(
         w, conversation_append_rewind(c, CONVERSATION_REWIND_ALL));
@@ -2066,6 +2276,7 @@ wire_status wire_checkpoint(wire *w, wire_checkpoint_report *out) {
         return wire_fail(w, WIRE_BUSY, "generation in progress");
     if (!w->has_current)
         return wire_fail(w, WIRE_SESSION_NOT_FOUND, "no open session");
+    wire_shadow_wait(w, 1);
     /* Explicit: bypass the autosave backoff and re-arm it on success. */
     w->ckpt_autosave_off = 0;
     int64_t now = wire_now();

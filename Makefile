@@ -29,6 +29,7 @@ clean:
 		tests/test_model_decode tests/test_fixture_decode tests/bench_decode \
 		tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
 		tests/test_prefill_dense tests/test_prefill_layer tests/test_prefill_session \
+		tests/test_prefill_session_drop tests/test_prefill_session_safe \
 		tests/test_session_sync tests/test_format tests/test_snapshot \
 		tests/test_snapshot_model \
 		tests/test_kvstore tests/test_conversation \
@@ -127,6 +128,12 @@ tests/test_prefill_layer: tests/test_prefill_layer.c xenolith.c xenolith.h forma
 
 tests/test_prefill_session: tests/test_prefill_session.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_session.c format.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_prefill_session_drop: tests/test_prefill_session.c xenolith.c xenolith.h format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -DXE_REPACK_DROP_SOURCE -I. -o $@ tests/test_prefill_session.c format.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_prefill_session_safe: tests/test_prefill_session.c xenolith.c xenolith.h format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -DXE_REPACK_DROP_SOURCE -DXE_CTX=65536 -I. -o $@ tests/test_prefill_session.c format.o $(GPU_OBJ) $(LDLIBS)
 
 tests/test_session_sync: tests/test_session_sync.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_session_sync.c format.o $(GPU_OBJ) $(LDLIBS)

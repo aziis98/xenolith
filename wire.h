@@ -112,6 +112,11 @@ typedef struct {
     uint64_t total;
     uint64_t reasoning;
     uint64_t replayed;
+    uint64_t shadow_prefilled;
+    uint64_t shadow_background;
+    uint64_t shadow_remaining;
+    uint64_t shadow_kv_bytes;
+    uint64_t shadow_wait_us;
 } wire_usage;
 
 typedef enum {

@@ -1935,6 +1935,92 @@ static int conversation_event_has_calls(const conversation_event *event) {
            event->blocks[1].format == CONVERSATION_BLOCK_JSON;
 }
 
+static int conversation_event_variant(const conversation_event *event,
+                                      int thinking,
+                                      uint32_t reasoning_history,
+                                      uint64_t position,
+                                      uint64_t last_user,
+                                      int current_open) {
+    int variant = 0;
+    if (!thinking && event->raw_tokens && !event->alternate_tokens)
+        variant = 2;
+    if (thinking && event->role == CONVERSATION_ROLE_SYSTEM)
+        variant = event->alternate_tokens != NULL;
+    if (thinking && event->role == CONVERSATION_ROLE_ASSISTANT) {
+        int current = current_open &&
+                      (last_user == UINT64_MAX || position > last_user);
+        int historical =
+            reasoning_history ==
+                CONVERSATION_REASONING_PRESERVE_TOOL_CALLS &&
+            conversation_event_has_calls(event);
+        variant = (current || historical) &&
+                  event->alternate_tokens != NULL;
+    }
+    return variant;
+}
+
+conversation_status conversation_project_copy(const conversation *c,
+                                               int thinking,
+                                               uint32_t reasoning_history,
+                                               int close_current,
+                                               int32_t **tokens,
+                                               uint64_t *count) {
+    if (!c || !tokens || !count || reasoning_history >
+              CONVERSATION_REASONING_PRESERVE_TOOL_CALLS)
+        return CONVERSATION_INVALID_ARGUMENT;
+    *tokens = NULL;
+    *count = 0;
+    uint64_t last_user = UINT64_MAX;
+    for (uint64_t i = 0; i < c->visible_count; i++) {
+        const conversation_event *event = &c->events[c->visible[i].index].view;
+        if (event->role == CONVERSATION_ROLE_USER) last_user = i;
+    }
+    int current_open = 0;
+    if (!close_current && c->visible_count) {
+        const conversation_event *last =
+            &c->events[c->visible[c->visible_count - 1].index].view;
+        if (last->type == CONVERSATION_EVENT_TOOL_RESULT ||
+            conversation_event_has_calls(last) ||
+            (last->type == CONVERSATION_EVENT_GENERATION_RESULT &&
+             (last->stop_reason == CONVERSATION_STOP_LIMIT ||
+              last->stop_reason == CONVERSATION_STOP_CANCELLED)))
+            current_open = 1;
+    }
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < c->visible_count; i++) {
+        const conversation_event *event = &c->events[c->visible[i].index].view;
+        int variant = conversation_event_variant(
+            event, thinking, reasoning_history, i, last_user, current_open);
+        uint32_t n = variant == 1 ? event->alternate_token_count
+                     : variant == 2 ? event->raw_token_count
+                                    : event->token_count;
+        if (total > CONVERSATION_TOKEN_LIMIT - n)
+            return CONVERSATION_LIMIT;
+        total += n;
+    }
+    int32_t *projected = malloc((size_t)(total ? total : 1) *
+                                sizeof(*projected));
+    if (!projected) return CONVERSATION_NOMEM;
+    uint64_t offset = 0;
+    for (uint64_t i = 0; i < c->visible_count; i++) {
+        const conversation_event *event = &c->events[c->visible[i].index].view;
+        int variant = conversation_event_variant(
+            event, thinking, reasoning_history, i, last_user, current_open);
+        const int32_t *source = variant == 1 ? event->alternate_tokens
+                                : variant == 2 ? event->raw_tokens
+                                               : event->tokens;
+        uint32_t n = variant == 1 ? event->alternate_token_count
+                     : variant == 2 ? event->raw_token_count
+                                    : event->token_count;
+        if (n) memcpy(projected + offset, source,
+                      (size_t)n * sizeof(*source));
+        offset += n;
+    }
+    *tokens = projected;
+    *count = total;
+    return CONVERSATION_OK;
+}
+
 conversation_status conversation_project(conversation *c, int thinking,
                                          uint32_t reasoning_history) {
     if (!c || reasoning_history >
@@ -1959,21 +2045,8 @@ conversation_status conversation_project(conversation *c, int thinking,
     uint64_t total = 0;
     for (uint64_t i = 0; i < c->visible_count; i++) {
         const conversation_event *event = &c->events[c->visible[i].index].view;
-        int variant = 0;
-        if (!thinking && event->raw_tokens && !event->alternate_tokens)
-            variant = 2;
-        if (thinking && event->role == CONVERSATION_ROLE_SYSTEM)
-            variant = event->alternate_tokens != NULL;
-        if (thinking && event->role == CONVERSATION_ROLE_ASSISTANT) {
-            int current = current_open &&
-                          (last_user == UINT64_MAX || i > last_user);
-            int historical =
-                reasoning_history ==
-                    CONVERSATION_REASONING_PRESERVE_TOOL_CALLS &&
-                conversation_event_has_calls(event);
-            variant = (current || historical) &&
-                      event->alternate_tokens != NULL;
-        }
+        int variant = conversation_event_variant(
+            event, thinking, reasoning_history, i, last_user, current_open);
         uint32_t count = variant == 1 ? event->alternate_token_count
                          : variant == 2 ? event->raw_token_count
                                         : event->token_count;
@@ -1987,21 +2060,8 @@ conversation_status conversation_project(conversation *c, int thinking,
     uint64_t offset = 0;
     for (uint64_t i = 0; i < c->visible_count; i++) {
         const conversation_event *event = &c->events[c->visible[i].index].view;
-        int variant = 0;
-        if (!thinking && event->raw_tokens && !event->alternate_tokens)
-            variant = 2;
-        if (thinking && event->role == CONVERSATION_ROLE_SYSTEM)
-            variant = event->alternate_tokens != NULL;
-        if (thinking && event->role == CONVERSATION_ROLE_ASSISTANT) {
-            int current = current_open &&
-                          (last_user == UINT64_MAX || i > last_user);
-            int historical =
-                reasoning_history ==
-                    CONVERSATION_REASONING_PRESERVE_TOOL_CALLS &&
-                conversation_event_has_calls(event);
-            variant = (current || historical) &&
-                      event->alternate_tokens != NULL;
-        }
+        int variant = conversation_event_variant(
+            event, thinking, reasoning_history, i, last_user, current_open);
         const int32_t *tokens = variant == 1 ? event->alternate_tokens
                                 : variant == 2 ? event->raw_tokens
                                                : event->tokens;

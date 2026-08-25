@@ -263,6 +263,12 @@ uint64_t conversation_epoch_current(const conversation *c);
 const int32_t *conversation_tokens(const conversation *c, uint64_t *count);
 conversation_status conversation_project(conversation *c, int thinking,
                                          uint32_t reasoning_history);
+conversation_status conversation_project_copy(const conversation *c,
+                                               int thinking,
+                                               uint32_t reasoning_history,
+                                               int close_current,
+                                               int32_t **tokens,
+                                               uint64_t *count);
 int conversation_snapshot_current(const conversation *c, kvstore_id *id,
                                   uint64_t *boundary);
 uint64_t conversation_event_count(const conversation *c);
