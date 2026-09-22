@@ -59,9 +59,14 @@ LLAMA_LDLIBS=-lllama -lggml -lggml-base
 
 TEST_CFLAGS=-O2 -std=c11 -Wall -Wextra -pthread
 
+UNIT_TESTS=tests/test_format tests/test_json tests/test_decode tests/test_conversation
+GPU_TESTS=tests/test_kv tests/test_snapshot tests/test_kvstore tests/test_prefill_session
+PERSISTENCE_TESTS=tests/test_snapshot_model tests/test_conversation_model tests/test_session_sync
+PREFILL_TESTS=tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
+	tests/test_prefill_dense tests/test_prefill_layer tests/test_prefill_session
 ENGINE_TESTS=tests/test_snapshot tests/test_snapshot_model tests/test_kvstore \
 	tests/test_conversation_model tests/test_kv tests/test_decode tests/test_model_decode \
-	tests/test_fixture_decode tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa tests/test_prefill_dense tests/test_prefill_layer tests/test_prefill_session tests/test_prefill_session_drop \
+	tests/test_fixture_decode $(PREFILL_TESTS) tests/test_prefill_session_drop \
 	tests/test_prefill_session_safe tests/test_session_sync
 
 $(ENGINE_TESTS): xenolith_internal.h format.h
@@ -197,10 +202,34 @@ tests/test_fixture_decode: tests/test_fixture_decode.c xenolith.c xenolith.h for
 check-kv: tests/test_kv
 	./tests/test_kv
 
-check: require-model tests/certify tests/test_kv tests/test_decode
+check-unit: $(UNIT_TESTS)
+	@set -e; for test in $(UNIT_TESTS); do ./$$test; done
+
+check-gpu: $(GPU_TESTS)
 	./tests/test_kv
-	./tests/test_decode
+	./tests/test_snapshot
+	./tests/test_kvstore
+	./tests/test_prefill_session route-reset
+
+check: require-model tests/certify tests/test_model_decode
+	$(MAKE) check-unit
+	$(MAKE) check-gpu
+	./tests/test_model_decode "$(MODEL)"
 	XENOLITH_MODEL="$(MODEL)" ./tests/certify
+
+check-persistence: require-model $(PERSISTENCE_TESTS)
+	@set -e; for test in $(PERSISTENCE_TESTS); do ./$$test "$(MODEL)"; done
+
+check-prefill: require-model $(PREFILL_TESTS) tests/test_fixture_decode
+	@set -e; for test in $(PREFILL_TESTS); do ./$$test "$(MODEL)"; done
+	./tests/test_fixture_decode "$(MODEL)"
+
+check-all: require-model
+	$(MAKE) check
+	$(MAKE) check-persistence
+	$(MAKE) check-prefill
+	$(MAKE) check-wire
+	$(MAKE) check-serve
 
 check-serve: require-model xenolith tests/test_serve tests/test_serve_model
 	./tests/test_serve "$(MODEL)"
@@ -247,5 +276,6 @@ test-tools-clean:
 require-model:
 	@test -f "$(MODEL)" || { printf '%s\n' 'Set MODEL to the path of the Gemma 4 GGUF file.' >&2; exit 2; }
 
-.PHONY: require-model clean check check-kv check-wire check-serve golden test-tools test-tools-clean \
+.PHONY: require-model clean check check-unit check-gpu check-persistence check-prefill check-all \
+	check-kv check-wire check-serve golden test-tools test-tools-clean \
 	bench-b3b bench-b14 bench-prefill-gemm
