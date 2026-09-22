@@ -244,15 +244,22 @@ check-wire: require-model xenolith tests/test_json tests/test_profile tests/test
 
 golden: require-model test-tools
 	mkdir -p tests/golden tests/fixtures
+	@set -e; stage=$$(mktemp -d tests/.golden.XXXXXX); \
+	trap 'rm -f "$$stage"/*; rmdir "$$stage"' EXIT; \
+	trap 'exit 1' HUP INT TERM; \
 	for p in $(GOLDEN_PROMPTS); do \
-		XENOLITH_MODEL="$(MODEL)" tools/tokenize_prompt "$(MODEL)" tests/prompts/$$p.txt > tests/golden/$$p.ids; \
-	done
+		tools/tokenize_prompt "$(MODEL)" tests/prompts/$$p.txt > "$$stage/$$p.ids"; \
+	done; \
 	for p in $(ORACLE_PROMPTS); do \
-		ids=`tools/tokenize_prompt "$(MODEL)" tests/prompts/$$p.txt 2>/dev/null`; \
-		tools/dump_logits "$(MODEL)" "$$ids" tests/golden/$$p.logits; \
-	done
-	cp $(VOCAB_DIR)/ggml-vocab-gemma-4.gguf.inp tests/fixtures/ggml-vocab-gemma-4.gguf.inp
-	cp $(VOCAB_DIR)/ggml-vocab-gemma-4.gguf.out tests/fixtures/ggml-vocab-gemma-4.gguf.out
+		ids=$$(tools/tokenize_prompt "$(MODEL)" tests/prompts/$$p.txt); \
+		tools/dump_logits "$(MODEL)" "$$ids" "$$stage/$$p.logits"; \
+	done; \
+	cp "$(VOCAB_DIR)/ggml-vocab-gemma-4.gguf.inp" "$$stage/ggml-vocab-gemma-4.gguf.inp"; \
+	cp "$(VOCAB_DIR)/ggml-vocab-gemma-4.gguf.out" "$$stage/ggml-vocab-gemma-4.gguf.out"; \
+	for p in $(GOLDEN_PROMPTS); do mv "$$stage/$$p.ids" tests/golden/$$p.ids; done; \
+	for p in $(ORACLE_PROMPTS); do mv "$$stage/$$p.logits" tests/golden/$$p.logits; done; \
+	mv "$$stage/ggml-vocab-gemma-4.gguf.inp" tests/fixtures/ggml-vocab-gemma-4.gguf.inp; \
+	mv "$$stage/ggml-vocab-gemma-4.gguf.out" tests/fixtures/ggml-vocab-gemma-4.gguf.out
 
 TEST_TOOLS=tools/dump_logits tools/tokenize_prompt tools/dump_layers tools/compare_logits
 
