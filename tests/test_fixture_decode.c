@@ -167,7 +167,12 @@ static int fixture_run(xe_engine *e, const char *name, int with_reference) {
            name, n, seconds, (double)n / seconds, rel, got_top, golden_top,
            no_alloc ? "none" : "HOT-PATH", ok ? "PASS" : "FAIL");
 
-    if (!strcmp(name, "short")) ok = fixture_sync(e, ids, n, s->logits) && ok;
+    float *sync_logits = NULL;
+    if (!strcmp(name, "short")) {
+        sync_logits = malloc(XE_VOCAB * sizeof(float));
+        if (!sync_logits) xe_fatal("fixture: allocation failed");
+        memcpy(sync_logits, s->logits, XE_VOCAB * sizeof(float));
+    }
 
     if (with_reference) {
         ref_state ref;
@@ -187,6 +192,10 @@ static int fixture_run(xe_engine *e, const char *name, int with_reference) {
     }
 
     xe_session_free(s);
+    if (sync_logits) {
+        ok = fixture_sync(e, ids, n, sync_logits) && ok;
+        free(sync_logits);
+    }
     xe_free(NULL, golden, XE_MEM_HOST);
     return ok;
 }
