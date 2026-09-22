@@ -26,7 +26,7 @@ serve.o: serve.c serve.h wire.h xenolith.h kvstore.h conversation.h profile.h js
 
 clean:
 	rm -f *.o xenolith tests/certify tests/test_kv tests/test_decode \
-		tests/test_model_decode tests/test_fixture_decode tests/bench_decode \
+		tests/test_model_decode tests/test_fixture_decode bench/bench_decode \
 		tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
 		tests/test_prefill_dense tests/test_prefill_layer tests/test_prefill_session \
 		tests/test_prefill_session_drop tests/test_prefill_session_safe \
@@ -36,11 +36,11 @@ clean:
 		tests/test_conversation_model \
 		tests/test_json tests/test_profile tests/test_wire \
 		tests/test_wire_model tests/test_serve tests/test_serve_model \
-		tests/bench_attention tests/bench_tg tests/bench_b3b tests/bench_b3b_8e \
-		tests/bench_guard \
-		tests/bench_b3b.spv tests/bench_b3b_adlp.spv \
-		tests/bench_prefill_gemm tests/bench_prefill_gemm_down \
-		tests/bench_prefill_gemm.spv $(GPU_SPV)
+		bench/bench_attention bench/bench_tg bench/bench_b3b bench/bench_b3b_8e \
+		bench/bench_guard \
+		bench/bench_b3b.spv bench/bench_b3b_adlp.spv \
+		bench/bench_prefill_gemm bench/bench_prefill_gemm_down \
+		bench/bench_prefill_gemm.spv $(GPU_SPV) $(TEST_TOOLS)
 
 $(GPU_SPV): xenolith.cl
 	ocloc compile -file $< -device 0xa7a0 -spv_only -output xenolith_gpu \
@@ -139,47 +139,47 @@ tests/test_prefill_session_safe: tests/test_prefill_session.c xenolith.c xenolit
 tests/test_session_sync: tests/test_session_sync.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_session_sync.c format.o $(GPU_OBJ) $(LDLIBS)
 
-tests/bench_decode: tests/bench_decode.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/bench_decode.c format.o $(GPU_OBJ) $(LDLIBS)
+bench/bench_decode: bench/bench_decode.c xenolith.c xenolith.h format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/bench_decode.c format.o $(GPU_OBJ) $(LDLIBS)
 
-tests/bench_attention: tests/bench_attention.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/bench_attention.c format.o $(GPU_OBJ) $(LDLIBS)
+bench/bench_attention: bench/bench_attention.c xenolith.c xenolith.h format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/bench_attention.c format.o $(GPU_OBJ) $(LDLIBS)
 
-tests/bench_tg: tests/bench_tg.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/bench_tg.c format.o $(GPU_OBJ) $(LDLIBS)
+bench/bench_tg: bench/bench_tg.c xenolith.c xenolith.h format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/bench_tg.c format.o $(GPU_OBJ) $(LDLIBS)
 
-tests/bench_guard: tests/bench_guard.c
+bench/bench_guard: bench/bench_guard.c
 	$(CC) $(TEST_CFLAGS) -o $@ $<
 
-tests/bench_b3b: tests/bench_b3b.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/bench_b3b.c format.o $(GPU_OBJ) $(LDLIBS)
+bench/bench_b3b: bench/bench_b3b.c xenolith.c xenolith.h format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/bench_b3b.c format.o $(GPU_OBJ) $(LDLIBS)
 
-tests/bench_b3b_8e: tests/bench_b3b.c xenolith.c xenolith.h format.o $(GPU_OBJ)
+bench/bench_b3b_8e: bench/bench_b3b.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -DXE_WORKERS=8 -DXE_WORKER_ECORES -I. \
-		-o $@ tests/bench_b3b.c format.o $(GPU_OBJ) $(LDLIBS)
+		-o $@ bench/bench_b3b.c format.o $(GPU_OBJ) $(LDLIBS)
 
-tests/bench_b3b.spv: tests/bench_b3b.cl
+bench/bench_b3b.spv: bench/bench_b3b.cl
 	ocloc compile -file $< -device 0xa7a0 -spv_only -output bench_b3b \
-		-output_no_suffix -out_dir tests -options '-cl-std=CL3.0' -q
+		-output_no_suffix -out_dir bench -options '-cl-std=CL3.0' -q
 
-bench-b3b: tests/bench_b3b tests/bench_b3b.spv
+bench-b3b: bench/bench_b3b bench/bench_b3b.spv
 
-bench-b14: tests/bench_b3b tests/bench_b3b_8e tests/bench_b3b.spv
+bench-b14: bench/bench_b3b bench/bench_b3b_8e bench/bench_b3b.spv
 
-tests/bench_prefill_gemm: tests/bench_prefill_gemm.c
+bench/bench_prefill_gemm: bench/bench_prefill_gemm.c
 	$(CC) $(TEST_CFLAGS) -o $@ $< $(LDLIBS)
 
-tests/bench_prefill_gemm_down: tests/bench_prefill_gemm.c
+bench/bench_prefill_gemm_down: bench/bench_prefill_gemm.c
 	$(CC) $(TEST_CFLAGS) -DBENCH_MOE_N=2816 -DBENCH_MOE_BLOCKS=22 \
 		-o $@ $< $(LDLIBS)
 
-tests/bench_prefill_gemm.spv: tests/bench_prefill_gemm.cl
+bench/bench_prefill_gemm.spv: bench/bench_prefill_gemm.cl
 	ocloc compile -file $< -device 0xa7a0 -spv_only \
-		-output bench_prefill_gemm -output_no_suffix -out_dir tests \
+		-output bench_prefill_gemm -output_no_suffix -out_dir bench \
 		-options '-cl-std=CL3.0' -q
 
-bench-prefill-gemm: tests/bench_prefill_gemm tests/bench_prefill_gemm_down \
-	tests/bench_prefill_gemm.spv
+bench-prefill-gemm: bench/bench_prefill_gemm bench/bench_prefill_gemm_down \
+	bench/bench_prefill_gemm.spv
 
 tests/test_fixture_decode: tests/test_fixture_decode.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_fixture_decode.c format.o $(GPU_OBJ) $(LDLIBS)
@@ -206,27 +206,30 @@ check-wire: require-model xenolith tests/test_json tests/test_profile tests/test
 golden: require-model test-tools
 	mkdir -p tests/golden tests/fixtures
 	for p in $(GOLDEN_PROMPTS); do \
-		XENOLITH_MODEL="$(MODEL)" tests/tokenize_prompt "$(MODEL)" tests/prompts/$$p.txt > tests/golden/$$p.ids; \
+		XENOLITH_MODEL="$(MODEL)" tools/tokenize_prompt "$(MODEL)" tests/prompts/$$p.txt > tests/golden/$$p.ids; \
 	done
 	for p in $(ORACLE_PROMPTS); do \
-		ids=`tests/tokenize_prompt "$(MODEL)" tests/prompts/$$p.txt 2>/dev/null`; \
-		tests/dump_logits "$(MODEL)" "$$ids" tests/golden/$$p.logits; \
+		ids=`tools/tokenize_prompt "$(MODEL)" tests/prompts/$$p.txt 2>/dev/null`; \
+		tools/dump_logits "$(MODEL)" "$$ids" tests/golden/$$p.logits; \
 	done
 	cp $(VOCAB_DIR)/ggml-vocab-gemma-4.gguf.inp tests/fixtures/ggml-vocab-gemma-4.gguf.inp
 	cp $(VOCAB_DIR)/ggml-vocab-gemma-4.gguf.out tests/fixtures/ggml-vocab-gemma-4.gguf.out
 
-TEST_TOOLS=tests/dump_logits tests/tokenize_prompt tests/dump_layers
+TEST_TOOLS=tools/dump_logits tools/tokenize_prompt tools/dump_layers tools/compare_logits
 
 test-tools: $(TEST_TOOLS)
 
-tests/dump_logits: tests/dump_logits.c
+tools/dump_logits: tools/dump_logits.c
 	$(CC) $(TEST_CFLAGS) $(LLAMA_CFLAGS) -o $@ $< $(LLAMA_LDFLAGS) $(LLAMA_LDLIBS) $(LDLIBS)
 
-tests/dump_layers: tests/dump_layers.c
+tools/dump_layers: tools/dump_layers.c
 	$(CC) $(TEST_CFLAGS) $(LLAMA_CFLAGS) -o $@ $< $(LLAMA_LDFLAGS) $(LLAMA_LDLIBS) $(LDLIBS)
 
-tests/tokenize_prompt: tests/tokenize_prompt.c
+tools/tokenize_prompt: tools/tokenize_prompt.c
 	$(CC) $(TEST_CFLAGS) $(LLAMA_CFLAGS) -o $@ $< $(LLAMA_LDFLAGS) $(LLAMA_LDLIBS) $(LDLIBS)
+
+tools/compare_logits: tools/compare_logits.c
+	$(CC) $(TEST_CFLAGS) -o $@ $< -lm
 
 test-tools-clean:
 	rm -f $(TEST_TOOLS)

@@ -5607,7 +5607,7 @@ int main(int argc, char **argv) {
         { "swa-qkv", 512, 8192, 88 },
         { "global-qk", 512, 9216, 88 }
     };
-    const char *spv_path = "tests/bench_prefill_gemm.spv";
+    const char *spv_path = "bench/bench_prefill_gemm.spv";
     const char *selected_shape = NULL;
     const char *selected_distribution = NULL;
     const char *selected_attention = NULL;

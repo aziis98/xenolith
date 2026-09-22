@@ -860,7 +860,7 @@ int main(int argc, char **argv) {
     }
 
     const char *mode = argv[1];
-    const char *spv_path = "tests/bench_b3b.spv";
+    const char *spv_path = "bench/bench_b3b.spv";
     double seconds = 60.0;
     double delay = 45.0;
     for (int i = 2; i < argc; i++) {
