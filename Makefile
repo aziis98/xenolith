@@ -14,8 +14,8 @@ GPU_OBJ=xenolith_gpu_spv.o
 xenolith: main.o xenolith.o format.o json.o profile.o kvstore.o conversation.o wire.o serve.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -o $@ main.o xenolith.o format.o json.o profile.o kvstore.o conversation.o wire.o serve.o $(GPU_OBJ) $(LDLIBS)
 
-main.o: main.c xenolith.h profile.h serve.h conversation.h
-xenolith.o: xenolith.c xenolith.h xenolith_internal.h format.h
+main.o: main.c xenolith.h profile.h serve.h conversation.h kvstore.h
+xenolith.o: xenolith.c xenolith.cl xenolith.h xenolith_internal.h format.h
 format.o: format.c format.h
 json.o: json.c json.h
 profile.o: profile.c profile.h xenolith.h format.h json.h
@@ -58,6 +58,16 @@ LLAMA_LDFLAGS=-L$(LLAMA_LIBDIR) -Wl,-rpath,$(abspath $(LLAMA_LIBDIR))
 LLAMA_LDLIBS=-lllama -lggml -lggml-base
 
 TEST_CFLAGS=-O2 -std=c11 -Wall -Wextra -pthread
+
+ENGINE_TESTS=tests/test_snapshot tests/test_snapshot_model tests/test_kvstore \
+	tests/test_conversation_model tests/test_kv tests/test_decode tests/test_model_decode \
+	tests/test_fixture_decode tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa tests/test_prefill_dense tests/test_prefill_layer tests/test_prefill_session tests/test_prefill_session_drop \
+	tests/test_prefill_session_safe tests/test_session_sync
+
+$(ENGINE_TESTS): xenolith_internal.h format.h
+tests/test_wire tests/test_wire_model tests/test_serve: xenolith.h conversation.h kvstore.h profile.h json.h
+tests/test_serve: serve.h
+tests/test_profile: json.h
 
 VOCAB_DIR=$(LLAMA_DIR)/models
 MODEL?=
