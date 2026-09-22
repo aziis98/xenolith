@@ -444,9 +444,67 @@ static int session_cow(xe_engine *e, int32_t *tokens, int rows,
     return ok ? 0 : 1;
 }
 
+static int session_route_reset_test(void) {
+    xe_engine e = {0};
+    xe_gpu_init(&e);
+    xe_prefill_workspace w;
+    size_t size = xe_prefill_workspace_layout(&w, NULL);
+    void *memory = xe_alloc(&e, size, XE_MEM_SHARED);
+    memset(memory, 0, size);
+    xe_prefill_workspace_layout(&w, memory);
+    static const int shapes[] = {2, 8, 9, 16, 17, 31, 32, 33, 96, 97, 512};
+    static const int modes[] = {0, 16, 32};
+    int cases = 0;
+    for (size_t mode = 0; mode < sizeof modes / sizeof modes[0]; mode++) {
+        xe_test_prefill_tile_rows = modes[mode];
+        for (size_t shape = 0; shape < sizeof shapes / sizeof shapes[0]; shape++) {
+            int rows = shapes[shape];
+            int tile_rows = modes[mode] ? modes[mode] :
+                            rows >= 32 && rows <= 96 ? 16 : 0;
+            int coverage[512 * XE_EXPERTS_USED] = {0};
+            for (int r = 0; r < rows * XE_EXPERTS_USED; r++)
+                w.route_expert[r] = r % XE_EXPERTS_USED;
+            for (int i = 0; i < 512; i++) {
+                w.routes.tile_expert[i] = XE_EXPERTS - 1;
+                w.routes.tile_m0[i] = 0;
+            }
+            xe_prefill_route_append(&e, &w.moe_input, &w.packed_moe,
+                                    w.route_expert, &w.routes, rows);
+            xe_ze_check("route reset test synchronize",
+                        zeCommandListHostSynchronize(e.gpu.commands, UINT64_MAX));
+            int limit = !tile_rows ? 512 :
+                        tile_rows == 16 && rows > 96 ? 384 : 256;
+            for (int i = 0; i < limit; i++) {
+                int expert = w.routes.tile_expert[i];
+                if (expert == -1) continue;
+                int first = w.routes.tile_m0[i];
+                if (expert < 0 || expert >= XE_EXPERTS_USED ||
+                    first < 0 || first >= rows)
+                    xe_fatal("route reset: M%d mode%d descriptor%d expert%d row%d",
+                             rows, modes[mode], i, expert, first);
+                int tile = tile_rows ? tile_rows : i < 256 ? 32 : i < 384 ? 16 : 8;
+                for (int row = first; row < first + tile && row < rows; row++)
+                    if (coverage[expert * rows + row]++)
+                        xe_fatal("route reset: overlapping descriptor");
+            }
+            for (int r = 0; r < rows * XE_EXPERTS_USED; r++)
+                if (!coverage[r]) xe_fatal("route reset: uncovered route");
+            cases++;
+        }
+    }
+    xe_test_prefill_tile_rows = 0;
+    xe_free(&e, memory, XE_MEM_SHARED);
+    xe_gpu_destroy(&e);
+    printf("prefill-route-reset: %d cases PASS\n", cases);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "route-reset"))
+        return session_route_reset_test();
     if (argc < 2 || !argv[1][0]) {
         fprintf(stderr, "usage: %s <model.gguf> [rows [batch_start [mode-or-ids [args...]]]]\n", argv[0]);
+        fprintf(stderr, "       %s route-reset\n", argv[0]);
         return 2;
     }
     const char *model = argv[1];

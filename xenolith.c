@@ -1164,7 +1164,7 @@ static void __attribute__((unused)) xe_prefill_route_append(
     xe_gpu_pointer_arg(reset, 2, route->tile_expert);
     xe_gpu_pointer_arg(reset, 3, route->tile_m0);
     ze_group_count_t reset_groups = {
-        (uint32_t)(rows > 96 && tile_rows != 32 ? 4 : 2), 1, 1
+        (uint32_t)(!tile_rows || (rows > 96 && tile_rows != 32) ? 4 : 2), 1, 1
     };
     xe_ze_check("zeCommandListAppendLaunchKernel prefill route reset",
                 zeCommandListAppendLaunchKernel(e->gpu.commands, reset,
