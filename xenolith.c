@@ -82,8 +82,8 @@ size_t xe_test_output_calls;
 #define XE_GLOBAL_HEAD_DIM 512
 #define XE_GLOBAL_ROPE_BASE 1000000.0f
 #define XE_GLOBAL_SHARD_CROSSOVER 32
-#define XE_REPACK_PARTS 8
-#define XE_REPACK_PART_LIMIT (UINT64_C(2) * 1024 * 1024 * 1024)
+#define XE_REPACK_PARTS 64
+#define XE_REPACK_PART_LIMIT (UINT64_C(512) * 1024 * 1024)
 #define XE_RMS_EPS 1e-6f
 #define XE_LOGIT_SOFTCAP 30.0f
 #define XE_TENSOR_COUNT 658
@@ -225,6 +225,7 @@ typedef struct {
 struct xe_engine {
     void *map;
     size_t map_len;
+    int map_fd;
     const void *data;
     size_t header_len;   /* bytes before the tensor data section: metadata + tensor directory */
     uint32_t gguf_version;
@@ -2945,7 +2946,28 @@ typedef struct {
     uint16_t *d_seg;
     int part;
     uint64_t part_offset;
+    uint64_t source_offset;
 } xe_repack_job;
+
+static int xe_repack_source_order(const void *a, const void *b) {
+    const xe_repack_job *x = a, *y = b;
+    return (x->source_offset > y->source_offset) -
+           (x->source_offset < y->source_offset);
+}
+
+static void xe_repack_release(xe_engine *e, uint64_t *released,
+                              uint64_t consumed, const char *gguf_path) {
+    uint64_t end = consumed & ~UINT64_C(4095);
+    if (end <= *released) return;
+    size_t bytes = (size_t)(end - *released);
+    if (madvise((uint8_t *)e->map + *released, bytes, MADV_DONTNEED) != 0)
+        xe_fatal("%s: madvise consumed source: %s", gguf_path, strerror(errno));
+    int error = posix_fadvise(e->map_fd, (off_t)*released, (off_t)bytes,
+                             POSIX_FADV_DONTNEED);
+    if (error)
+        xe_fatal("%s: fadvise consumed source: %s", gguf_path, strerror(error));
+    *released = end;
+}
 
 typedef struct {
     xe_repack_job *jobs;
@@ -2991,8 +3013,17 @@ static void *xe_repack_worker(void *arg_) {
             for (int m = 0; m < nuniq; m++) if (uniq[m] == cand[k]) dup = 1;
             if (!dup) uniq[nuniq++] = cand[k];
         }
-        for (int k = 0; k < nuniq; k++) {
+#ifdef XE_REPACK_VERIFY_ALL
+        uint64_t verify_count = j->nblocks;
+#else
+        uint64_t verify_count = (uint64_t)nuniq;
+#endif
+        for (uint64_t k = 0; k < verify_count; k++) {
+#ifdef XE_REPACK_VERIFY_ALL
+            uint64_t b = k;
+#else
             uint64_t b = uniq[k];
+#endif
             uint64_t row = b / j->blocks;
             int block = (int)(b % j->blocks);
             uint8_t recon[18];
@@ -3039,6 +3070,10 @@ static void xe_copy_f32(xe_engine *e) {
         if (s->kind == XE_TK_SINGLETON) {
             const float **field = (const float **)((char *)e + s->off);
             memcpy(cursor, *field, bytes);
+#ifdef XE_REPACK_VERIFY_ALL
+            if (memcmp(cursor, *field, bytes) != 0)
+                xe_fatal("F32 copy verification failed: %s", s->suffix);
+#endif
             *field = (const float *)cursor;
             cursor += padded;
             continue;
@@ -3048,6 +3083,10 @@ static void xe_copy_f32(xe_engine *e) {
             if (s->kind == XE_TK_GLOBAL && !XE_IS_GLOBAL(l)) continue;
             const float **field = (const float **)((char *)&e->layers[l] + s->off);
             memcpy(cursor, *field, bytes);
+#ifdef XE_REPACK_VERIFY_ALL
+            if (memcmp(cursor, *field, bytes) != 0)
+                xe_fatal("F32 copy verification failed: blk.%d.%s", l, s->suffix);
+#endif
             *field = (const float *)cursor;
             cursor += padded;
         }
@@ -3066,12 +3105,11 @@ static xe_engine *xe_map_file(const char *gguf_path) {
 
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) xe_fatal("%s: mmap: %s", gguf_path, strerror(errno));
-    close(fd);
-
     xe_engine *e = calloc(1, sizeof *e);
     if (!e) xe_fatal("out of memory allocating engine");
     e->map = map;
     e->map_len = (size_t)st.st_size;
+    e->map_fd = fd;
     e->bos_id = e->eos_id = e->eot_id = e->unk_id = e->pad_id = -1;
 
     return e;
@@ -3551,6 +3589,11 @@ static void xe_repack(xe_engine *e, const char *gguf_path) {
     if ((uint64_t)njobs != e->q4_0_count)
         xe_fatal("%s: repack job count %d mismatches Q4_0 tensor count %llu", gguf_path, njobs, (unsigned long long)e->q4_0_count);
 
+    for (int i = 0; i < njobs; i++)
+        jobs[i].source_offset = (uint64_t)(jobs[i].field->qs -
+                                          (const uint8_t *)e->map);
+    qsort(jobs, (size_t)njobs, sizeof *jobs, xe_repack_source_order);
+
     int part = 0;
     uint64_t part_used = 0;
     for (int i = 0; i < njobs; i++) {
@@ -3573,17 +3616,27 @@ static void xe_repack(xe_engine *e, const char *gguf_path) {
     }
     e->repack_part_sizes[part++] = part_used;
     e->repack_part_count = part;
-    for (int i = 0; i < e->repack_part_count; i++)
+    e->repack_slab_size = slab_size;
+    e->repack_nibble_bytes = nibble_bytes;
+    e->repack_scale_bytes = scale_bytes;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    xe_copy_f32(e);
+
+    uint64_t released = xe_align_up(e->header_len, 4096);
+    uint64_t verified = 0;
+    int first = 0;
+    for (int i = 0; i < e->repack_part_count; i++) {
         e->repack_parts[i] = xe_alloc(e, e->repack_part_sizes[i], XE_MEM_SHARED);
 #if defined(XE_REPACK_HUGEPAGE) || defined(XE_REPACK_NOHUGEPAGE)
-    size_t page = (size_t)sysconf(_SC_PAGESIZE);
-    int huge_advice =
+        size_t page = 4096;
+        int huge_advice =
 #ifdef XE_REPACK_HUGEPAGE
-        MADV_HUGEPAGE;
+            MADV_HUGEPAGE;
 #else
-        MADV_NOHUGEPAGE;
+            MADV_NOHUGEPAGE;
 #endif
-    for (int i = 0; i < e->repack_part_count; i++) {
         uintptr_t huge_begin = ((uintptr_t)e->repack_parts[i] + page - 1) &
                                ~(uintptr_t)(page - 1);
         uintptr_t huge_end = ((uintptr_t)e->repack_parts[i] +
@@ -3591,40 +3644,37 @@ static void xe_repack(xe_engine *e, const char *gguf_path) {
         if (huge_end > huge_begin &&
             madvise((void *)huge_begin, huge_end - huge_begin, huge_advice) != 0)
             xe_fatal("%s: madvise repack slab: %s", gguf_path, strerror(errno));
-    }
 #endif
-    e->repack_slab_size = slab_size;
-    e->repack_nibble_bytes = nibble_bytes;
-    e->repack_scale_bytes = scale_bytes;
+        int end = first;
+        while (end < njobs && jobs[end].part == i) {
+            uint64_t nb64 = xe_align_up(jobs[end].nblocks * 16, 64);
+            uint8_t *cursor = (uint8_t *)e->repack_parts[i] +
+                              jobs[end].part_offset;
+            jobs[end].qs_seg = cursor;
+            jobs[end].d_seg = (uint16_t *)(cursor + nb64);
+            end++;
+        }
 
-    for (int i = 0; i < njobs; i++) {
-        uint64_t nb64 = xe_align_up(jobs[i].nblocks * 16, 64);
-        uint8_t *cursor = (uint8_t *)e->repack_parts[jobs[i].part] +
-                          jobs[i].part_offset;
-        jobs[i].qs_seg = cursor;
-        jobs[i].d_seg = (uint16_t *)(cursor + nb64);
+        atomic_int next_job;
+        atomic_init(&next_job, 0);
+        pthread_t threads[XE_REPACK_THREADS];
+        xe_repack_worker_arg args[XE_REPACK_THREADS];
+        for (int t = 0; t < XE_REPACK_THREADS; t++) {
+            args[t] = (xe_repack_worker_arg){ jobs + first, end - first,
+                                             &next_job, gguf_path, 0 };
+            if (pthread_create(&threads[t], NULL, xe_repack_worker, &args[t]) != 0)
+                xe_fatal("%s: pthread_create failed for repack worker %d", gguf_path, t);
+        }
+        for (int t = 0; t < XE_REPACK_THREADS; t++) {
+            pthread_join(threads[t], NULL);
+            verified += args[t].verified;
+        }
+        uint64_t consumed = end < njobs ? jobs[end].source_offset : e->map_len;
+        xe_repack_release(e, &released, consumed, gguf_path);
+        first = end;
     }
-
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    atomic_int next_job;
-    atomic_init(&next_job, 0);
-
-    pthread_t threads[XE_REPACK_THREADS];
-    xe_repack_worker_arg args[XE_REPACK_THREADS];
-    for (int t = 0; t < XE_REPACK_THREADS; t++) {
-        args[t] = (xe_repack_worker_arg){ jobs, njobs, &next_job, gguf_path, 0 };
-        if (pthread_create(&threads[t], NULL, xe_repack_worker, &args[t]) != 0)
-            xe_fatal("%s: pthread_create failed for repack worker %d", gguf_path, t);
-    }
-
-    uint64_t verified = 0;
-    for (int t = 0; t < XE_REPACK_THREADS; t++) {
-        pthread_join(threads[t], NULL);
-        verified += args[t].verified;
-    }
-    xe_copy_f32(e);
+    close(e->map_fd);
+    e->map_fd = -1;
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     e->repack_seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
@@ -3645,6 +3695,10 @@ static xe_engine *xe_open_common(const char *gguf_path, int vocab_only, xe_cur *
     *c = xe_parse_header(e, gguf_path);
     xe_parse_metadata(e, c, gguf_path);
     xe_tok_build(e, gguf_path);
+    if (vocab_only) {
+        close(e->map_fd);
+        e->map_fd = -1;
+    }
     return e;
 }
 
@@ -3678,6 +3732,7 @@ void xe_engine_close(xe_engine *e) {
     xe_free(e, e->tok_merge, XE_MEM_HOST);
     xe_free(e, e->tok_hash, XE_MEM_HOST);
     xe_free(e, e->tok_piece, XE_MEM_HOST);
+    if (e->map && e->map_fd >= 0) close(e->map_fd);
     munmap(e->map, e->map_len);
     free(e->name);
     free(e);
