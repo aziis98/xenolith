@@ -277,10 +277,12 @@ struct xe_engine {
     pthread_cond_t worker_cv;
     pthread_cond_t ready_cv;
     pthread_t owner;
+    cpu_set_t owner_affinity;
     uint64_t worker_ticket;
     int worker_ready;
     int worker_stop;
     int pool_initialized;
+    int worker_pinned;
     int token_active;
     xe_phase phase;
     atomic_uint_fast64_t phase_epoch;
@@ -403,6 +405,24 @@ static void xe_free(const xe_engine *e, void *p, xe_mem_kind kind) {
     xe_ze_check("zeMemFree", zeMemFree(e->gpu.context, p));
 }
 
+static int xe_xelp_device(uint32_t id) {
+    static const uint16_t ids[] = {
+        0x9a49, 0x9a40, 0x9a59, 0x9a60, 0x9a68, 0x9a70, 0x9a78,
+        0x4905, 0x4906, 0x4907, 0x4908, 0x4909,
+        0x4c80, 0x4c8a, 0x4c8b, 0x4c8c, 0x4c90, 0x4c9a,
+        0x4680, 0x4682, 0x4688, 0x468a, 0x468b, 0x4690, 0x4692, 0x4693,
+        0xa780, 0xa781, 0xa782, 0xa783, 0xa788, 0xa789, 0xa78a, 0xa78b,
+        0x46d0, 0x46d1, 0x46d2, 0x46d3, 0x46d4,
+        0x46a0, 0x46b0, 0x46a1, 0x46a3, 0x46a6, 0x46a8, 0x46aa,
+        0x462a, 0x4626, 0x4628, 0x46b1, 0x46b3, 0x46c0, 0x46c1, 0x46c3,
+        0xa7a0, 0xa720, 0xa7a8, 0xa7a1, 0xa721, 0xa7a9,
+        0xa7aa, 0xa7ab, 0xa7ac, 0xa7ad
+    };
+    for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++)
+        if (id == ids[i]) return 1;
+    return 0;
+}
+
 static void xe_gpu_init(xe_engine *e) {
     xe_ze_check("zeInit", zeInit(ZE_INIT_FLAG_GPU_ONLY));
 
@@ -422,8 +442,8 @@ static void xe_gpu_init(xe_engine *e) {
         .stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
     };
     xe_ze_check("zeDeviceGetProperties", zeDeviceGetProperties(e->gpu.device, &properties));
-    if (properties.vendorId != 0x8086 || properties.deviceId != 0xa7a0)
-        xe_fatal("expected Intel GPU 8086:a7a0, found %04x:%04x",
+    if (properties.vendorId != 0x8086 || !xe_xelp_device(properties.deviceId))
+        xe_fatal("expected Intel Xe-LP GPU, found %04x:%04x",
                  properties.vendorId, properties.deviceId);
 
     ze_context_desc_t context_desc = {
@@ -1400,6 +1420,35 @@ static int xe_worker_cpu(int lane) {
 #endif
 }
 
+static int xe_worker_pin_available(const cpu_set_t *allowed) {
+    int packages[XE_WORKERS];
+    int cores[XE_WORKERS];
+    for (int lane = 0; lane < XE_WORKERS; lane++) {
+        int cpu = xe_worker_cpu(lane);
+        if (!CPU_ISSET(cpu, allowed)) return 0;
+        char path[128];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+        FILE *f = fopen(path, "r");
+        if (!f) return 0;
+        int package;
+        int read = fscanf(f, "%d", &package);
+        fclose(f);
+        if (read != 1) return 0;
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+        f = fopen(path, "r");
+        if (!f) return 0;
+        int core;
+        read = fscanf(f, "%d", &core);
+        fclose(f);
+        if (read != 1) return 0;
+        for (int other = 0; other < lane; other++)
+            if (packages[other] == package && cores[other] == core) return 0;
+        packages[lane] = package;
+        cores[lane] = core;
+    }
+    return 1;
+}
+
 static void xe_require_owner(const xe_engine *e) {
     if (!e->pool_initialized || !pthread_equal(e->owner, pthread_self()))
         xe_fatal("decode called from a thread other than the engine owner");
@@ -1441,7 +1490,7 @@ static void *xe_worker_main(void *opaque) {
     int lane = wa->lane;
     uint64_t seen = 0;
 
-    xe_pin_thread(xe_worker_cpu(lane));
+    if (e->worker_pinned) xe_pin_thread(xe_worker_cpu(lane));
 
     pthread_mutex_lock(&e->worker_mutex);
     e->worker_ready++;
@@ -1483,6 +1532,9 @@ static void xe_worker_pool_init(xe_engine *e) {
     }
 
     e->owner = pthread_self();
+    e->worker_pinned = pthread_getaffinity_np(e->owner, sizeof e->owner_affinity,
+                                                &e->owner_affinity) == 0 &&
+                       xe_worker_pin_available(&e->owner_affinity);
     if (pthread_mutex_init(&e->worker_mutex, NULL) != 0 ||
         pthread_cond_init(&e->worker_cv, NULL) != 0 ||
         pthread_cond_init(&e->ready_cv, NULL) != 0)
@@ -1503,7 +1555,7 @@ static void xe_worker_pool_init(xe_engine *e) {
 
     xe_constants_init(e);
 
-    xe_pin_thread(xe_worker_cpu(0));
+    if (e->worker_pinned) xe_pin_thread(xe_worker_cpu(0));
 
     pthread_mutex_lock(&e->worker_mutex);
     for (int lane = 1; lane < XE_WORKERS; lane++) {
@@ -1535,6 +1587,10 @@ static void xe_worker_pool_destroy(xe_engine *e) {
     pthread_cond_destroy(&e->worker_cv);
     pthread_mutex_destroy(&e->worker_mutex);
     e->pool_initialized = 0;
+    if (e->worker_pinned) {
+        int rc = pthread_setaffinity_np(e->owner, sizeof e->owner_affinity, &e->owner_affinity);
+        if (rc != 0) xe_fatal("pthread_setaffinity_np restore: %s", strerror(rc));
+    }
 }
 
 static void xe_workers_begin(xe_engine *e) {
@@ -4058,7 +4114,7 @@ int xe_engine_worker_cpu(const xe_engine *e, int worker) {
     if (!e) xe_fatal("worker_cpu: missing engine");
     if (worker < 0 || worker >= XE_WORKERS)
         xe_fatal("worker_cpu: worker %d out of range [0, %d]", worker, XE_WORKERS - 1);
-    return xe_worker_cpu(worker);
+    return e->worker_pinned ? xe_worker_cpu(worker) : -1;
 }
 
 static int xe_tokens_valid(const xe_tokens *tokens) {

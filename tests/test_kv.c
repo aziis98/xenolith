@@ -221,9 +221,13 @@ static int test_shared_allocation(xe_engine *e, const void *p) {
 static int test_session_slabs(void) {
     xe_engine e;
     memset(&e, 0, sizeof e);
+    cpu_set_t original_affinity;
+    if (pthread_getaffinity_np(pthread_self(), sizeof original_affinity, &original_affinity) != 0)
+        return 0;
     xe_gpu_init(&e);
     xe_session *s = xe_session_new(&e);
     int ok = s && s->engine == &e && s->n_tokens == 0;
+    ok = ok && e.worker_pinned == xe_worker_pin_available(&original_affinity);
     ok = ok && ((uintptr_t)s->swa_k & 63u) == 0;
     ok = ok && ((uintptr_t)s->swa_v & 63u) == 0;
     ok = ok && ((uintptr_t)s->global_k & 63u) == 0;
@@ -249,7 +253,8 @@ static int test_session_slabs(void) {
     ok = ok && s->n_tokens == 0;
     ok = ok && xe_engine_worker_count(&e) == XE_WORKERS;
     for (int lane = 0; lane < XE_WORKERS; lane++)
-        ok = ok && xe_engine_worker_cpu(&e, lane) == xe_worker_cpu(lane);
+        ok = ok && xe_engine_worker_cpu(&e, lane) ==
+                   (e.worker_pinned ? xe_worker_cpu(lane) : -1);
 
     float *swa_k = xe_alloc(NULL, XE_SWA_KV_HEADS * XE_SWA_HEAD_DIM * sizeof(*swa_k), XE_MEM_HOST);
     float *swa_v = xe_alloc(NULL, XE_SWA_KV_HEADS * XE_SWA_HEAD_DIM * sizeof(*swa_v), XE_MEM_HOST);
@@ -297,6 +302,10 @@ static int test_session_slabs(void) {
     ok = ok && test_workspace_regions(s);
     xe_session_free(s);
     xe_worker_pool_destroy(&e);
+    cpu_set_t restored_affinity;
+    ok = ok && pthread_getaffinity_np(pthread_self(), sizeof restored_affinity,
+                                      &restored_affinity) == 0 &&
+               CPU_EQUAL(&original_affinity, &restored_affinity);
     xe_gpu_destroy(&e);
     printf("kv: session slabs %s\n", ok ? "PASS" : "FAIL");
     return ok;

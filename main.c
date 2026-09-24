@@ -684,6 +684,10 @@ static void bench_json_string(const char *value) {
 static void bench_cpu_mask(const xe_engine *e, char *out, size_t cap) {
     size_t used = 0;
     out[0] = '\0';
+    if (xe_engine_worker_cpu(e, 0) < 0) {
+        snprintf(out, cap, "unbound");
+        return;
+    }
     int workers = xe_engine_worker_count(e);
     for (int i = 0; i < workers; i++) {
         int n = snprintf(out + used, cap - used, "%s%d", i ? "," : "",
