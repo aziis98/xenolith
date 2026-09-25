@@ -37,7 +37,7 @@ clean:
 		tests/test_json tests/test_profile tests/test_wire \
 		tests/test_wire_model tests/test_serve tests/test_serve_model \
 		bench/bench_attention bench/bench_tg bench/bench_b3b bench/bench_b3b_8e \
-		bench/bench_guard \
+		bench/bench_guard bench/compare_pp_tg_xe bench/compare_pp_tg_tokens \
 		bench/bench_b3b.spv bench/bench_b3b_adlp.spv \
 		bench/bench_prefill_gemm bench/bench_prefill_gemm_down \
 		bench/bench_prefill_gemm.spv $(GPU_SPV) $(TEST_TOOLS)
@@ -165,6 +165,12 @@ bench/bench_tg: bench/bench_tg.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 
 bench/bench_guard: bench/bench_guard.c
 	$(CC) $(TEST_CFLAGS) -o $@ $<
+
+bench/compare_pp_tg_xe: bench/compare_pp_tg.c xenolith.o format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/compare_pp_tg.c xenolith.o format.o $(GPU_OBJ) $(LDLIBS)
+
+bench/compare_pp_tg_tokens: bench/compare_pp_tg_tokens.c
+	$(CC) $(BASE_CFLAGS) -o $@ $<
 
 bench/bench_b3b: bench/bench_b3b.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ bench/bench_b3b.c format.o $(GPU_OBJ) $(LDLIBS)

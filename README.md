@@ -17,9 +17,11 @@ So Xenolith is built to do exactly that, and we can see some non-extraordinary r
 
 | Token/s | Xenolith | llama.cpp CPU | llama.cpp Vulkan |
 |---|---:|---:|---:|
-| pp512 | **204,27** | 72,72 | 189,07 |
-| pp2048 | **171,08** | 51,21 | 160,67 |
-| tg128 | **18,39** | 16,47 | 11,96 |
+| pp512 | **204,27** | 70,59 | 189,07 |
+| pp2048 | **171,08** | 51,11 | 160,67 |
+| tg128 | **18,39** | 14,66 | 11,96 |
+
+These are medians of three measurements per row on the target laptop. The llama.cpp CPU column uses one profile throughout: six generation threads, twenty batch threads, CPUs 0–19, mmap, and no BLAS. The input is the same fixed synthetic token sequence for all engines; `tg128` starts from an empty context. The measured samples and instructions for checking or repeating the comparison are in [bench/compare_pp_tg.md](bench/compare_pp_tg.md). Results from a new run can vary with system conditions.
 
 So you can see that, while with llama.cpp you have to choose which one to prioritize between prefill and decode, with Xenolith you have a more balanced setup.
 

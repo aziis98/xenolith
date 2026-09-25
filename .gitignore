@@ -23,6 +23,8 @@
 /bench/bench_prefill_gemm
 /bench/bench_prefill_gemm_down
 /bench/bench_tg
+/bench/compare_pp_tg_xe
+/bench/compare_pp_tg_tokens
 /tests/bench_attention
 /tests/bench_b3b
 /tests/bench_b3b_8e
