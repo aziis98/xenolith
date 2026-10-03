@@ -405,7 +405,13 @@ static void xe_free(const xe_engine *e, void *p, xe_mem_kind kind) {
     xe_ze_check("zeMemFree", zeMemFree(e->gpu.context, p));
 }
 
-static int xe_xelp_device(uint32_t id) {
+typedef enum {
+    XE_GPU_UNSUPPORTED,
+    XE_GPU_SUPPORTED,
+    XE_GPU_EXPERIMENTAL
+} xe_gpu_support_status;
+
+static xe_gpu_support_status xe_gpu_support(uint32_t id) {
     static const uint16_t ids[] = {
         0x9a49, 0x9a40, 0x9a59, 0x9a60, 0x9a68, 0x9a70, 0x9a78,
         0x4905, 0x4906, 0x4907, 0x4908, 0x4909,
@@ -419,8 +425,16 @@ static int xe_xelp_device(uint32_t id) {
         0xa7aa, 0xa7ab, 0xa7ac, 0xa7ad
     };
     for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++)
-        if (id == ids[i]) return 1;
-    return 0;
+        if (id == ids[i]) return XE_GPU_SUPPORTED;
+    /* Experimental Meteor Lake (Xe-LPG) and Arrow Lake (Xe-LPG / Xe-LPG+).
+     * IDs from intel/compute-runtime shared/source/dll/devices/devices_base.inl. */
+    switch (id) {
+        case 0x7d40: case 0x7d45: case 0x7d55: case 0x7dd5:
+        case 0x7d41: case 0x7d51: case 0x7d67: case 0x7dd1:
+            return XE_GPU_EXPERIMENTAL;
+        default:
+            return XE_GPU_UNSUPPORTED;
+    }
 }
 
 static void xe_gpu_init(xe_engine *e) {
@@ -442,9 +456,14 @@ static void xe_gpu_init(xe_engine *e) {
         .stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
     };
     xe_ze_check("zeDeviceGetProperties", zeDeviceGetProperties(e->gpu.device, &properties));
-    if (properties.vendorId != 0x8086 || !xe_xelp_device(properties.deviceId))
-        xe_fatal("expected Intel Xe-LP GPU, found %04x:%04x",
+    xe_gpu_support_status support = xe_gpu_support(properties.deviceId);
+    if (properties.vendorId != 0x8086 || support == XE_GPU_UNSUPPORTED)
+        xe_fatal("expected Intel Xe-LP, Xe-LPG or Xe-LPG+ GPU, found %04x:%04x",
                  properties.vendorId, properties.deviceId);
+    if (support == XE_GPU_EXPERIMENTAL)
+        fprintf(stderr, "xenolith: experimental Xe-LPG/Xe-LPG+ support for %s (%04x:%04x); "
+                        "not validated on maintainer hardware, using Xe-LP kernels without XMX\n",
+                properties.name, properties.vendorId, properties.deviceId);
 
     ze_context_desc_t context_desc = {
         .stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC

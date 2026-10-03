@@ -43,7 +43,8 @@ clean:
 		bench/bench_prefill_gemm.spv $(GPU_SPV) $(TEST_TOOLS)
 
 $(GPU_SPV): xenolith.cl
-	ocloc compile -file $< -device 0xa7a0 -spv_only -output xenolith_gpu \
+	# Xe-LP is the SPIR-V feature baseline; native code is compiled at startup.
+	ocloc compile -file $< -device xe-lp -spv_only -output xenolith_gpu \
 		-output_no_suffix -out_dir . -options '-cl-std=CL3.0' -q
 
 $(GPU_OBJ): $(GPU_SPV)
@@ -180,7 +181,7 @@ bench/bench_b3b_8e: bench/bench_b3b.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 		-o $@ bench/bench_b3b.c format.o $(GPU_OBJ) $(LDLIBS)
 
 bench/bench_b3b.spv: bench/bench_b3b.cl
-	ocloc compile -file $< -device 0xa7a0 -spv_only -output bench_b3b \
+	ocloc compile -file $< -device xe-lp -spv_only -output bench_b3b \
 		-output_no_suffix -out_dir bench -options '-cl-std=CL3.0' -q
 
 bench-b3b: bench/bench_b3b bench/bench_b3b.spv
@@ -195,7 +196,7 @@ bench/bench_prefill_gemm_down: bench/bench_prefill_gemm.c
 		-o $@ $< $(LDLIBS)
 
 bench/bench_prefill_gemm.spv: bench/bench_prefill_gemm.cl
-	ocloc compile -file $< -device 0xa7a0 -spv_only \
+	ocloc compile -file $< -device xe-lp -spv_only \
 		-output bench_prefill_gemm -output_no_suffix -out_dir bench \
 		-options '-cl-std=CL3.0' -q
 

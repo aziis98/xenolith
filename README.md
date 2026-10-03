@@ -1,5 +1,5 @@
 # What is Xenolith
-Xenolith is a pure C inference engine designed for a single target hardware (Intel Xe-LP iGPU (11th–13th gen mobile), 32 GB RAM, Linux) and a single target model (Gemma 4 26B-A4B QAT).
+Xenolith is a pure C inference engine designed and optimized for Intel Xe-LP iGPUs (11th–13th gen mobile), 32 GB RAM, Linux, and a single target model (Gemma 4 26B-A4B QAT). Intel Xe-LPG and Xe-LPG+ iGPUs are also enabled as experimental targets.
 This project exists because I need it. I want to extract the most I can from my laptop, and so it's tuned for exactly that:
 HP Envy 17, i7-13700H (6 P-core Raptor Lake-H), DDR4-3200 dual channel (51.2 GB/).
 Systems like mine are very interesting for two reasons:
