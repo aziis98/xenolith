@@ -485,8 +485,8 @@ static int cmd_chat(const char *model, int argc, char **argv) {
             int nb = xe_detokenize(e, t, buf, sizeof buf);
             if (nb > 0) {
                 if (tty && live) {
-                    if (col > 0) printf("\033[A\r\033[%dC\033[J", col);
-                    else printf("\033[A\r\033[J");
+                    if (col > 0) printf("\r\033[J\033[A\r\033[%dC", col);
+                    else printf("\r\033[J\033[A\r");
                 }
                 if (tty) {
                     chat_put_token(buf, nb, &col, term_cols);
