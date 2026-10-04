@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 static void usage(void) {
     fprintf(stderr,
@@ -309,6 +310,45 @@ static int cmd_run(const char *model, int argc, char **argv) {
     return 0;
 }
 
+static uint64_t bench_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static int term_width(void) {
+    struct winsize ws;
+    if (ioctl(fileno(stdout), TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return ws.ws_col;
+    return 80;
+}
+
+static void chat_put_token(const char *buf, int nb, int *col, int term_cols) {
+    for (int b = 0; b < nb; b++) {
+        char c = buf[b];
+        if (c == '\n') {
+            putchar('\n');
+            *col = 0;
+        } else {
+            int is_codepoint = (c & 0xc0) != 0x80;
+            if (is_codepoint && *col >= term_cols) {
+                putchar('\n');
+                *col = 0;
+            }
+            putchar(c);
+            if (is_codepoint) (*col)++;
+        }
+    }
+}
+
+static void chat_print_stats_streaming(int n_gen, double cur_tps, double avg_tps) {
+    printf("\n[%d tokens | %.1f tps | avg %.1f tps]", n_gen, cur_tps, avg_tps);
+}
+
+static void chat_print_stats(int n_gen, double avg_tps) {
+    printf("\n[%d tokens | avg %.1f tps]", n_gen, avg_tps);
+}
+
 static int cmd_chat(const char *model, int argc, char **argv) {
     int max_n = 512;
     float temp = 1.0f;
@@ -421,8 +461,16 @@ static int cmd_chat(const char *model, int argc, char **argv) {
 
         fputs("assistant> ", stdout);
         fflush(stdout);
+        uint64_t t_start = 0, t_prev = 0;
+        int n_gen = 0, col = 11, live = 0;
+        int tty = isatty(fileno(stdout));
+        int term_cols = tty ? term_width() : INT_MAX;
         for (int i = 0; i < max_n && transcript.len < ctx - 1; i++) {
             xe_session_sync(s, &transcript);
+            if (i == 0) {
+                t_start = bench_now_ns();
+                t_prev = t_start;
+            }
             int32_t t = xe_session_next(s, &sp);
             if (t == eos) {
                 stop = 1;
@@ -435,8 +483,34 @@ static int cmd_chat(const char *model, int argc, char **argv) {
             }
             char buf[256];
             int nb = xe_detokenize(e, t, buf, sizeof buf);
-            fwrite(buf, 1, (size_t)nb, stdout);
-            fflush(stdout);
+            if (nb > 0) {
+                if (tty && live) {
+                    if (col > 0) printf("\r\033[J\033[A\r\033[%dC", col);
+                    else printf("\r\033[J\033[A\r");
+                }
+                if (tty) {
+                    chat_put_token(buf, nb, &col, term_cols);
+                } else {
+                    fwrite(buf, 1, (size_t)nb, stdout);
+                }
+                n_gen++;
+                uint64_t now = bench_now_ns();
+                double cur_tps = (now > t_prev) ? 1e9 / (double)(now - t_prev) : 0.0;
+                double avg_tps = (now > t_start) ? 1e9 * (double)n_gen / (double)(now - t_start) : 0.0;
+                t_prev = now;
+                if (tty) {
+                    chat_print_stats_streaming(n_gen, cur_tps, avg_tps);
+                    fflush(stdout);
+                    live = 1;
+                } else {
+                    fflush(stdout);
+                }
+            }
+        }
+        if (!tty && n_gen > 0) {
+            uint64_t now = bench_now_ns();
+            double avg_tps = (now > t_start) ? 1e9 * (double)n_gen / (double)(now - t_start) : 0.0;
+            chat_print_stats(n_gen, avg_tps);
         }
         putchar('\n');
     }
@@ -540,12 +614,6 @@ static int bench_int(const char *arg, int min, int max) {
     long value = strtol(arg, &end, 10);
     if (errno || *end || value < min || value > max) usage();
     return (int)value;
-}
-
-static uint64_t bench_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
 
 static void bench_time(char out[32]) {
