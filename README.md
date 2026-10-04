@@ -29,6 +29,18 @@ Again, if you look at the decode and prefill improvements separately, you can se
 
 I want to specify that I didn't write the kernels myself, but I used a mix of Fable and Sol to autoresearch and autoimprove them.
 
+# Supported Devices
+
+Xenolith targets Intel mobile integrated GPUs on Linux using Level Zero (`intel-compute-runtime`):
+
+| Family / Platform | GPU Architecture | Example Processors | Status |
+|---|---|---|---|
+| **11th Gen Mobile (Tiger Lake)** | Xe-LP (Iris Xe) | [Core i7-1165G7](https://www.intel.com/content/www/us/en/products/sku/208658/intel-core-i71165g7-processor-12m-cache-up-to-4-70-ghz-with-ipu/specifications.html) | Supported (`0x9a49`, ...) |
+| **12th Gen Mobile (Alder Lake-H/P/U)** | Xe-LP (Iris Xe) | [Core i7-12700H](https://www.intel.com/content/www/us/en/products/sku/132228/intel-core-i712700h-processor-24m-cache-up-to-4-70-ghz/specifications.html) | Supported (`0x46a0`, ...) |
+| **13th Gen Mobile (Raptor Lake-H/P)** | Xe-LP (Iris Xe) | [Core i7-13700H](https://www.intel.com/content/www/us/en/products/sku/232128/intel-core-i713700h-processor-24m-cache-up-to-5-00-ghz/specifications.html) *(maintainer target)* | Supported (`0xa7a0`, ...) |
+| **Core Ultra 100H (Meteor Lake)** | Xe-LPG (Arc) | [Core Ultra 7 155H](https://www.intel.com/content/www/us/en/products/sku/236847/intel-core-ultra-7-processor-155h-24m-cache-up-to-4-80-ghz/specifications.html) | Experimental (`0x7d40`, `0x7d55`, ...) |
+| **Core Ultra 200H (Arrow Lake-H/P)** | Xe-LPG+ (Arc 140T / 130T) | [Core Ultra 7 255H](https://www.intel.com/content/www/us/en/products/sku/241751/intel-core-ultra-7-processor-255h-24m-cache-up-to-5-10-ghz/specifications.html) | Supported (`0x7d51`) |
+
 # Design choices
 First of all, I decided to not implement an internal agent/harness because that's another whole piece of software that needs attention and care. Also, harnesses are the new IDEs, so very personal, and everyone should use the one he prefers.
 
